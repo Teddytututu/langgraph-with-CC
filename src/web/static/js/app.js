@@ -1,5 +1,5 @@
 // Vue 3 App
-const { createApp, ref, computed, onMounted, watch } = Vue;
+const { createApp, ref, computed, onMounted } = Vue;
 
 mermaid.initialize({
     startOnLoad: false,
@@ -68,7 +68,7 @@ createApp({
                 case 'system_status_changed':
                     systemStatus.value = payload.status;
                     addActivity(`System: ${payload.status}`);
-                    if (payload.status === 'running' || payload.status === 'completed') fetchGraph();
+                    fetchGraph();
                     break;
                 case 'node_changed':
                     currentNode.value = payload.node;
@@ -76,22 +76,25 @@ createApp({
                     fetchGraph();
                     break;
                 case 'task_created':
-                    tasks.value.unshift(payload);
+                    // Avoid duplicate if fetchTasks already added it
+                    if (!tasks.value.find(t => t.id === payload.id)) {
+                        tasks.value.unshift(payload);
+                    }
                     addActivity(`Task created: ${payload.id}`);
                     break;
                 case 'task_started':
-                    updateTaskStatus(payload.id, 'running');
+                    mergeTasks([{ id: payload.id, status: 'running' }]);
                     addActivity(`Task started: ${payload.id}`);
                     break;
                 case 'task_progress':
-                    updateTaskProgress(payload);
+                    handleTaskProgress(payload);
                     break;
                 case 'task_completed':
-                    updateTaskStatus(payload.id, 'completed');
+                    handleTaskCompleted(payload);
                     addActivity(`Task completed: ${payload.id}`);
                     break;
                 case 'task_failed':
-                    updateTaskStatus(payload.id, 'failed');
+                    mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
                     addActivity(`Task failed: ${payload.id}`);
                     break;
             }
@@ -105,23 +108,53 @@ createApp({
             if (activityLogs.value.length > 20) activityLogs.value.pop();
         };
 
-        const updateTaskStatus = (id, status) => {
-            const task = tasks.value.find(t => t.id === id);
-            if (task) task.status = status;
-            if (selectedTask.value?.id === id) selectedTask.value.status = status;
+        // Merge partial task updates in-place (preserves Vue reactivity / selectedTask ref)
+        const mergeTasks = (updates) => {
+            updates.forEach(update => {
+                const task = tasks.value.find(t => t.id === update.id);
+                if (task) Object.assign(task, update);
+            });
         };
 
-        const updateTaskProgress = (payload) => {
+        const handleTaskProgress = (payload) => {
             const task = tasks.value.find(t => t.id === payload.task_id);
-            if (task) task.subtasks = payload.subtasks;
-            if (selectedTask.value?.id === payload.task_id) selectedTask.value.subtasks = payload.subtasks;
+            if (!task) return;
+            if (payload.subtasks) task.subtasks = payload.subtasks;
+            if (payload.result) task.result = payload.result;
         };
 
-        // API
+        const handleTaskCompleted = (payload) => {
+            const task = tasks.value.find(t => t.id === payload.id);
+            if (!task) return;
+            task.status = 'completed';
+            if (payload.result !== undefined) task.result = payload.result;
+            if (payload.subtasks) task.subtasks = payload.subtasks;
+            fetchGraph();
+        };
+
+        // Fetch all tasks from API, merge in-place to keep object references stable
         const fetchTasks = async () => {
-            const res = await fetch('/api/tasks');
-            const data = await res.json();
-            tasks.value = data.tasks;
+            try {
+                const res = await fetch('/api/tasks');
+                const data = await res.json();
+                const incoming = data.tasks || [];
+
+                // Add new tasks, update existing ones in-place
+                incoming.forEach(newT => {
+                    const existing = tasks.value.find(t => t.id === newT.id);
+                    if (existing) {
+                        Object.assign(existing, newT);
+                    } else {
+                        tasks.value.push(newT);
+                    }
+                });
+
+                // Remove tasks that no longer exist on server
+                const incomingIds = new Set(incoming.map(t => t.id));
+                tasks.value = tasks.value.filter(t => incomingIds.has(t.id));
+            } catch (e) {
+                console.warn('fetchTasks error', e);
+            }
         };
 
         const fetchGraph = async () => {
@@ -131,15 +164,19 @@ createApp({
                 const { svg } = await mermaid.render(`graph-${Date.now()}`, data.mermaid);
                 mermaidSvg.value = svg;
             } catch (e) {
-                mermaidSvg.value = '<p style="color:#52525B">Failed to load graph</p>';
+                // keep previous SVG or show nothing
             }
         };
 
         const fetchSystemStatus = async () => {
-            const res = await fetch('/api/system/status');
-            const data = await res.json();
-            systemStatus.value = data.status;
-            currentNode.value = data.current_node;
+            try {
+                const res = await fetch('/api/system/status');
+                const data = await res.json();
+                systemStatus.value = data.status;
+                currentNode.value = data.current_node || '';
+            } catch (e) {
+                console.warn('fetchSystemStatus error', e);
+            }
         };
 
         const createTask = async () => {
@@ -155,10 +192,16 @@ createApp({
             await fetch(`/api/tasks/${data.id}/start`, { method: 'POST' });
         };
 
-        const selectTask = (task) => {
+        const selectTask = async (task) => {
             selectedTask.value = task;
             selectedSubtask.value = null;
             discussionMessages.value = [];
+            // Refresh from API to ensure result/subtasks are up to date
+            try {
+                const res = await fetch(`/api/tasks/${task.id}`);
+                const fresh = await res.json();
+                Object.assign(task, fresh);
+            } catch (e) {}
         };
 
         const selectSubtask = async (subtask) => {
@@ -188,17 +231,28 @@ createApp({
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
         const formatTime = (t) => t ? new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '';
 
-        onMounted(() => {
+        onMounted(async () => {
             connectWebSocket();
-            fetchTasks();
-            fetchSystemStatus();
+            await fetchTasks();
+            await fetchSystemStatus();
+            fetchGraph();
+
+            // Poll every 3s when running to keep subtasks + result fresh
+            setInterval(async () => {
+                await fetchSystemStatus();
+                if (systemStatus.value === 'running') {
+                    await fetchTasks();
+                    fetchGraph();
+                }
+            }, 3000);
         });
 
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
             discussionMessages, mermaidSvg, showNewTask, newTask, newMessage, activityLogs,
             stats, getCompletedSubtasks,
-            createTask, selectTask, selectSubtask, sendMessage, getStatusText, formatTime
+            createTask, selectTask, selectSubtask, sendMessage, getStatusText, formatTime,
+            fetchGraph,
         };
     }
 }).mount('#app');

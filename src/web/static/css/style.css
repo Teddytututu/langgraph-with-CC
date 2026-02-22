@@ -1343,3 +1343,24 @@ body {
 }
 
 .card { animation: cardIn 0.5s var(--ease) backwards; animation-delay: 0.1s; }
+
+/* ========== 任务输出 ========== */
+.result-output {
+    display: block;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 480px;
+    overflow-y: auto;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 12.5px;
+    line-height: 1.75;
+    color: var(--text-2);
+    padding: 16px;
+    background: var(--bg-elevated);
+    border-radius: var(--r-md);
+    border: 1px solid var(--border);
+    margin: 0;
+}
+
+.result-output::-webkit-scrollbar { width: 6px; }
+.result-output::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
