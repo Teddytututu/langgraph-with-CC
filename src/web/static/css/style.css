@@ -616,6 +616,12 @@ body {
     overflow: hidden;
 }
 
+.task-item.active .task-desc {
+    -webkit-line-clamp: unset;
+    overflow: visible;
+    display: block;
+}
+
 /* ========== 按钮 ========== */
 .btn {
     display: inline-flex;
@@ -723,6 +729,35 @@ body {
     color: var(--text-4);
     position: relative;
     z-index: 1;
+}
+
+/* ========== Task Detail Card ========== */
+.task-detail-card { flex-shrink: 0; }
+
+.task-detail-body {
+    padding: 14px 20px 16px;
+}
+
+.task-detail-desc {
+    font-size: 0.9rem;
+    color: var(--text-1);
+    line-height: 1.75;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0 0 10px;
+}
+
+.task-detail-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 0.72rem;
+    color: var(--text-4);
+}
+
+.task-detail-error {
+    color: #f87171;
+    margin-left: 8px;
 }
 
 /* ========== Graph ========== */

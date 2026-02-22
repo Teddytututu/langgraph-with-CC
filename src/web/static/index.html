@@ -97,6 +97,32 @@
 
             <!-- 主内容 -->
             <section class="main">
+                <!-- 任务详情卡 -->
+                <div class="card task-detail-card" v-if="selectedTask">
+                    <div class="card-header">
+                        <span class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                            </svg>
+                            Task
+                        </span>
+                        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+                            <span class="task-status" :class="selectedTask.status">{{ selectedTask.status }}</span>
+                            <span style="font-size:0.72rem;color:var(--text-4)">{{ selectedTask.time_minutes ? selectedTask.time_minutes + ' min' : '∞' }}</span>
+                            <span style="font-size:0.72rem;color:var(--text-4);font-family:monospace">{{ selectedTask.id.slice(0,8) }}</span>
+                        </div>
+                    </div>
+                    <div class="task-detail-body">
+                        <p class="task-detail-desc">{{ selectedTask.task }}</p>
+                        <div class="task-detail-meta">
+                            <span>Created: {{ formatTime(selectedTask.created_at) }}</span>
+                            <span v-if="selectedTask.finished_at">· Finished: {{ formatTime(selectedTask.finished_at) }}</span>
+                            <span v-if="selectedTask.error" class="task-detail-error">✗ {{ selectedTask.error }}</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 统计卡片 -->
                 <div class="stats-grid">
                     <div class="stat-card">
