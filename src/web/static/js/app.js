@@ -1,5 +1,5 @@
 // Vue 3 App
-const { createApp, ref, computed, onMounted } = Vue;
+const { createApp, ref, computed, onMounted, watch } = Vue;
 
 mermaid.initialize({
     startOnLoad: false,
@@ -28,6 +28,7 @@ createApp({
         const discussionMessages = ref([]);
         const discussionParticipants = ref([]);
         const mermaidSvg = ref('');
+        const rawMermaid = ref('');  // 缓存后端基础图结构，避免重复请求
         const showNewTask = ref(false);
         const terminalLines = ref([]);
         const terminalInput = ref('');
@@ -130,7 +131,8 @@ createApp({
                     break;
                 case 'node_changed':
                     currentNode.value = payload.node;
-                    fetchGraph();
+                    // 不重新请求网络，直接用缓存的原始图重渲染
+                    updateGraphRender();
                     break;
                 case 'terminal_output':
                     termLog(payload.line, payload.level || 'info', payload.ts);
@@ -239,21 +241,56 @@ createApp({
             }
         };
 
-        let _lastMermaidSrc = '';
+        // 渲染计数器，每次渲染用唯一 ID 防止 Mermaid 内部缓存污染
+        let _renderSeq = 0;
+
+        // 根据当前活跃节点向原始图注入 classDef 高亮并渲染
+        const updateGraphRender = async () => {
+            if (!rawMermaid.value) return;
+            let mStr = rawMermaid.value;
+
+            // 基础样式：统一节点外观
+            mStr += '\nclassDef default fill:#252526,stroke:#444,stroke-width:2px,color:#ddd;';
+            // 活跃节点：紫色发光
+            mStr += '\nclassDef active fill:#6c63ff,stroke:#fff,stroke-width:4px,color:#fff,filter:drop-shadow(0 0 10px rgba(108,99,255,0.8));';
+
+            if (currentNode.value) {
+                mStr += `\nclass ${currentNode.value} active;`;
+            }
+
+            try {
+                const id = 'graph-render-' + (++_renderSeq);
+                const { svg } = await mermaid.render(id, mStr);
+                mermaidSvg.value = svg;
+            } catch (e) {
+                console.error('Mermaid render error:', e);
+            }
+        };
+
+        // 拉取图结构（只在结构真正变化时请求网络）
+        let _lastRawMermaid = '';
         const fetchGraph = async () => {
             try {
                 const res = await fetch('/api/graph/mermaid');
                 if (!res.ok) return;
                 const data = await res.json();
-                // 内容未变则跳过重绘，避免高频 CPU 消耗
-                if (data.mermaid === _lastMermaidSrc) return;
-                _lastMermaidSrc = data.mermaid;
-                const { svg } = await mermaid.render('graph-main-view', data.mermaid);
-                mermaidSvg.value = svg;
+                // 结构未变则只重渲染高亮，不替换 rawMermaid
+                if (data.mermaid === _lastRawMermaid) {
+                    await updateGraphRender();
+                    return;
+                }
+                _lastRawMermaid = data.mermaid;
+                rawMermaid.value = data.mermaid;
+                await updateGraphRender();
             } catch (e) {
                 console.error('fetchGraph error', e);
             }
         };
+
+        // 监听节点变化，实时闪烁高亮
+        watch(currentNode, (newNode, oldNode) => {
+            if (newNode !== oldNode) updateGraphRender();
+        });
 
         let _terminalRestored = false;
         const fetchSystemStatus = async (restoreTerminal = false) => {
