@@ -89,9 +89,10 @@ class WriterAgent:
 
     def analyze_task_and_define_agents(self, task_description: str) -> list[AgentDefinition]:
         """
-        分析任务并决定需要哪些 agent
+        分析任务并决定需要哪些 agent（关键词启发式实现）
 
-        注意：这是一个框架方法，实际的 LLM 调用应该在节点层实现
+        根据任务描述中的关键词推断所需 agent 类型，返回 AgentDefinition 列表。
+        真正的 LLM 推断在节点层通过 caller.call("writer_1", ...) 实现。
 
         Args:
             task_description: 任务描述
@@ -99,9 +100,87 @@ class WriterAgent:
         Returns:
             建议的 agent 定义列表
         """
-        # 这里只是框架，实际实现需要调用 LLM
-        # 返回空列表，等待 LLM 填充
-        return []
+        desc_lower = task_description.lower()
+        agents: list[AgentDefinition] = []
+
+        # ── 代码类关键词 ──
+        code_keywords = ["代码", "编写", "实现", "开发", "脚本", "函数", "类", "模块",
+                         "code", "implement", "develop", "script", "function", "class",
+                         "python", "javascript", "typescript", "java", "c++", "rust", "go"]
+        if any(k in desc_lower for k in code_keywords):
+            agents.append(AgentDefinition(
+                name="coder",
+                description="编写和修改代码，实现功能需求",
+                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+                system_prompt=(
+                    "你是一名高级软件工程师。你的职责是根据需求编写高质量代码，"
+                    "遵循最佳实践，包括错误处理、类型注解和单元测试。\n"
+                    "任务: " + task_description
+                ),
+            ))
+
+        # ── 研究类关键词 ──
+        research_keywords = ["研究", "调研", "查找", "搜索", "文档", "资料", "了解",
+                             "research", "search", "find", "document", "analyze", "study",
+                             "survey", "investigate", "explore"]
+        if any(k in desc_lower for k in research_keywords):
+            agents.append(AgentDefinition(
+                name="researcher",
+                description="搜索信息、阅读文档、整理研究结果",
+                tools=["Read", "Glob", "Grep", "Bash"],
+                system_prompt=(
+                    "你是一名专业研究员。你的职责是收集和整理信息，"
+                    "通过阅读文档和代码来回答问题并提供准确的调研报告。\n"
+                    "任务: " + task_description
+                ),
+            ))
+
+        # ── 写作类关键词 ──
+        write_keywords = ["文档", "报告", "撰写", "写作", "说明书", "readme", "注释",
+                          "document", "write", "report", "readme", "comment", "describe",
+                          "summarize", "记录"]
+        if any(k in desc_lower for k in write_keywords):
+            agents.append(AgentDefinition(
+                name="writer",
+                description="撰写文档、报告和说明文字",
+                tools=["Read", "Write", "Edit"],
+                system_prompt=(
+                    "你是一名专业技术写手。你的职责是将复杂的技术内容清晰地表达出来，"
+                    "编写易于理解的文档和报告。\n"
+                    "任务: " + task_description
+                ),
+            ))
+
+        # ── 分析类关键词 ──
+        analyst_keywords = ["分析", "评估", "对比", "比较", "优化", "性能", "安全",
+                            "analyze", "evaluate", "compare", "optimize", "performance",
+                            "security", "review", "audit", "diagnose", "数据"]
+        if any(k in desc_lower for k in analyst_keywords):
+            agents.append(AgentDefinition(
+                name="analyst",
+                description="数据分析、性能评估和方案对比",
+                tools=["Read", "Bash", "Glob", "Grep"],
+                system_prompt=(
+                    "你是一名高级分析师。你的职责是对数据、代码和系统进行深入分析，"
+                    "提供可操作的洞见和改进建议。\n"
+                    "任务: " + task_description
+                ),
+            ))
+
+        # 如果没有匹配，返回通用执行 agent
+        if not agents:
+            agents.append(AgentDefinition(
+                name="executor",
+                description="通用任务执行 agent",
+                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+                system_prompt=(
+                    "你是一名通用 AI 助手。请根据任务要求完成工作，"
+                    "并以清晰的格式返回结果。\n"
+                    "任务: " + task_description
+                ),
+            ))
+
+        return agents
 
     def fill_from_definition(self, definition: AgentDefinition, agent_id: str = None) -> str:
         """

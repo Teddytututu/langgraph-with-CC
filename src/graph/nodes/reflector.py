@@ -4,6 +4,7 @@ from typing import Optional
 
 from src.graph.state import GraphState, SubTask
 from src.agents.caller import get_caller
+from src.agents.pool_registry import get_pool
 
 
 async def reflector_node(state: GraphState) -> dict:
@@ -64,6 +65,9 @@ async def reflector_node(state: GraphState) -> dict:
             }))
         else:
             updated_subtasks.append(t)
+
+    # 同步更新专家 subagent 的 system_prompt，使其从失败中学习
+    _update_specialist_prompts(current, reflection)
 
     return {
         "subtasks": updated_subtasks,
@@ -130,3 +134,35 @@ def _parse_reflection_result(call_result: dict, issues: list) -> str:
             return "\n".join(parts)
 
     return f"\n需要改进的问题: {issues if issues else '无特定问题，请重新执行'}"
+
+
+def _update_specialist_prompts(task: SubTask, reflection: str) -> None:
+    """
+    将反思结果追加到关联专家的 system_prompt，使其从失败中学习
+
+    Args:
+        task: 刚完成反思的子任务
+        reflection: 反思文本
+    """
+    if not task.assigned_agents:
+        return
+
+    pool = get_pool()
+    note = (
+        f"\n\n## 经验补丁（自动注入，来源于第 {task.retry_count + 1} 次反思）\n"
+        f"任务: {task.title}\n"
+        f"{reflection}\n"
+        f"---\n"
+    )
+
+    for agent_id in task.assigned_agents:
+        template = pool.get_template(agent_id)
+        if template and template.content:
+            updated_content = template.content + note
+            pool.fill_agent(
+                agent_id=agent_id,
+                name=template.name or agent_id,
+                description=template.description or "",
+                content=updated_content,
+                tools=template.tools or [],
+            )

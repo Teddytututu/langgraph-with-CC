@@ -1,9 +1,21 @@
 """src/graph/nodes/executor.py — 子任务执行调度"""
+import asyncio
 from datetime import datetime
 from typing import Optional
 
 from src.graph.state import GraphState, SubTask
 from src.agents.caller import get_caller
+from src.agents.coordinator import CoordinatorAgent
+from src.agents.collaboration import (
+    CollaborationMode, AgentExecutor, execute_collaboration,
+)
+
+_coordinator = CoordinatorAgent()
+
+
+def _compute_timeout(task: SubTask) -> float:
+    """计算子任务执行超时时间（秒），取估算时间的 2 倍，最低 60s 最高 600s"""
+    return max(60.0, min(task.estimated_minutes * 120, 600.0))
 
 
 async def executor_node(state: GraphState) -> dict:
@@ -41,37 +53,60 @@ async def executor_node(state: GraphState) -> dict:
     # 收集前序依赖任务的结果
     previous_results = _build_context(state, next_task)
 
-    # 获取或创建专业 subagent
-    specialist_id = await caller.get_or_create_specialist(
-        skills=next_task.knowledge_domains,
-        task_description=next_task.description
+    # 使用协调者选择协作模式
+    mode = _coordinator.choose_collaboration_mode(
+        task=next_task.description,
+        agents=next_task.knowledge_domains or [next_task.agent_type],
+        subtasks=state.get("subtasks", []),
     )
 
-    # 调用专业 subagent 执行任务
-    if specialist_id:
-        call_result = await caller.call_specialist(
-            agent_id=specialist_id,
-            subtask={
-                "id": next_task.id,
-                "title": next_task.title,
-                "description": next_task.description,
-                "agent_type": next_task.agent_type,
-                "knowledge_domains": next_task.knowledge_domains,
-            },
-            previous_results=previous_results
+    timeout = _compute_timeout(next_task)
+    specialist_id: Optional[str] = None
+
+    # 并行协作：为每个知识域分配独立的专家
+    if mode == CollaborationMode.PARALLEL and len(next_task.knowledge_domains) >= 2:
+        call_result = await _execute_parallel(
+            caller, next_task, previous_results, timeout
         )
+        specialist_id = call_result.get("specialist_id")
     else:
-        # 没有专业 subagent，使用通用 executor
-        call_result = await caller.call_executor(
-            subtask={
-                "id": next_task.id,
-                "title": next_task.title,
-                "description": next_task.description,
-                "agent_type": next_task.agent_type,
-                "knowledge_domains": next_task.knowledge_domains,
-            },
-            previous_results=previous_results
+        # 链式或单专家模式
+        specialist_id = await caller.get_or_create_specialist(
+            skills=next_task.knowledge_domains,
+            task_description=next_task.description
         )
+
+        subtask_dict = {
+            "id": next_task.id,
+            "title": next_task.title,
+            "description": next_task.description,
+            "agent_type": next_task.agent_type,
+            "knowledge_domains": next_task.knowledge_domains,
+        }
+
+        try:
+            if specialist_id:
+                call_result = await asyncio.wait_for(
+                    caller.call_specialist(
+                        agent_id=specialist_id,
+                        subtask=subtask_dict,
+                        previous_results=previous_results,
+                    ),
+                    timeout=timeout,
+                )
+            else:
+                call_result = await asyncio.wait_for(
+                    caller.call_executor(
+                        subtask=subtask_dict,
+                        previous_results=previous_results,
+                    ),
+                    timeout=timeout,
+                )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Executor 超时：任务 {next_task.id}（{next_task.title}）"
+                f"超过 {timeout:.0f}s 未完成"
+            )
 
     # 检查执行是否成功
     if not call_result.get("success"):
@@ -143,4 +178,67 @@ def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
                     "title": t.title,
                     "result": t.result,
                 })
+    return prev_results
+
+
+async def _execute_parallel(caller, task: SubTask, previous_results: list, timeout: float) -> dict:
+    """
+    并行协作：为每个知识域创建独立专家，并发执行，合并结果
+
+    Returns:
+        标准的 call_result 字典（含 success / result 字段）
+    """
+    domains = task.knowledge_domains
+    subtask_dict = {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "agent_type": task.agent_type,
+        "knowledge_domains": task.knowledge_domains,
+    }
+
+    async def run_one(domain: str) -> dict:
+        sid = await caller.get_or_create_specialist(
+            skills=[domain],
+            task_description=task.description,
+        )
+        if sid:
+            return await caller.call_specialist(
+                agent_id=sid,
+                subtask=subtask_dict,
+                previous_results=previous_results,
+            )
+        return await caller.call_executor(
+            subtask=subtask_dict,
+            previous_results=previous_results,
+        )
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[run_one(d) for d in domains], return_exceptions=False),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Executor 并行超时：任务 {task.id}（{task.title}）"
+            f"超过 {timeout:.0f}s 未完成"
+        )
+
+    # 合并：取第一个成功的结果，失败的结果拼接到末尾
+    merged_parts = []
+    first_success = None
+    for r in results:
+        if isinstance(r, dict) and r.get("success"):
+            if first_success is None:
+                first_success = r
+            data = r.get("result")
+            if data:
+                merged_parts.append(str(data))
+
+    if first_success is None:
+        errors = [r.get("error", "unknown") for r in results if isinstance(r, dict)]
+        return {"success": False, "error": "; ".join(errors), "result": None}
+
+    merged_result = "\n\n---\n\n".join(merged_parts) if merged_parts else first_success.get("result")
+    return {"success": True, "result": merged_result, "specialist_id": first_success.get("agent_id")}
     return prev_results

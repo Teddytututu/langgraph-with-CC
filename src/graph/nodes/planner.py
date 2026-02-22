@@ -19,6 +19,7 @@ PLANNER_SYSTEM_PROMPT = """
 4. 估算每个子任务的耗时（分钟）
 5. 子任务数量控制在 3~10 个，不要过度拆分
 6. 必须考虑用户给定的时间预算，合理分配
+7. 为每个子任务列出所需知识领域（knowledge_domains），如 ["python", "async", "database"]
 
 ## 输出格式
 返回严格的 JSON 数组，每个元素包含：
@@ -26,7 +27,9 @@ PLANNER_SYSTEM_PROMPT = """
  "description": "详细描述，包含具体要求和验收标准",
  "agent_type": "coder",
  "dependencies": [], "priority": 1,
- "estimated_minutes": 10}
+ "estimated_minutes": 10,
+ "knowledge_domains": ["domain1", "domain2"],
+ "completion_criteria": ["标准1", "标准2"]}
 """
 
 
@@ -75,6 +78,8 @@ async def planner_node(state: GraphState) -> dict:
                     budget.total_minutes * 0.8
                     if budget else 30
                 ),
+                knowledge_domains=["general"],
+                completion_criteria=["任务已完成"],
             )
         ]
 

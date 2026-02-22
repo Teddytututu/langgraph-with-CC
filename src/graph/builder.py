@@ -14,6 +14,17 @@ from src.graph.edges import (
     should_continue_or_timeout,
 )
 
+_DEFAULT_DB_PATH = "checkpoints.db"
+
+
+def _make_default_checkpointer():
+    """创建默认检查点存储器（优先 SqliteSaver，失败则回退到 MemorySaver）"""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        return SqliteSaver.from_conn_string(_DEFAULT_DB_PATH)
+    except Exception:
+        return MemorySaver()
+
 
 def build_graph(checkpointer=None):
     """构建并编译完整的任务执行 Graph"""
@@ -53,5 +64,5 @@ def build_graph(checkpointer=None):
 
     # ── 编译 ──
     if checkpointer is None:
-        checkpointer = MemorySaver()
+        checkpointer = _make_default_checkpointer()
     return g.compile(checkpointer=checkpointer)
