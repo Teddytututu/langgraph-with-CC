@@ -269,27 +269,20 @@ createApp({
                 if (el) el.scrollTop = el.scrollHeight;
             });
 
-            // build history (exclude the message we just appended)
             const history = chatMessages.value.slice(-9, -1).map(m => ({ role: m.role, content: m.content }));
 
+            // 立即发送，不等待回复（回复通过 WebSocket chat_reply 事件推送）
             try {
-                const res = await fetch('/api/chat', {
+                await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message: msg, history }),
                 });
-                const data = await res.json();
-                const replyTime = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-                chatMessages.value.push({ role: 'assistant', content: data.reply, time: replyTime });
             } catch (e) {
-                chatMessages.value.push({ role: 'assistant', content: `请求失败: ${e.message}`, time: new Date().toLocaleTimeString() });
-            } finally {
                 chatThinking.value = false;
-                Vue.nextTick(() => {
-                    const el = document.getElementById('chat-messages');
-                    if (el) el.scrollTop = el.scrollHeight;
-                });
+                chatMessages.value.push({ role: 'assistant', content: `请求失败: ${e.message}`, time: new Date().toLocaleTimeString() });
             }
+            // chatThinking 由 WS chat_reply 事件处理器关闭
         };
 
         const selectTask = async (task) => {

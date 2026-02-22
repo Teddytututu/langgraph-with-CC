@@ -236,8 +236,7 @@ def register_routes(app: FastAPI):
 
     @app.post("/api/chat")
     async def chat_with_monitor(req: ChatRequest):
-        """与监控AI对话（拥有完整系统上下文）"""
-        executor = get_executor()
+        """与监控AI对话（立即返回，结果通过 WebSocket 推送）"""
 
         running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
         task_summaries = "\n".join(
@@ -245,7 +244,6 @@ def register_routes(app: FastAPI):
             for t in list(app_state.tasks.values())[-8:]
         ) or "  （暂无任务）"
 
-        # 注入当前状态作为上下文，但不覆盖角色——让 CLAUDE.md 的 supervisor 身份生效
         state_context = f"""[web对话上下文]
 当前系统状态: {app_state.system_status}
 当前节点: {app_state.current_node or '无'}
@@ -255,7 +253,6 @@ def register_routes(app: FastAPI):
 ---
 用户通过 Web UI 发来消息，请以 CLAUDE.md supervisor 身份回答。"""
 
-        # 拼接历史
         history_lines = ""
         for h in req.history[-6:]:
             role_label = "用户" if h.get("role") == "user" else "助手"
@@ -263,34 +260,31 @@ def register_routes(app: FastAPI):
 
         full_prompt = f"{state_context}\n\n{history_lines}用户: {req.message}\n助手:"
 
-        try:
-            result = await asyncio.wait_for(
-                executor.execute(
+        async def _run_chat():
+            executor = get_executor()
+            try:
+                result = await executor.execute(
                     agent_id="monitor_chat",
-                    system_prompt="",   # 空 system_prompt → 完全使用 CLAUDE.md + 用户设置
+                    system_prompt="",
                     context={"task": full_prompt},
                     tools=[],
                     max_turns=5,
-                ),
-                timeout=90,
-            )
-            if not result.success:
-                reply = f"⚠️ 执行错误: {result.error or '未知错误'}"
-            else:
-                reply = (result.result or "（无回复内容）").strip()
-        except asyncio.TimeoutError:
-            reply = "⏱️ 响应超时（>90s），请稍后重试。"
-        except Exception as e:
-            reply = f"⚠️ 请求失败: {str(e)[:150]}"
-        ts = datetime.now().isoformat()
+                )
+                if not result.success:
+                    reply = f"⚠️ 执行错误: {result.error or '未知错误'}"
+                else:
+                    reply = (result.result or "（无回复内容）").strip()
+            except Exception as e:
+                reply = f"⚠️ 请求失败: {str(e)[:200]}"
 
-        await app_state.broadcast("chat_reply", {
-            "role": "assistant",
-            "content": reply,
-            "ts": ts,
-        })
+            await app_state.broadcast("chat_reply", {
+                "role": "assistant",
+                "content": reply,
+                "ts": datetime.now().isoformat(),
+            })
 
-        return {"reply": reply, "timestamp": ts}
+        asyncio.create_task(_run_chat())
+        return {"status": "thinking"}
 
     @app.post("/api/tasks/{task_id}/start")
     async def start_task(task_id: str):
