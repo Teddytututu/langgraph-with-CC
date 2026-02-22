@@ -36,6 +36,11 @@ class MessagePost(BaseModel):
     message_type: str = "info"
 
 
+class TaskIntervene(BaseModel):
+    """实时干预请求"""
+    instruction: str  # 注入到运行中任务的指令
+
+
 # 全局状态
 class AppState:
     def __init__(self):
@@ -46,6 +51,8 @@ class AppState:
         self.system_status: str = "idle"  # idle, running, completed, failed
         self.current_node: str = ""  # 当前执行的节点
         self.current_task_id: str = ""  # 当前执行的任务 ID
+        # 实时干预：task_id -> 待注入指令列表
+        self.intervention_queues: dict[str, list[str]] = {}
 
     async def broadcast(self, event: str, data: dict):
         """广播事件到所有连接的 WebSocket"""
@@ -146,6 +153,33 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
         return app_state.tasks[task_id]
+
+    @app.post("/api/tasks/{task_id}/intervene")
+    async def intervene_task(task_id: str, req: TaskIntervene):
+        """向运行中的任务注入实时指令"""
+        if task_id not in app_state.tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = app_state.tasks[task_id]
+
+        # 追加到干预队列（run_task 在下一个节点间隙消费）
+        if task_id not in app_state.intervention_queues:
+            app_state.intervention_queues[task_id] = []
+        app_state.intervention_queues[task_id].append(req.instruction)
+
+        # 记录到任务历史
+        if "interventions" not in task:
+            task["interventions"] = []
+        entry = {"content": req.instruction, "timestamp": datetime.now().isoformat()}
+        task["interventions"].append(entry)
+
+        await app_state.broadcast("task_intervened", {
+            "task_id": task_id,
+            "instruction": req.instruction,
+            "timestamp": entry["timestamp"],
+        })
+
+        return {"status": "queued", "timestamp": entry["timestamp"]}
 
     @app.post("/api/tasks/{task_id}/start")
     async def start_task(task_id: str):
@@ -250,6 +284,19 @@ def register_routes(app: FastAPI):
                             "status": "completed",
                             "task_id": task_id,
                         })
+
+                # ── 节点间隙：消费干预队列，注入 GraphState messages ──
+                pending = app_state.intervention_queues.pop(task_id, [])
+                if pending:
+                    injected = [f"[用户实时指令] {inst}" for inst in pending]
+                    await graph.aupdate_state(
+                        config,
+                        {"messages": injected},
+                    )
+                    await app_state.broadcast("task_intervention_applied", {
+                        "task_id": task_id,
+                        "instructions": pending,
+                    })
 
         except Exception as e:
             task["status"] = "failed"

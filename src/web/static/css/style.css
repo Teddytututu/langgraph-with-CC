@@ -1364,3 +1364,53 @@ body {
 
 .result-output::-webkit-scrollbar { width: 6px; }
 .result-output::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ========== 实时干预面板 ========== */
+.intervene-history {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 14px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+.intervene-history::-webkit-scrollbar { width: 4px; }
+.intervene-history::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.intervene-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--violet-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--violet-light);
+    border-radius: var(--r-md);
+}
+.intervene-icon { font-size: 14px; line-height: 1.6; flex-shrink: 0; }
+.intervene-body { flex: 1; min-width: 0; }
+.intervene-text { font-size: 12.5px; color: var(--text-2); line-height: 1.5; word-break: break-word; }
+.intervene-time { font-size: 11px; color: var(--text-4); margin-top: 3px; }
+
+.intervene-composer {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+.intervene-input {
+    flex: 1;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    color: var(--text-1);
+    resize: vertical;
+    min-height: 58px;
+    outline: none;
+    transition: border-color 0.15s var(--ease);
+}
+.intervene-input:focus { border-color: var(--violet-light); }
+.intervene-input::placeholder { color: var(--text-4); }
+.intervene-btn { align-self: flex-end; white-space: nowrap; }

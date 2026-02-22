@@ -32,6 +32,7 @@ createApp({
 
         const newTask = ref({ task: '', time_minutes: null });
         const newMessage = ref({ from_agent: 'director', content: '' });
+        const interveneText = ref('');
 
         // Stats
         const stats = computed(() => ({
@@ -97,6 +98,15 @@ createApp({
                     mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
                     addActivity(`Task failed: ${payload.id}`);
                     break;
+                case 'task_intervened': {
+                    const t = tasks.value.find(t => t.id === payload.task_id);
+                    if (t) {
+                        if (!t.interventions) t.interventions = [];
+                        t.interventions.push({ content: payload.instruction, timestamp: payload.timestamp });
+                    }
+                    addActivity(`⚡ Injected: ${payload.instruction.slice(0, 40)}`);
+                    break;
+                }
             }
         };
 
@@ -227,6 +237,16 @@ createApp({
             newMessage.value.content = '';
         };
 
+        const intervene = async () => {
+            if (!interveneText.value.trim() || !selectedTask.value) return;
+            await fetch(`/api/tasks/${selectedTask.value.id}/intervene`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ instruction: interveneText.value.trim() })
+            });
+            interveneText.value = '';
+        };
+
         // Utils
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
         const formatTime = (t) => t ? new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '';
@@ -250,8 +270,9 @@ createApp({
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
             discussionMessages, mermaidSvg, showNewTask, newTask, newMessage, activityLogs,
+            interveneText,
             stats, getCompletedSubtasks,
-            createTask, selectTask, selectSubtask, sendMessage, getStatusText, formatTime,
+            createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime,
             fetchGraph,
         };
     }

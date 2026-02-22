@@ -222,6 +222,47 @@
                     </div>
                 </div>
 
+                <!-- 实时干预 -->
+                <div class="card" v-if="selectedTask">
+                    <div class="card-header">
+                        <span class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                            </svg>
+                            Intervention
+                        </span>
+                        <span v-if="selectedTask.status === 'running'" class="node-badge">
+                            <span class="pulse"></span>Live
+                        </span>
+                    </div>
+                    <div class="card-body">
+                        <div class="intervene-history" v-if="selectedTask.interventions?.length">
+                            <div v-for="iv in selectedTask.interventions" :key="iv.timestamp" class="intervene-item">
+                                <span class="intervene-icon">&#9889;</span>
+                                <div class="intervene-body">
+                                    <div class="intervene-text">{{ iv.content }}</div>
+                                    <div class="intervene-time">{{ formatTime(iv.timestamp) }}</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="intervene-composer">
+                            <textarea
+                                v-model="interveneText"
+                                @keydown.ctrl.enter="intervene"
+                                placeholder="Inject an instruction into the running task… (Ctrl+Enter to send)"
+                                rows="2"
+                                class="intervene-input"
+                            ></textarea>
+                            <button class="btn btn-primary intervene-btn" @click="intervene" :disabled="!interveneText.trim()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                                </svg>
+                                Inject
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 任务输出 -->
                 <div class="card result-card" v-if="selectedTask?.result">
                     <div class="card-header">
