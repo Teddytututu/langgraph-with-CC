@@ -5,19 +5,30 @@ Subagent 调用接口
 """
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any, Optional
 
 from .subagent_manager import SubagentManager, get_manager, SubagentState
 from .pool_registry import SubagentPool, get_pool
+from .executor_bridge import ExecutorBridge, get_bridge
 
 
 class SubagentCaller:
     """Subagent 调用器"""
 
-    def __init__(self, manager: SubagentManager = None, pool: SubagentPool = None):
+    def __init__(self, manager: SubagentManager = None, pool: SubagentPool = None, bridge: ExecutorBridge = None):
         self.manager = manager or get_manager()
         self.pool = pool or get_pool()
+        self.bridge = bridge or get_bridge()
+        # 缓存 call_id 映射（用于检测相同调用的结果）
+        self._call_cache: dict[str, str] = {}  # cache_key -> call_id
+
+    def _get_cache_key(self, agent_id: str, context: dict) -> str:
+        """生成调用缓存键"""
+        context_str = json.dumps(context, sort_keys=True, ensure_ascii=False)
+        context_hash = hashlib.md5(context_str.encode()).hexdigest()[:8]
+        return f"{agent_id}:{context_hash}"
 
     async def call(self, agent_id: str, context: dict[str, Any]) -> dict[str, Any]:
         """
@@ -30,6 +41,23 @@ class SubagentCaller:
         Returns:
             执行结果
         """
+        # 检查是否有已完成的结果（基于缓存键）
+        cache_key = self._get_cache_key(agent_id, context)
+        cached_call_id = self._call_cache.get(cache_key)
+
+        if cached_call_id:
+            result = self.bridge.get_result(cached_call_id)
+            if result:
+                # 有缓存结果，直接返回
+                return {
+                    "success": result.get("success", True),
+                    "call_id": cached_call_id,
+                    "agent_id": agent_id,
+                    "result": result.get("result"),
+                    "status": "completed",
+                    "from_cache": True
+                }
+
         # 检查 subagent 状态
         state = self.manager.get_state(agent_id)
         if state not in (SubagentState.READY, SubagentState.IN_USE):
@@ -52,22 +80,33 @@ class SubagentCaller:
         self.manager.mark_in_use(agent_id)
 
         try:
-            # 构建 subagent 调用信息
-            call_info = {
-                "agent_id": agent_id,
-                "name": template.name,
-                "description": template.description,
-                "tools": template.tools,
-                "system_prompt": template.content,
-                "context": context,
-            }
+            # 创建调用指令（写入 pending_calls.json）
+            call_id = self.bridge.create_call(
+                agent_id=agent_id,
+                system_prompt=template.content,
+                context=context,
+                tools=template.tools,
+                model=template.model
+            )
 
-            # 返回调用信息（实际执行由 Claude Code 的 Task 工具完成）
+            # 缓存调用
+            self._call_cache[cache_key] = call_id
+
+            # 返回调用信息（等待 CLAUDE.md 执行）
             return {
                 "success": True,
-                "call_info": call_info,
+                "call_id": call_id,
                 "agent_id": agent_id,
-                "result": None,  # 实际结果由外部执行器填充
+                "status": "pending_execution",
+                "result": None,
+                "call_info": {
+                    "agent_id": agent_id,
+                    "name": template.name,
+                    "description": template.description,
+                    "tools": template.tools,
+                    "system_prompt": template.content,
+                    "context": context,
+                }
             }
 
         except Exception as e:
@@ -76,6 +115,33 @@ class SubagentCaller:
                 "error": str(e),
                 "result": None
             }
+
+    def check_result(self, call_id: str) -> dict[str, Any]:
+        """
+        检查调用结果
+
+        Args:
+            call_id: 调用 ID
+
+        Returns:
+            包含结果状态和数据的字典
+        """
+        result = self.bridge.get_result(call_id)
+
+        if result is None:
+            return {
+                "status": "pending",
+                "result": None,
+                "completed": False
+            }
+
+        return {
+            "status": "completed",
+            "result": result.get("result"),
+            "success": result.get("success", True),
+            "error": result.get("error"),
+            "completed": True
+        }
 
     async def call_planner(self, task: str, time_budget: dict = None) -> dict:
         """调用 planner subagent 进行任务分解"""
@@ -108,6 +174,14 @@ class SubagentCaller:
             "subtask": subtask,
         }
         return await self.call("reflector", context)
+
+    async def call_specialist(self, agent_id: str, subtask: dict, previous_results: list = None) -> dict:
+        """调用专业 subagent 执行任务"""
+        context = {
+            "subtask": subtask,
+            "previous_results": previous_results or [],
+        }
+        return await self.call(agent_id, context)
 
     async def get_or_create_specialist(self, skills: list[str], task_description: str) -> Optional[str]:
         """
