@@ -35,43 +35,12 @@ async def planner_node(state: GraphState) -> dict:
     分解用户任务为子任务 DAG
 
     通过 SubagentCaller 调用 planner subagent 执行任务分解
-    SDK 模式下同步执行，降级模式下需要等待
     """
     config = get_config()
     caller = get_caller()
 
     budget = state.get("time_budget")
     user_task = state["user_task"]
-
-    # 🆕 降级模式：检查是否有等待中的调用
-    pending_id = state.get("pending_call_id")
-    if pending_id and caller.mode == "fallback":
-        result_info = caller.check_result(pending_id)
-
-        if result_info.get("completed"):
-            # 有结果了，解析并返回
-            subtasks = _parse_subtasks_from_result(result_info.get("result"), budget)
-            return {
-                "subtasks": subtasks,
-                "phase": "budgeting",
-                "pending_call_id": None,
-                "waiting_for_subagent": False,
-                "pending_agent_type": None,
-                "execution_log": [{
-                    "event": "planning_complete",
-                    "timestamp": datetime.now().isoformat(),
-                    "subtask_count": len(subtasks),
-                    "subagent_called": "planner",
-                    "call_id": pending_id,
-                    "mode": "fallback",
-                }],
-            }
-        else:
-            # 还在等待
-            return {
-                "waiting_for_subagent": True,
-                "phase": "waiting",
-            }
 
     # 构建时间预算信息
     time_budget_info = None
@@ -81,29 +50,17 @@ async def planner_node(state: GraphState) -> dict:
             "remaining_minutes": budget.remaining_minutes,
         }
 
-    # 调用 planner subagent（SDK 模式下同步执行）
+    # 直接调用 planner subagent
     call_result = await caller.call_planner(
         task=user_task,
         time_budget=time_budget_info
     )
 
-    # 🆕 降级模式：检查是否需要等待外部执行
-    if call_result.get("status") == "pending_execution":
-        return {
-            "pending_call_id": call_result["call_id"],
-            "waiting_for_subagent": True,
-            "pending_agent_type": "planner",
-            "phase": "waiting",
-            "execution_log": [{
-                "event": "planning_call_created",
-                "timestamp": datetime.now().isoformat(),
-                "call_id": call_result["call_id"],
-                "agent_id": "planner",
-                "mode": "fallback",
-            }],
-        }
+    # 检查执行是否成功
+    if not call_result.get("success"):
+        raise RuntimeError(f"Planner 执行失败: {call_result.get('error')}")
 
-    # SDK 模式：直接获取结果
+    # 解析子任务
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
 
     # 如果 subagent 未返回有效结果，创建默认子任务
@@ -124,15 +81,11 @@ async def planner_node(state: GraphState) -> dict:
     return {
         "subtasks": subtasks,
         "phase": "budgeting",
-        "pending_call_id": None,
-        "waiting_for_subagent": False,
-        "pending_agent_type": None,
         "execution_log": [{
             "event": "planning_complete",
             "timestamp": datetime.now().isoformat(),
             "subtask_count": len(subtasks),
             "subagent_called": "planner",
-            "mode": call_result.get("mode", "sdk"),
         }],
     }
 

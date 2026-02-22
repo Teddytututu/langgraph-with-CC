@@ -7,7 +7,7 @@ async def router_node(state: GraphState) -> dict:
     """判断整体进度，决定下一步"""
     budget = state.get("time_budget")
 
-    # ✅ 纯函数式更新时间
+    # 纯函数式更新时间
     if budget and budget.started_at:
         elapsed = (
             datetime.now() - budget.started_at
@@ -18,15 +18,6 @@ async def router_node(state: GraphState) -> dict:
             "remaining_minutes": remaining,
             "is_overtime": remaining <= 0,
         })
-
-    # 🆕 检查是否在等待 subagent 执行
-    if state.get("waiting_for_subagent"):
-        # 保持等待状态，等待下一轮检查
-        return {
-            "phase": "waiting",
-            "time_budget": budget,
-            "iteration": state.get("iteration", 0) + 1,
-        }
 
     # 全部完成 → 汇总输出
     subtasks = state.get("subtasks", [])
