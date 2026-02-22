@@ -763,7 +763,7 @@ body {
 /* ========== Graph ========== */
 .graph-card {
     flex: 1;
-    min-height: 340px;
+    min-height: 400px;
     display: flex;
     flex-direction: column;
 }
@@ -783,22 +783,69 @@ body {
     position: absolute;
     inset: 0;
     background-image:
-        radial-gradient(circle at 20% 30%, rgba(124, 58, 237, 0.05) 0%, transparent 30%),
-        radial-gradient(circle at 80% 70%, rgba(59, 130, 246, 0.05) 0%, transparent 30%);
+        radial-gradient(circle at 20% 30%, rgba(124, 58, 237, 0.07) 0%, transparent 35%),
+        radial-gradient(circle at 80% 70%, rgba(59, 130, 246, 0.07) 0%, transparent 35%),
+        radial-gradient(circle at 50% 50%, rgba(16, 185, 129, 0.03) 0%, transparent 50%);
     pointer-events: none;
+}
+
+/* ── Mermaid SVG 容器 ── */
+.graph-card .card-body > div {
+    width: 100%;
+    max-height: 520px;
+    overflow: auto;
+    z-index: 1;
+    position: relative;
+    padding: 16px 12px;
+    box-sizing: border-box;
+    /* 美化滚动条 */
+    scrollbar-width: thin;
+    scrollbar-color: #3f3f46 transparent;
+}
+.graph-card .card-body > div::-webkit-scrollbar { width: 5px; height: 5px; }
+.graph-card .card-body > div::-webkit-scrollbar-track { background: transparent; }
+.graph-card .card-body > div::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+
+/* SVG 本体 */
+.graph-card .card-body svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    filter: drop-shadow(0 2px 12px rgba(0,0,0,0.4));
+}
+
+/* 边上标签 pill */
+.graph-card .card-body .edgeLabel foreignObject { overflow: visible; }
+.graph-card .card-body .edgeLabel .label {
+    background: #1c1c22 !important;
+    border: 1px solid #3f3f46 !important;
+    border-radius: 4px !important;
+    padding: 1px 6px !important;
+    font-size: 11px !important;
+    color: #71717a !important;
+    white-space: nowrap;
+}
+
+/* 节点形状透明度修正（Mermaid dark 主题有时 fill:none 残影）*/
+.graph-card .card-body .node rect,
+.graph-card .card-body .node circle,
+.graph-card .card-body .node ellipse,
+.graph-card .card-body .node polygon,
+.graph-card .card-body .node path {
+    stroke-width: 1.5px;
 }
 
 .node-badge {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 14px;
-    background: var(--warning-bg);
-    border: 1px solid #FED7AA;
+    padding: 5px 14px;
+    background: rgba(109, 40, 217, 0.18);
+    border: 1px solid #7c3aed;
     border-radius: 100px;
     font-size: 0.75rem;
     font-weight: 600;
-    color: #92400E;
+    color: #c4b5fd;
     text-transform: capitalize;
 }
 
@@ -1661,3 +1708,14 @@ body {
 .intervene-input:focus { border-color: var(--violet-light); }
 .intervene-input::placeholder { color: var(--text-4); }
 .intervene-btn { align-self: flex-end; white-space: nowrap; }
+
+/* ── 静态工作流 SVG 管线 ─────────────────────────── */
+.workflow-svg {
+    width: 100%;
+    max-width: 560px;
+    height: auto;
+    display: block;
+    margin: auto;
+    position: relative;
+    z-index: 1;
+}

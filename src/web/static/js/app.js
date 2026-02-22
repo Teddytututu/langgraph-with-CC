@@ -5,15 +5,33 @@ mermaid.initialize({
     startOnLoad: false,
     theme: 'dark',
     themeVariables: {
-        primaryColor: '#8B5CF6',
-        primaryTextColor: '#FAFAFA',
-        primaryBorderColor: '#8B5CF6',
-        lineColor: '#52525B',
-        secondaryColor: '#27272A',
-        background: '#18181B',
-        mainBkg: '#27272A',
-        nodeBorder: '#8B5CF6',
-    }
+        // Base palette
+        primaryColor: '#2a2a35',
+        primaryTextColor: '#e4e4e7',
+        primaryBorderColor: '#52525b',
+        secondaryColor: '#1f1f27',
+        tertiaryColor: '#3a3a46',
+        // Lines / edges
+        lineColor: '#6b7280',
+        edgeLabelBackground: '#18181b',
+        // Background
+        background: '#18181b',
+        mainBkg: '#27272a',
+        // Typography
+        fontFamily: '"Inter", ui-sans-serif, system-ui, sans-serif',
+        fontSize: '13px',
+        // Note/label
+        noteBkgColor: '#3f3f46',
+        noteTextColor: '#d4d4d8',
+        notesBorderColor: '#52525b',
+    },
+    flowchart: {
+        htmlLabels: true,
+        padding: 20,
+        nodeSpacing: 48,
+        rankSpacing: 64,
+        curve: 'basis',
+    },
 });
 
 createApp({
@@ -255,16 +273,12 @@ createApp({
 
         // 根据当前活跃节点向原始图注入 classDef 高亮并渲染
         const updateGraphRender = async () => {
-            if (!rawMermaid.value) return;
-            let mStr = rawMermaid.value;
-
-            // 活跃节点：紫色高亮（不能用 filter: 括号会触发 Mermaid 解析错误；default 是保留字不能覆盖）
-            mStr += '\nclassDef active fill:#6c63ff,stroke:#a78bfa,stroke-width:4px,color:#fff;';
-
-            if (currentNode.value) {
-                mStr += `\nclass ${currentNode.value} active;`;
+            // 静态骨架图由前端 SVG 直接渲染，无需 Mermaid
+            if (!isDynamicGraph.value || !rawMermaid.value) {
+                mermaidSvg.value = '';
+                return;
             }
-
+            let mStr = rawMermaid.value;
             try {
                 const id = 'graph-render-' + (++_renderSeq);
                 const { svg } = await mermaid.render(id, mStr);
@@ -273,6 +287,9 @@ createApp({
                 console.error('Mermaid render error:', e);
             }
         };
+
+        // 是否显示动态子任务 DAG（否则显示静态 SVG Pipeline）
+        const isDynamicGraph = computed(() => rawMermaid.value.includes('task_header'));
 
         // 拉取图结构（只在结构真正变化时请求网络）
         let _lastRawMermaid = '';
@@ -524,7 +541,7 @@ createApp({
 
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
-            discussionMessages, discussionParticipants, mermaidSvg, showNewTask, newTask, newMessage,
+            discussionMessages, discussionParticipants, mermaidSvg, isDynamicGraph, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks, discussionAgents,

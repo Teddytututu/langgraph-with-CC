@@ -609,7 +609,7 @@ def register_routes(app: FastAPI):
                     break
 
         if not subtasks:
-            return app_state.graph_builder.to_mermaid()
+            return ""
 
         # ── 动态子任务 DAG ────────────────────────────────────────────────────
         def safe_id(raw: str) -> str:
@@ -626,7 +626,7 @@ def register_routes(app: FastAPI):
             "skipped": "fill:#18181b,color:#52525b,stroke:#27272a,stroke-width:1px",
         }
 
-        lines = ["graph TD"]
+        lines = ["graph LR"]
         deferred_styles = []
 
         # ── 顶部标题节点 ──────────────────────────────────────────────────────
@@ -636,22 +636,22 @@ def register_routes(app: FastAPI):
 
         if task_status == "running":
             phase = app_state.current_node or "running"
-            lines.append(f'    {hid}[["⚙ {phase.upper()}"]]')
+            lines.append(f'    {hid}(["⚙ {phase.upper()}"])')
             deferred_styles.append(
                 f"    style {hid} fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:2px"
             )
         elif task_status in ("completed", "done"):
-            lines.append(f'    {hid}[/"✓ {task_title}"/]')
+            lines.append(f'    {hid}(["✓ {task_title}"])')
             deferred_styles.append(
                 f"    style {hid} fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px"
             )
         elif task_status == "failed":
-            lines.append(f'    {hid}[\"✗ {task_title}\"]')
+            lines.append(f'    {hid}(["✗ {task_title}"])')
             deferred_styles.append(
                 f"    style {hid} fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px"
             )
         else:
-            lines.append(f'    {hid}["{task_title}"]')
+            lines.append(f'    {hid}(["{task_title}"])')
             deferred_styles.append(
                 f"    style {hid} fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1px"
             )
@@ -661,7 +661,7 @@ def register_routes(app: FastAPI):
             sid = safe_id(st["id"])
             icon = status_icon.get(st.get("status", "pending"), "○")
             title = st["title"].replace('"', "'")[:24]
-            lines.append(f'    {sid}["{icon} {title}"]')
+            lines.append(f'    {sid}(["{icon} {title}"])')
             fill = status_fill.get(st.get("status", "pending"), status_fill["pending"])
             deferred_styles.append(f"    style {sid} {fill}")
 
