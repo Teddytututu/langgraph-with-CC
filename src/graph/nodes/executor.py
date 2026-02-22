@@ -241,4 +241,3 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
 
     merged_result = "\n\n---\n\n".join(merged_parts) if merged_parts else first_success.get("result")
     return {"success": True, "result": merged_result, "specialist_id": first_success.get("agent_id")}
-    return prev_results
