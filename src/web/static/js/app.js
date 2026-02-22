@@ -5,10 +5,25 @@ const { createApp, ref, computed, onMounted, watch } = Vue;
 // 初始化 Mermaid
 mermaid.initialize({
     startOnLoad: false,
-    theme: 'default',
+    theme: 'dark',
+    themeVariables: {
+        primaryColor: '#6366f1',
+        primaryTextColor: '#f8fafc',
+        primaryBorderColor: '#6366f1',
+        lineColor: '#64748b',
+        secondaryColor: '#1e293b',
+        tertiaryColor: '#334155',
+        background: '#0f172a',
+        mainBkg: '#1e293b',
+        nodeBorder: '#6366f1',
+        clusterBkg: '#1e293b',
+        titleColor: '#f8fafc',
+        edgeLabelBackground: '#0f172a',
+    },
     flowchart: {
         useMaxWidth: true,
         htmlLabels: true,
+        curve: 'basis',
     }
 });
 
@@ -16,7 +31,7 @@ createApp({
     setup() {
         // 状态
         const wsConnected = ref(false);
-        const systemStatus = ref('idle');  // idle, running, completed, failed
+        const systemStatus = ref('idle');
         const currentNode = ref('');
         const currentTaskId = ref('');
         const tasks = ref([]);
@@ -38,6 +53,12 @@ createApp({
             content: ''
         });
 
+        // 计算属性：完成的子任务数量
+        const getCompletedSubtasks = computed(() => {
+            if (!selectedTask.value?.subtasks) return 0;
+            return selectedTask.value.subtasks.filter(s => s.status === 'done' || s.status === 'completed').length;
+        });
+
         // WebSocket 连接
         let ws = null;
 
@@ -53,7 +74,6 @@ createApp({
             ws.onclose = () => {
                 wsConnected.value = false;
                 console.log('WebSocket disconnected');
-                // 5秒后重连
                 setTimeout(connectWebSocket, 5000);
             };
 
@@ -76,7 +96,6 @@ createApp({
                     if (payload.task_id) {
                         currentTaskId.value = payload.task_id;
                     }
-                    // 状态改变时刷新 Graph
                     if (payload.status === 'running' || payload.status === 'completed') {
                         fetchGraph();
                     }
@@ -84,7 +103,7 @@ createApp({
 
                 case 'node_changed':
                     currentNode.value = payload.node;
-                    fetchGraph();  // 刷新 Graph 以高亮当前节点
+                    fetchGraph();
                     break;
 
                 case 'task_created':
@@ -141,23 +160,31 @@ createApp({
 
         // API 调用
         const fetchTasks = async () => {
-            const response = await fetch('/api/tasks');
-            const data = await response.json();
-            tasks.value = data.tasks;
+            try {
+                const response = await fetch('/api/tasks');
+                const data = await response.json();
+                tasks.value = data.tasks;
+            } catch (error) {
+                console.error('Failed to fetch tasks:', error);
+            }
         };
 
         const fetchGraph = async () => {
             try {
                 const response = await fetch('/api/graph/mermaid');
                 const data = await response.json();
-                const { svg } = await mermaid.render('graph-svg', data.mermaid);
+
+                // 生成唯一 ID 避免 Mermaid 缓存问题
+                const uniqueId = `graph-svg-${Date.now()}`;
+                const { svg } = await mermaid.render(uniqueId, data.mermaid);
                 mermaidSvg.value = svg;
+
                 if (data.current_node) {
                     currentNode.value = data.current_node;
                 }
             } catch (error) {
                 console.error('Failed to fetch graph:', error);
-                mermaidSvg.value = '<p>加载 Graph 失败</p>';
+                mermaidSvg.value = '<p style="color: var(--text-muted); text-align: center;">加载 Graph 失败</p>';
             }
         };
 
@@ -176,18 +203,22 @@ createApp({
         const createTask = async () => {
             if (!newTask.value.task.trim()) return;
 
-            const response = await fetch('/api/tasks', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(newTask.value)
-            });
+            try {
+                const response = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newTask.value)
+                });
 
-            const data = await response.json();
-            showNewTask.value = false;
-            newTask.value = { task: '', time_minutes: null };
+                const data = await response.json();
+                showNewTask.value = false;
+                newTask.value = { task: '', time_minutes: null };
 
-            // 自动启动任务
-            await fetch(`/api/tasks/${data.id}/start`, { method: 'POST' });
+                // 自动启动任务
+                await fetch(`/api/tasks/${data.id}/start`, { method: 'POST' });
+            } catch (error) {
+                console.error('Failed to create task:', error);
+            }
         };
 
         const selectTask = (task) => {
@@ -199,7 +230,6 @@ createApp({
         const selectSubtask = async (subtask) => {
             selectedSubtask.value = subtask;
 
-            // 加载讨论历史
             if (selectedTask.value) {
                 try {
                     const response = await fetch(
@@ -218,16 +248,20 @@ createApp({
         const sendMessage = async () => {
             if (!newMessage.value.content.trim() || !selectedSubtask.value || !selectedTask.value) return;
 
-            await fetch(
-                `/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(newMessage.value)
-                }
-            );
+            try {
+                await fetch(
+                    `/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(newMessage.value)
+                    }
+                );
 
-            newMessage.value.content = '';
+                newMessage.value.content = '';
+            } catch (error) {
+                console.error('Failed to send message:', error);
+            }
         };
 
         const scrollToBottom = () => {
@@ -242,7 +276,7 @@ createApp({
         // 工具函数
         const getStatusIcon = (status) => {
             const icons = {
-                created: '📝',
+                created: '📋',
                 pending: '⏳',
                 running: '🔄',
                 done: '✅',
@@ -251,6 +285,20 @@ createApp({
                 skipped: '⏭️'
             };
             return icons[status] || '❓';
+        };
+
+        const getStatusText = (status) => {
+            const texts = {
+                idle: '待机中',
+                running: '执行中',
+                completed: '已完成',
+                failed: '执行失败',
+                created: '已创建',
+                pending: '等待中',
+                done: '已完成',
+                skipped: '已跳过'
+            };
+            return texts[status] || status;
         };
 
         const formatTime = (timestamp) => {
@@ -267,33 +315,7 @@ createApp({
             connectWebSocket();
             fetchTasks();
             fetchSystemStatus();
-            // 只有在有任务运行时才获取 Graph
-            if (systemStatus.value === 'running' || systemStatus.value === 'completed') {
-                fetchGraph();
-            }
         });
-
-        // 监听任务选择变化，更新 Graph
-        watch(selectedTask, () => {
-            if (systemStatus.value === 'running' || systemStatus.value === 'completed') {
-                fetchGraph();
-            }
-        });
-
-        // 工具函数 - 状态文本
-        const getStatusText = (status) => {
-            const texts = {
-                idle: '待机中',
-                running: '执行中',
-                completed: '已完成',
-                failed: '执行失败',
-                created: '已创建',
-                pending: '等待中',
-                done: '已完成',
-                skipped: '已跳过'
-            };
-            return texts[status] || status;
-        };
 
         return {
             // 状态
@@ -309,6 +331,9 @@ createApp({
             showNewTask,
             newTask,
             newMessage,
+
+            // 计算属性
+            getCompletedSubtasks,
 
             // 方法
             createTask,
