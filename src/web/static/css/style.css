@@ -964,76 +964,109 @@ body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ========== 活动 ========== */
-.activity-card {
-    margin-top: 24px;
-    border-top: 3px solid;
-    border-image: var(--gradient) 1;
-    background: linear-gradient(180deg, var(--bg-elevated) 0%, var(--bg-surface) 100%);
-}
-
-.activity-card::before {
-    display: none;
-}
-
-.activity-list {
+/* ========== Terminal ========== */
+.terminal-card {
     display: flex;
     flex-direction: column;
-    min-height: 200px;
-    max-height: 300px;
+    margin-top: 24px;
+    border-top: 3px solid transparent;
+    border-image: var(--gradient) 1;
+}
+
+.terminal-card::before { display: none; }
+
+.terminal-output {
+    flex: 1;
+    min-height: 320px;
+    max-height: 440px;
     overflow-y: auto;
+    background: #0A0A0C;
+    border-radius: var(--r-sm);
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.775rem;
+    line-height: 1.75;
+    border: 1px solid rgba(255,255,255,0.06);
+    margin: 0 16px 0;
 }
 
-.activity-item {
+.terminal-output::-webkit-scrollbar { width: 4px; }
+.terminal-output::-webkit-scrollbar-track { background: transparent; }
+.terminal-output::-webkit-scrollbar-thumb { background: #3F3F46; border-radius: 2px; }
+
+.term-line {
     display: flex;
-    gap: 12px;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    transition: background 0.15s;
-    position: relative;
+    gap: 10px;
+    padding: 1px 0;
+    animation: termIn 0.1s ease;
 }
 
-/* 活动项左边装饰 */
-.activity-item::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: var(--gradient);
-    opacity: 0;
-    transition: opacity 0.2s;
+@keyframes termIn {
+    from { opacity: 0; transform: translateX(-4px); }
+    to   { opacity: 1; transform: translateX(0); }
 }
 
-.activity-item:hover::before {
-    opacity: 1;
-}
-
-.activity-item:hover { background: var(--bg-elevated); }
-.activity-item:last-child { border-bottom: none; }
-
-.activity-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--violet);
-    margin-top: 6px;
+.term-ts {
     flex-shrink: 0;
-}
-
-.activity-content { flex: 1; }
-
-.activity-title {
-    font-size: 0.875rem;
-    color: var(--text-1);
-    font-weight: 500;
-}
-
-.activity-time {
-    font-size: 0.6875rem;
-    color: var(--text-4);
+    width: 64px;
+    color: #3F3F46;
     font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+
+.term-text {
+    flex: 1;
+    word-break: break-all;
+    color: #71717A;
+}
+
+/* Level colours */
+.term-line.node    .term-text { color: #22D3EE; }
+.term-line.success .term-text { color: #10B981; }
+.term-line.error   .term-text { color: #EF4444; }
+.term-line.warn    .term-text { color: #F59E0B; }
+.term-line.input   .term-text { color: #FAFAFA; font-weight: 600; }
+.term-line.start   .term-text { color: #A78BFA; font-weight: 500; }
+.term-line.running .term-text { color: #60A5FA; }
+.term-line.info    .term-text { color: #52525B; font-style: italic; }
+
+/* Terminal input row */
+.terminal-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: #0A0A0C;
+    border-radius: 0 0 var(--r-md) var(--r-md);
+}
+
+.term-prompt {
+    color: #A78BFA;
+    font-family: monospace;
+    font-size: 0.8rem;
+    font-weight: 700;
+    flex-shrink: 0;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.term-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #FAFAFA;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    caret-color: #A78BFA;
+}
+
+.term-input::placeholder { color: #3F3F46; }
+
+.term-send {
+    padding: 5px 10px;
+    flex-shrink: 0;
 }
 
 /* ========== 讨论 ========== */

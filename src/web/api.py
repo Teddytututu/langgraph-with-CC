@@ -69,7 +69,8 @@ class AppState:
         for ws in self.active_websockets[:]:  # 复制列表避免迭代时修改
             try:
                 await ws.send_text(message)
-            except:
+            except (ConnectionError, RuntimeError, OSError):
+                # WebSocket 连接异常，移除断开的连接
                 if ws in self.active_websockets:
                     self.active_websockets.remove(ws)
 
@@ -239,8 +240,18 @@ def register_routes(app: FastAPI):
         """执行任务（后台）"""
         task = app_state.tasks[task_id]
 
+        async def emit(line: str, level: str = "info"):
+            """broadcast 一行终端输出"""
+            await app_state.broadcast("terminal_output", {
+                "task_id": task_id,
+                "line": line,
+                "level": level,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+
         try:
             graph = app_state.graph_builder.compile()
+            await emit(f"▶ 任务已启动: {task['task'][:60]}", "start")
 
             initial_state: GraphState = {
                 "user_task": task["task"],
@@ -267,6 +278,26 @@ def register_routes(app: FastAPI):
                         "task_id": task_id,
                         "node": node_name,
                     })
+                    await emit(f"\u25b6 [{node_name.upper()}] phase={state_update.get('phase','')}", "node")
+
+                    # 解析 execution_log 中的事件
+                    for log_entry in state_update.get("execution_log", []):
+                        ev = log_entry.get("event", "")
+                        if ev == "planning_complete":
+                            await emit(
+                                f"  ✓ 规划完成: {log_entry.get('subtask_count')} 个子任务",
+                                "success"
+                            )
+                        elif ev == "task_executed":
+                            await emit(
+                                f"  ✓ {log_entry.get('task_id')} 执行完成 [専家={log_entry.get('specialist_id','-')}]",
+                                "success"
+                            )
+                        elif ev == "reflection_complete":
+                            await emit(
+                                f"  ↺ {log_entry.get('task_id')} 反思重试 #retry={log_entry.get('retry_count',0)+1}",
+                                "warn"
+                            )
 
                     # 广播状态更新
                     await app_state.broadcast("task_progress", {
@@ -285,7 +316,7 @@ def register_routes(app: FastAPI):
                         "result": state_update.get("final_output"),
                     })
 
-                    # 更新任务数据
+                    # 子任务状态变化时推送名单
                     if "subtasks" in state_update:
                         task["subtasks"] = [
                             {
@@ -298,12 +329,24 @@ def register_routes(app: FastAPI):
                             }
                             for t in state_update.get("subtasks", [])
                         ]
+                        for t in state_update["subtasks"]:
+                            if t.status == "running":
+                                await emit(
+                                    f"  ⧗ {t.id} 正在执行: {t.title} [{t.agent_type}]",
+                                    "running"
+                                )
+                            elif t.status == "failed":
+                                await emit(
+                                    f"  ✗ {t.id} 失败: {(t.result or '')[:80]}",
+                                    "error"
+                                )
 
-                    if state_update.get("final_output"):
+                if state_update.get("final_output"):
                         task["result"] = state_update["final_output"]
                         task["status"] = "completed"
                         app_state.system_status = "completed"
                         app_state.current_node = ""
+                        await emit(f"✓ 任务完成", "success")
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
                             "result": state_update["final_output"],
@@ -330,6 +373,7 @@ def register_routes(app: FastAPI):
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            await emit(f"✗ 崩溃: {str(e)[:200]}", "error")
 
             # 生成崩溃报告
             crash_report = {
@@ -450,10 +494,26 @@ def register_routes(app: FastAPI):
         try:
             while True:
                 data = await websocket.receive_text()
-                # 处理客户端消息（如需要）
                 try:
                     message = json.loads(data)
-                    # 可以在这里处理客户端发来的命令
+                    if message.get("type") == "terminal_input":
+                        task_id = message.get("task_id") or app_state.current_task_id
+                        cmd = message.get("command", "").strip()
+                        if task_id and cmd and task_id in app_state.tasks:
+                            app_state.intervention_queues.setdefault(task_id, []).append(cmd)
+                            entry = {"content": cmd, "timestamp": datetime.now().isoformat()}
+                            app_state.tasks[task_id].setdefault("interventions", []).append(entry)
+                            await app_state.broadcast("task_intervened", {
+                                "task_id": task_id,
+                                "instruction": cmd,
+                                "timestamp": entry["timestamp"],
+                            })
+                            await app_state.broadcast("terminal_output", {
+                                "task_id": task_id,
+                                "line": f"[USER] $ {cmd}",
+                                "level": "input",
+                                "ts": datetime.now().strftime("%H:%M:%S"),
+                            })
                 except json.JSONDecodeError:
                     pass
         except WebSocketDisconnect:

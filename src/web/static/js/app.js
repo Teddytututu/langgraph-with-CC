@@ -28,7 +28,8 @@ createApp({
         const discussionMessages = ref([]);
         const mermaidSvg = ref('');
         const showNewTask = ref(false);
-        const activityLogs = ref([]);
+        const terminalLines = ref([]);
+        const terminalInput = ref('');
 
         const newTask = ref({ task: '', time_minutes: null });
         const newMessage = ref({ from_agent: 'director', content: '' });
@@ -37,6 +38,18 @@ createApp({
         // Subtask edit state
         const editingSubtask = ref(null);
         const editForm = ref({ title: '', description: '', agent_type: 'coder', priority: 1, estimated_minutes: 10 });
+
+        // Terminal helper
+        const termLog = (text, level = 'info', ts = null) => {
+            const time = ts || new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            terminalLines.value.push({ time, text, level });
+            if (terminalLines.value.length > 800) terminalLines.value.shift();
+            // Auto-scroll
+            Vue.nextTick(() => {
+                const el = document.getElementById('terminal-output');
+                if (el) el.scrollTop = el.scrollHeight;
+            });
+        };
 
         // Stats
         const stats = computed(() => ({
@@ -72,35 +85,34 @@ createApp({
             switch (event) {
                 case 'system_status_changed':
                     systemStatus.value = payload.status;
-                    addActivity(`System: ${payload.status}`);
+                    termLog(`▶ System → ${payload.status}${ payload.task ? ': '+payload.task.slice(0,60) : '' }`, 'start');
                     fetchGraph();
                     break;
                 case 'node_changed':
                     currentNode.value = payload.node;
-                    addActivity(`Executing: ${payload.node}`);
                     fetchGraph();
                     break;
+                case 'terminal_output':
+                    termLog(payload.line, payload.level || 'info', payload.ts);
+                    break;
                 case 'task_created':
-                    // Avoid duplicate if fetchTasks already added it
-                    if (!tasks.value.find(t => t.id === payload.id)) {
-                        tasks.value.unshift(payload);
-                    }
-                    addActivity(`Task created: ${payload.id}`);
+                    if (!tasks.value.find(t => t.id === payload.id)) tasks.value.unshift(payload);
+                    termLog(`⊕ 任务创建: ${payload.id}`, 'info');
                     break;
                 case 'task_started':
                     mergeTasks([{ id: payload.id, status: 'running' }]);
-                    addActivity(`Task started: ${payload.id}`);
+                    termLog(`▶ 任务启动: ${payload.id}`, 'start');
                     break;
                 case 'task_progress':
                     handleTaskProgress(payload);
                     break;
                 case 'task_completed':
                     handleTaskCompleted(payload);
-                    addActivity(`Task completed: ${payload.id}`);
+                    termLog(`✓ 任务完成: ${payload.id}`, 'success');
                     break;
                 case 'task_failed':
                     mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
-                    addActivity(`Task failed: ${payload.id}`);
+                    termLog(`✗ 任务失败: ${payload.error}`, 'error');
                     break;
                 case 'task_intervened': {
                     const t = tasks.value.find(t => t.id === payload.task_id);
@@ -108,11 +120,13 @@ createApp({
                         if (!t.interventions) t.interventions = [];
                         t.interventions.push({ content: payload.instruction, timestamp: payload.timestamp });
                     }
-                    addActivity(`⚡ Injected: ${payload.instruction.slice(0, 40)}`);
+                    termLog(`⚡ [USER] $ ${payload.instruction}`, 'input');
                     break;
                 }
+                case 'task_intervention_applied':
+                    termLog(`⚡ 已注入 ${payload.instructions?.length || 1} 条指令`, 'input');
+                    break;
                 case 'discussion_message': {
-                    // Update live discussion panel if the message belongs to the open subtask
                     if (
                         selectedTask.value?.id === payload.task_id &&
                         selectedSubtask.value?.id === payload.node_id
@@ -120,18 +134,10 @@ createApp({
                         const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
                         if (!exists) discussionMessages.value.push(payload.message);
                     }
-                    addActivity(`💬 ${payload.node_id}: ${payload.message?.content?.slice(0, 40)}`);
+                    termLog(`💬 [${payload.node_id}] ${payload.message?.content?.slice(0,60)}`, 'info');
                     break;
                 }
             }
-        };
-
-        const addActivity = (title) => {
-            activityLogs.value.unshift({
-                title,
-                time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-            });
-            if (activityLogs.value.length > 20) activityLogs.value.pop();
         };
 
         // Merge partial task updates in-place (preserves Vue reactivity / selectedTask ref)
@@ -215,8 +221,26 @@ createApp({
             const data = await res.json();
             showNewTask.value = false;
             newTask.value = { task: '', time_minutes: null };
-            await fetch(`/api/tasks/${data.id}/start`, { method: 'POST' });
+            // API now auto-starts; select the task immediately
+            if (!tasks.value.find(t => t.id === data.id)) tasks.value.unshift(data);
+            selectedTask.value = tasks.value.find(t => t.id === data.id) || data;
+            termLog(`⊕ 提交任务 ${data.id} 并自动启动`, 'start');
         };
+
+        const sendTerminalCmd = () => {
+            if (!terminalInput.value.trim()) return;
+            const task_id = selectedTask.value?.id || app_state_task_id;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'terminal_input',
+                    task_id: task_id || '',
+                    command: terminalInput.value.trim(),
+                }));
+            }
+            terminalInput.value = '';
+        };
+
+        const clearTerminal = () => { terminalLines.value = []; };
 
         const selectTask = async (task) => {
             selectedTask.value = task;
@@ -305,8 +329,9 @@ createApp({
             await fetchTasks();
             await fetchSystemStatus();
             fetchGraph();
+            termLog('System ready. Waiting for tasks…', 'info');
 
-            // Poll every 3s when running to keep subtasks + result fresh
+            // Poll every 3s when running
             setInterval(async () => {
                 await fetchSystemStatus();
                 if (systemStatus.value === 'running') {
@@ -318,11 +343,11 @@ createApp({
 
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
-            discussionMessages, mermaidSvg, showNewTask, newTask, newMessage, activityLogs,
-            interveneText, editingSubtask, editForm,
+            discussionMessages, mermaidSvg, showNewTask, newTask, newMessage,
+            terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             stats, getCompletedSubtasks,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime,
-            fetchGraph, openEditSubtask, saveSubtask,
+            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal,
         };
     }
 }).mount('#app');
