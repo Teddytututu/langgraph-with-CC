@@ -212,10 +212,12 @@ class DynamicGraphBuilder:
 
         # 节点样式映射（只收集，稍后统一追加到边的后面）
         node_styles = {
-            "planner": "style {} fill:#e1f5fe",
-            "executor": "style {} fill:#e8f5e9",
-            "reviewer": "style {} fill:#fff3e0",
-            "reflector": "style {} fill:#fce4ec",
+            "router":         "style {} fill:#1e1b4b,color:#a5b4fc,stroke:#6366f1,stroke-width:2px",
+            "planner":        "style {} fill:#0c2340,color:#93c5fd,stroke:#3b82f6,stroke-width:2px",
+            "budget":         "style {} fill:#0f2922,color:#6ee7b7,stroke:#10b981,stroke-width:2px",
+            "executor":       "style {} fill:#14532d,color:#86efac,stroke:#22c55e,stroke-width:2px",
+            "reviewer":       "style {} fill:#3b1500,color:#fcd34d,stroke:#f59e0b,stroke-width:2px",
+            "reflector":      "style {} fill:#3b0764,color:#e879f9,stroke:#a21caf,stroke-width:2px",
         }
         deferred_styles = []
 
