@@ -21,5 +21,3 @@ stuck_report.json
 app_state.json
 sdk_debug.log
 
-# 动态填充的 agent 槽位（任务运行时写入，不应提交）
-.claude/agents/agent_*.md
