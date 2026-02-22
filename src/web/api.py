@@ -586,7 +586,6 @@ def register_routes(app: FastAPI):
         subtasks: list[dict] = (task or {}).get("subtasks") or []
 
         if not subtasks:
-            # 找所有任务中最后一个有子任务的（按 tasks 字典保留插入顺序）
             for t in reversed(list(app_state.tasks.values())):
                 if t.get("subtasks"):
                     subtasks = t["subtasks"]
@@ -597,52 +596,67 @@ def register_routes(app: FastAPI):
             return app_state.graph_builder.to_mermaid()
 
         # ── 动态子任务 DAG ────────────────────────────────────────────────────
-        # mermaid 节点 ID 不能含连字符，将 "task-001" → "t001"
         def safe_id(raw: str) -> str:
+            """Mermaid 节点 ID 不能含连字符/空格，task-001 → task001"""
             return raw.replace("-", "").replace("_", "").replace(" ", "")
+
+        status_icon = {"running": "⟳", "done": "✓", "failed": "✗",
+                       "pending": "○", "skipped": "—"}
+        status_fill = {
+            "running": "fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:3px",
+            "done":    "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:1px",
+            "failed":  "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px",
+            "pending": "fill:#18181b,color:#71717a,stroke:#3f3f46,stroke-width:1px",
+            "skipped": "fill:#18181b,color:#52525b,stroke:#27272a,stroke-width:1px",
+        }
 
         lines = ["graph TD"]
         deferred_styles = []
 
-        # 状态 → 颜色
-        status_fill = {
-            "running": "fill:#6c63ff,color:#fff,stroke:#a78bfa,stroke-width:3px",
-            "done":    "fill:#166534,color:#bbf7d0,stroke:#22c55e",
-            "failed":  "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444",
-            "pending": "fill:#27272a,color:#a1a1aa,stroke:#52525b",
-            "skipped": "fill:#1c1c1f,color:#71717a,stroke:#3f3f46",
-        }
+        # ── 顶部标题节点 ──────────────────────────────────────────────────────
+        task_status = (task or {}).get("status", "")
+        task_title = ((task or {}).get("task") or "任务")[:32].replace('"', "'")
+        hid = "task_header"
 
-        # 当前执行的 LangGraph 阶段（executor/reviewer 等）作为顶部说明节点
-        phase = app_state.current_node
-        if phase:
-            phase_sid = f"_phase_{phase}"
-            lines.append(f'    {phase_sid}[["⚙ {phase.upper()}"]]')
+        if task_status == "running":
+            phase = app_state.current_node or "running"
+            lines.append(f'    {hid}[["⚙ {phase.upper()}"]]')
             deferred_styles.append(
-                f"    style {phase_sid} fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:2px"
+                f"    style {hid} fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:2px"
+            )
+        elif task_status in ("completed", "done"):
+            lines.append(f'    {hid}[/"✓ {task_title}"/]')
+            deferred_styles.append(
+                f"    style {hid} fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px"
+            )
+        elif task_status == "failed":
+            lines.append(f'    {hid}[\"✗ {task_title}\"]')
+            deferred_styles.append(
+                f"    style {hid} fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px"
+            )
+        else:
+            lines.append(f'    {hid}["{task_title}"]')
+            deferred_styles.append(
+                f"    style {hid} fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1px"
             )
 
-        # 节点
+        # ── 子任务节点 ────────────────────────────────────────────────────────
         for st in subtasks:
             sid = safe_id(st["id"])
-            label = st["title"].replace('"', "'")[:30]
-            agent = st.get("agent_type", "")
-            lines.append(f'    {sid}["{st["id"]}\\n{label}\\n[{agent}]"]')
+            icon = status_icon.get(st.get("status", "pending"), "○")
+            title = st["title"].replace('"', "'")[:24]
+            lines.append(f'    {sid}["{icon} {title}"]')
             fill = status_fill.get(st.get("status", "pending"), status_fill["pending"])
             deferred_styles.append(f"    style {sid} {fill}")
 
-        # 如果有 phase 节点，第一批无依赖的子任务从 phase 节点出发
-        if phase:
-            phase_sid = f"_phase_{phase}"
-            dep_ids = {dep for st in subtasks for dep in (st.get("dependencies") or [])}
-            roots = [st for st in subtasks if st["id"] not in dep_ids]
-            for st in roots:
-                lines.append(f"    {phase_sid} --> {safe_id(st['id'])}")
+        # ── 边：header → 根节点，依赖节点间连线 ──────────────────────────────
+        dep_ids = {dep for st in subtasks for dep in (st.get("dependencies") or [])}
+        roots = [st for st in subtasks if st["id"] not in dep_ids]
+        for st in roots:
+            lines.append(f"    {hid} --> {safe_id(st['id'])}")
 
-        # 依赖边
         for st in subtasks:
             for dep_id in (st.get("dependencies") or []):
-                # 只连接 subtasks 中存在的依赖
                 if any(s["id"] == dep_id for s in subtasks):
                     lines.append(f"    {safe_id(dep_id)} --> {safe_id(st['id'])}")
 
