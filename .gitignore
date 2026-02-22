@@ -21,3 +21,6 @@ stuck_report.json
 app_state.json
 sdk_debug.log
 
+# 任务产出（运行时散落在根目录的代码/报告文件）
+*_report.json
+improved_task_*.json

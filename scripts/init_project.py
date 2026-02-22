@@ -34,7 +34,19 @@ RUNTIME_FILES = [
     "decision_request.json",
     "decision_result.json",
     "stuck_report.json",
+    "checkpoints.db",
 ]
+
+# 根目录白名单：这些文件永远不删
+ROOT_KEEP = {
+    ".env", ".gitignore", "CLAUDE.md", "README.md",
+    "LICENSE", "requirements.txt",
+}
+
+# 根目录永久保留的 .py 文件（非任务产物）
+ROOT_PY_KEEP = {
+    "test_agent_sdk.py",
+}
 
 # 空槽位模板内容
 BLANK_TEMPLATE = """\
@@ -96,7 +108,39 @@ def delete_runtime_files(dry: bool = False) -> int:
     return count
 
 
-# ─── 主流程 ───────────────────────────────────────────────────────────────────
+def delete_task_outputs(dry: bool = False) -> int:
+    """删除根目录中任务产出的散落文件
+
+    规则：
+      - *.py  且不在 ROOT_PY_KEEP 白名单中
+      - *.json 且不在 ROOT_KEEP 白名单中
+    """
+    count = 0
+    for f in sorted(ROOT.iterdir()):
+        if not f.is_file():
+            continue
+        name = f.name
+        if name in ROOT_KEEP or name.startswith("."):
+            continue
+        should_delete = False
+        if f.suffix == ".py" and name not in ROOT_PY_KEEP:
+            should_delete = True
+        elif f.suffix == ".json":
+            should_delete = True
+        elif f.suffix in (".db", ".log") and name not in RUNTIME_FILES:
+            should_delete = True
+        if should_delete:
+            log(f"  DELETE {name}  (任务产出)", dry)
+            if not dry:
+                try:
+                    f.unlink()
+                except (PermissionError, OSError) as e:
+                    log(f"  WARN   {name}: {e} (跳过)", dry)
+                    continue
+            count += 1
+    return count
+
+
 
 
 def main():
@@ -117,13 +161,17 @@ def main():
     print("\n[2] 清理运行时产物:")
     n_files = delete_runtime_files(dry)
 
+    print("\n[3] 清理任务产出文件（根目录散落):")
+    n_outputs = delete_task_outputs(dry)
+
+    total = n_agents + n_files + n_outputs
     print("\n" + "=" * 60)
-    print(f"  完成：重置 {n_agents} 个 agent 槽位，删除 {n_files} 个运行时文件")
+    print(f"  完成：重置 {n_agents} 个 agent 槽位，删除 {n_files + n_outputs} 个文件")
     if dry:
         print("  （DRY-RUN：以上均未实际执行）")
     print("=" * 60)
 
-    if not dry and (n_agents + n_files) == 0:
+    if not dry and total == 0:
         print("  项目已是干净状态，无需操作。")
 
 
