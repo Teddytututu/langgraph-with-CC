@@ -8,7 +8,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class CollaborationMode(Enum):
@@ -20,12 +20,11 @@ class CollaborationMode(Enum):
 
 class AgentExecutor(BaseModel):
     """Agent 执行器配置"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     agent_id: str
     name: str = ""
     execute_fn: Optional[Callable] = None
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class CollaborationResult(BaseModel):
@@ -213,10 +212,73 @@ class DiscussionCollaboration(BaseCollaboration):
             final_output=consensus
         )
 
-    async def _wait_consensus(self, discussion_id: str) -> dict:
-        """等待共识达成"""
-        # 简化实现：直接返回同意状态
-        return {"status": "consensus_reached", "discussion_id": discussion_id}
+    async def _wait_consensus(self, discussion_id: str, timeout: float = 60.0) -> dict:
+        """
+        等待共识达成
+
+        Args:
+            discussion_id: 讨论ID
+            timeout: 超时时间（秒）
+
+        Returns:
+            共识结果
+        """
+        if not self.discussion_manager:
+            return {"status": "consensus_reached", "discussion_id": discussion_id}
+
+        import asyncio
+
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            discussion = self.discussion_manager.get_discussion(discussion_id)
+
+            if discussion:
+                # 检查是否已达成共识
+                if discussion.consensus_reached:
+                    return {
+                        "status": "consensus_reached",
+                        "discussion_id": discussion_id,
+                        "topic": discussion.consensus_topic,
+                        "message_count": len(discussion.messages),
+                    }
+
+                # 检查是否被阻塞（冲突）
+                if discussion.status == "blocked":
+                    return {
+                        "status": "blocked",
+                        "discussion_id": discussion_id,
+                        "error": "讨论被阻塞，存在未解决的冲突",
+                    }
+
+                # 检查参与者数量（至少2人参与才算共识）
+                if len(discussion.participants) >= 2:
+                    # 统计同意消息
+                    recent = discussion.get_recent_messages(20)
+                    agree_count = sum(
+                        1 for m in recent
+                        if m.message_type == "consensus" and "CONFIRMED" in m.content
+                    )
+                    if agree_count >= len(discussion.participants):
+                        discussion.consensus_reached = True
+                        discussion.status = "resolved"
+                        return {
+                            "status": "consensus_reached",
+                            "discussion_id": discussion_id,
+                            "agree_count": agree_count,
+                        }
+
+            # 超时检查
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= timeout:
+                return {
+                    "status": "timeout",
+                    "discussion_id": discussion_id,
+                    "error": f"共识超时（{timeout}秒）",
+                }
+
+            # 等待一小段时间再检查
+            await asyncio.sleep(0.5)
 
     def _consensus(self, opinions: dict) -> Any:
         """从意见中提取共识"""

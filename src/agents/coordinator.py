@@ -31,7 +31,13 @@ class CoordinatorAgent:
     """
 
     def __init__(self):
-        pass
+        """初始化协调者"""
+        self._decision_history: list[dict] = []  # 决策历史记录
+        self._mode_stats: dict[str, int] = {  # 模式使用统计
+            "chain": 0,
+            "parallel": 0,
+            "discussion": 0,
+        }
 
     def analyze_task(self, task: Any, subtasks: list[Any] = None) -> TaskAnalysis:
         """
@@ -119,10 +125,21 @@ class CoordinatorAgent:
         """
         if len(agents) <= 1:
             # 单个 agent，默认链式
-            return CollaborationMode.CHAIN
+            mode = CollaborationMode.CHAIN
+        else:
+            analysis = self.analyze_task(task, subtasks)
+            mode = analysis.suggested_mode
 
-        analysis = self.analyze_task(task, subtasks)
-        return analysis.suggested_mode
+        # 记录决策
+        self._mode_stats[mode.value] = self._mode_stats.get(mode.value, 0) + 1
+        self._decision_history.append({
+            "task": str(task)[:100],  # 截断避免过长
+            "agents": agents,
+            "mode": mode.value,
+            "timestamp": __import__('datetime').datetime.now().isoformat(),
+        })
+
+        return mode
 
     def plan_execution(
         self,
@@ -161,17 +178,62 @@ class CoordinatorAgent:
         return plan
 
     def _plan_chain_order(self, agents: list[str], subtasks: list[Any]) -> list[str]:
-        """规划链式执行顺序"""
+        """
+        规划链式执行顺序（拓扑排序）
+
+        根据子任务的依赖关系确定 agent 执行顺序
+        """
         if not subtasks:
             return agents
 
-        # 根据子任务依赖排序
-        ordered = []
-        remaining = list(agents)
+        # 构建依赖图
+        task_deps: dict[str, set[str]] = {}
+        task_to_agent: dict[str, str] = {}
 
-        # 简化实现：保持原顺序
-        # 实际应该根据依赖图拓扑排序
-        return agents
+        for i, subtask in enumerate(subtasks):
+            task_id = subtask.id if hasattr(subtask, 'id') else subtask.get('id', f'task_{i}')
+            agent = agents[i] if i < len(agents) else agents[-1]
+            task_to_agent[task_id] = agent
+
+            deps = subtask.dependencies if hasattr(subtask, 'dependencies') else subtask.get('dependencies', [])
+            task_deps[task_id] = set(deps) if deps else set()
+
+        # Kahn 算法拓扑排序
+        in_degree = {t: 0 for t in task_deps}
+        for task_id, deps in task_deps.items():
+            for dep in deps:
+                if dep in in_degree:
+                    in_degree[task_id] += 1
+
+        # 入度为0的任务队列
+        queue = [t for t, deg in in_degree.items() if deg == 0]
+        ordered_tasks: list[str] = []
+
+        while queue:
+            # 按优先级排序（高优先级先执行）
+            queue.sort(key=lambda t: (
+                -subtasks[[s.id if hasattr(s, 'id') else s.get('id') for s in subtasks].index(t)].priority
+                if hasattr(subtasks[0], 'priority') else 0
+            ))
+            current = queue.pop(0)
+            ordered_tasks.append(current)
+
+            # 更新依赖此任务的其他任务入度
+            for task_id, deps in task_deps.items():
+                if current in deps:
+                    in_degree[task_id] -= 1
+                    if in_degree[task_id] == 0:
+                        queue.append(task_id)
+
+        # 映射回 agent 顺序
+        ordered_agents = [task_to_agent[t] for t in ordered_tasks if t in task_to_agent]
+
+        # 补充未在 subtasks 中的 agents
+        for agent in agents:
+            if agent not in ordered_agents:
+                ordered_agents.append(agent)
+
+        return ordered_agents
 
     def _plan_discussion_order(self, agents: list[str]) -> list[str]:
         """规划讨论顺序"""

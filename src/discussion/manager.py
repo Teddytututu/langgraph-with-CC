@@ -141,25 +141,46 @@ class DiscussionManager:
         node_id: str,
         from_agent: str,
     ) -> DiscussionMessage:
-        """确认共识"""
+        """
+        确认共识
+
+        当参与者确认共识时，记录确认状态。
+        只有当所有活跃参与者都确认后，才标记为已达成。
+        """
         discussion = self.get_discussion(node_id)
         if not discussion:
             raise ValueError(f"Discussion {node_id} not found")
 
-        # 检查是否所有参与者都已确认
-        # 简化实现：直接标记为已达成
-        discussion.consensus_reached = True
-        discussion.status = "resolved"
+        # 确保该参与者被记录
+        if from_agent not in discussion.participants:
+            discussion.participants.append(from_agent)
 
-        # 触发共识处理器
-        for handler in self._on_consensus_handlers:
-            await handler(node_id, discussion.consensus_topic or "")
+        # 在元数据中记录确认
+        if "confirmations" not in discussion.__dict__:
+            discussion.__dict__["confirmations"] = set()
+        discussion.__dict__["confirmations"].add(from_agent)
 
-        return await self.post_message(
+        # 发送确认消息
+        msg = await self.post_message(
             node_id, from_agent,
             f"[CONSENSUS CONFIRMED by {from_agent}] ✓",
             message_type="consensus",
         )
+
+        # 检查是否所有参与者都已确认
+        confirmations = discussion.__dict__.get("confirmations", set())
+        active_participants = set(discussion.participants)
+
+        if active_participants and confirmations >= active_participants:
+            # 所有人都确认，标记共识达成
+            discussion.consensus_reached = True
+            discussion.status = "resolved"
+
+            # 触发共识处理器
+            for handler in self._on_consensus_handlers:
+                await handler(node_id, discussion.consensus_topic or "")
+
+        return msg
 
     # ── 冲突处理 ──
 
