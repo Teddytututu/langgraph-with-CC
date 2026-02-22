@@ -216,6 +216,48 @@ taskkill /PID <PID> /F /T
 
 ---
 
+## 八、项目初始化（Init / Reset）
+
+### 何时需要初始化
+
+每次**新任务开始前**，或发现项目处于"上次任务残留"状态时，执行初始化：
+
+- `.claude/agents/agent_XX.md` 中仍有上次任务填充的 subagent 内容
+- `app_state.json` 中保留旧任务状态
+- 根目录存在 `sdk_debug.log`、信号文件等运行时产物
+
+### 初始化命令
+
+```bash
+# 正式执行（重置所有动态槽位 + 删除运行时文件）
+.venv\Scripts\python.exe scripts/init_project.py
+
+# 仅预览，不修改
+.venv\Scripts\python.exe scripts/init_project.py --dry-run
+```
+
+### 脚本做了什么
+
+| 操作 | 目标文件 | 说明 |
+|------|----------|------|
+| 重置为空槽位 | `.claude/agents/agent_*.md` | `name: ""`、`description: ""`，正文替换为"预留-由写手填充" |
+| 删除 | `app_state.json` | 任务队列 + 终端日志持久化数据 |
+| 删除 | `sdk_debug.log` | SDK 调试日志 |
+| 删除 | `crash/decision/stuck_*.json` | 进程间通信信号文件 |
+
+### 不会被重置的文件
+
+- `.claude/agents/coordinator.md` / `planner.md` / `executor.md` / `reviewer.md` / `reflector.md` — 系统核心 agent
+- `.claude/agents/writer_*.md` — 写手 agent
+- 全部源码 `src/`、配置 `.env` / `requirements.txt`
+
+### Git 提交前检查清单
+
+初始化后，`git status` 应只显示真正改动的源码文件。  
+若仍看到 `agent_XX.md` 或 `app_state.json`，先运行初始化脚本再提交。
+
+---
+
 ## 附：环境约束
 
 - **Python venv**: `.venv\Scripts\python.exe`（始终用此路径，不用系统 python）

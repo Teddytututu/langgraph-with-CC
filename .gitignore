@@ -14,5 +14,12 @@ downloads/
 src/web/FRONTEND_GUIDE.md
 report/
 crash_report.json
+decision_request.json
+decision_result.json
+stuck_report.json
 
 app_state.json
+sdk_debug.log
+
+# 动态填充的 agent 槽位（任务运行时写入，不应提交）
+.claude/agents/agent_*.md
