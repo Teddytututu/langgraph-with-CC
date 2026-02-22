@@ -22,7 +22,7 @@ async def router_node(state: GraphState) -> dict:
     # 全部完成 → 汇总输出
     subtasks = state.get("subtasks", [])
     if subtasks and all(
-        t.status in ("done", "skipped") for t in subtasks
+        t.status in ("done", "skipped", "failed") for t in subtasks
     ):
         return {
             "phase": "complete",

@@ -18,6 +18,21 @@ async def executor_node(state: GraphState) -> dict:
     # 找到依赖已满足的下一个待执行任务
     next_task = _find_next_task(state)
     if not next_task:
+        # 检查是否有死锁：有 pending 任务但无法执行
+        pending = [t for t in subtasks if t.status == "pending"]
+        if pending:
+            # 所有 pending 任务的依赖都已失败/无法满足，将它们标记为失败
+            updated_subtasks = []
+            done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
+            for t in subtasks:
+                if t.status == "pending" and not all(d in done_ids for d in t.dependencies):
+                    updated_subtasks.append(t.model_copy(update={
+                        "status": "failed",
+                        "result": f"依赖任务失败，无法执行：{t.dependencies}",
+                    }))
+                else:
+                    updated_subtasks.append(t)
+            return {"phase": "reviewing", "current_subtask_id": None, "subtasks": updated_subtasks}
         return {"phase": "reviewing", "current_subtask_id": None}
 
     # 记录开始时间
@@ -89,22 +104,10 @@ async def executor_node(state: GraphState) -> dict:
         else:
             updated_subtasks.append(t)
 
-    # 纯函数式更新时间预算
-    budget = state.get("time_budget")
-    if budget and started_at:
-        elapsed = (datetime.now() - started_at).total_seconds() / 60
-        new_elapsed = budget.elapsed_minutes + elapsed
-        new_remaining = max(0, budget.total_minutes - new_elapsed)
-        budget = budget.model_copy(update={
-            "elapsed_minutes": new_elapsed,
-            "remaining_minutes": new_remaining,
-            "is_overtime": new_remaining <= 0,
-        })
-
     return {
         "subtasks": updated_subtasks,
         "current_subtask_id": next_task.id,
-        "time_budget": budget,
+        "time_budget": state.get("time_budget"),
         "phase": "executing",
         "execution_log": [{
             "event": "task_executed",

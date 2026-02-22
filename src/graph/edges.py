@@ -12,7 +12,7 @@ def route_after_router(state: GraphState) -> str:
     subtasks = state.get("subtasks", [])
     if phase == "init" or not subtasks:
         return "planning"
-    if all(t.status in ("done", "skipped") for t in subtasks):
+    if all(t.status in ("done", "skipped", "failed") for t in subtasks):
         return "complete"
     return "executing"
 
@@ -33,7 +33,10 @@ def should_continue_or_timeout(state: GraphState) -> str:
     if _check_timeout(state):
         return "timeout"
     current = _get_current(state)
-    if current and current.status in ("done", "failed"):
+    # 无当前任务（executor 未找到可执行项），进入审查阶段
+    if not current:
+        return "review"
+    if current.status in ("done", "failed"):
         return "review"
     return "continue"
 
