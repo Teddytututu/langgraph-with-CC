@@ -373,6 +373,11 @@ createApp({
         // Utils
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
         const formatTime = (t) => t ? new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '';
+        const renderMd = (text) => {
+            if (!text) return '';
+            try { return marked.parse(text, { breaks: true, gfm: true }); }
+            catch (e) { return text; }
+        };
 
         onMounted(async () => {
             connectWebSocket();
@@ -404,7 +409,7 @@ createApp({
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks,
-            createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime,
+            createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd,
             fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat,
         };
     }

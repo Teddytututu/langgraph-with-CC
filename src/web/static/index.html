@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
     <div id="app">
@@ -323,7 +324,8 @@
                     <div class="chat-messages" id="chat-messages">
                         <div v-for="(msg, i) in chatMessages" :key="i"
                              class="chat-msg" :class="msg.role">
-                            <div class="chat-bubble">{{ msg.content }}</div>
+                            <div class="chat-bubble" :class="{markdown: msg.role === 'assistant'}" v-if="msg.role === 'assistant'" v-html="renderMd(msg.content)"></div>
+                            <div class="chat-bubble" v-else>{{ msg.content }}</div>
                             <div class="chat-time">{{ msg.time }}</div>
                         </div>
                         <div v-if="chatMessages.length === 0" class="empty" style="padding:20px">

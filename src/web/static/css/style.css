@@ -1117,6 +1117,66 @@ body {
     word-break: break-word;
 }
 
+/* Markdown rendered content inside assistant bubbles */
+.chat-bubble.markdown {
+    white-space: normal;
+    max-width: 100%;
+}
+.chat-bubble.markdown p { margin: 0 0 8px; }
+.chat-bubble.markdown p:last-child { margin-bottom: 0; }
+.chat-bubble.markdown h1,.chat-bubble.markdown h2,.chat-bubble.markdown h3,.chat-bubble.markdown h4 {
+    font-weight: 600; margin: 12px 0 4px; color: var(--text-1); line-height: 1.3;
+}
+.chat-bubble.markdown h1 { font-size: 1.05rem; }
+.chat-bubble.markdown h2 { font-size: 0.97rem; }
+.chat-bubble.markdown h3,.chat-bubble.markdown h4 { font-size: 0.88rem; }
+.chat-bubble.markdown ul,.chat-bubble.markdown ol {
+    margin: 6px 0 8px 16px; padding: 0;
+}
+.chat-bubble.markdown li { margin: 2px 0; }
+.chat-bubble.markdown strong { font-weight: 600; color: var(--text-1); }
+.chat-bubble.markdown em { font-style: italic; }
+.chat-bubble.markdown code {
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.78rem;
+    color: #a78bfa;
+}
+.chat-bubble.markdown pre {
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+}
+.chat-bubble.markdown pre code {
+    background: none; border: none; padding: 0;
+    font-size: 0.78rem; color: var(--text-2);
+}
+.chat-bubble.markdown table {
+    border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 0.8rem;
+}
+.chat-bubble.markdown th,.chat-bubble.markdown td {
+    border: 1px solid var(--border);
+    padding: 5px 10px; text-align: left;
+}
+.chat-bubble.markdown th {
+    background: var(--bg-base); font-weight: 600; color: var(--violet-light);
+}
+.chat-bubble.markdown tr:nth-child(even) td { background: rgba(139,92,246,0.04); }
+.chat-bubble.markdown hr {
+    border: none; border-top: 1px solid var(--border); margin: 10px 0;
+}
+.chat-bubble.markdown blockquote {
+    border-left: 3px solid var(--violet);
+    margin: 6px 0; padding: 4px 12px;
+    color: var(--text-3); font-style: italic;
+}
+
 .chat-msg.user .chat-bubble {
     background: var(--violet);
     color: #fff;
