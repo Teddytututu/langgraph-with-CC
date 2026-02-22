@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude LangGraph 多 Agent 协作系统</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- 头部 -->
+        <header class="header">
+            <h1>🤖 Claude LangGraph 多 Agent 协作系统</h1>
+            <div class="connection-status" :class="{ connected: wsConnected }">
+                {{ wsConnected ? '🟢 已连接' : '🔴 断开' }}
+            </div>
+        </header>
+
+        <main class="main-container">
+            <!-- 左侧：任务列表 -->
+            <aside class="sidebar">
+                <div class="panel">
+                    <h2>📋 任务列表</h2>
+                    <button class="btn btn-primary" @click="showNewTask = true">
+                        + 新建任务
+                    </button>
+                    <div class="task-list">
+                        <div
+                            v-for="task in tasks"
+                            :key="task.id"
+                            class="task-item"
+                            :class="{ active: selectedTask?.id === task.id }"
+                            @click="selectTask(task)"
+                        >
+                            <div class="task-header">
+                                <span class="task-status" :class="task.status">
+                                    {{ getStatusIcon(task.status) }}
+                                </span>
+                                <span class="task-title">{{ task.task.slice(0, 30) }}...</span>
+                            </div>
+                            <div class="task-meta">
+                                <span>{{ task.subtasks?.length || 0 }} 子任务</span>
+                                <span>{{ task.time_minutes || '∞' }} 分钟</span>
+                            </div>
+                        </div>
+                        <div v-if="tasks.length === 0" class="empty-state">
+                            暂无任务，点击上方按钮创建
+                        </div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 中间：Graph 可视化 -->
+            <section class="content">
+                <div class="panel">
+                    <h2>🔄 Graph 可视化</h2>
+                    <div class="graph-container" v-html="mermaidSvg"></div>
+                </div>
+
+                <!-- 子任务进度 -->
+                <div class="panel" v-if="selectedTask">
+                    <h2>📊 任务进度</h2>
+                    <div class="subtask-list">
+                        <div
+                            v-for="subtask in selectedTask.subtasks"
+                            :key="subtask.id"
+                            class="subtask-item"
+                            :class="subtask.status"
+                            @click="selectSubtask(subtask)"
+                        >
+                            <span class="subtask-status">{{ getStatusIcon(subtask.status) }}</span>
+                            <span class="subtask-title">{{ subtask.title }}</span>
+                            <span class="subtask-agent">{{ subtask.agent_type }}</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 右侧：讨论库 -->
+            <aside class="sidebar right">
+                <div class="panel" v-if="selectedSubtask">
+                    <h2>💬 讨论 - {{ selectedSubtask.title }}</h2>
+                    <div class="discussion-container">
+                        <div
+                            v-for="msg in discussionMessages"
+                            :key="msg.id"
+                            class="message"
+                            :class="msg.message_type"
+                        >
+                            <div class="message-header">
+                                <span class="from-agent">{{ msg.from_agent }}</span>
+                                <span class="timestamp">{{ formatTime(msg.timestamp) }}</span>
+                            </div>
+                            <div class="message-content">{{ msg.content }}</div>
+                        </div>
+                        <div v-if="discussionMessages.length === 0" class="empty-state">
+                            暂无讨论
+                        </div>
+                    </div>
+                    <div class="message-input">
+                        <select v-model="newMessage.from_agent">
+                            <option value="director">Director</option>
+                            <option value="coder">Coder</option>
+                            <option value="researcher">Researcher</option>
+                            <option value="writer">Writer</option>
+                            <option value="analyst">Analyst</option>
+                        </select>
+                        <input
+                            v-model="newMessage.content"
+                            @keyup.enter="sendMessage"
+                            placeholder="输入消息..."
+                        >
+                        <button class="btn btn-primary" @click="sendMessage">发送</button>
+                    </div>
+                </div>
+                <div class="panel" v-else>
+                    <h2>💬 讨论</h2>
+                    <div class="empty-state">
+                        选择一个子任务查看讨论
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- 新建任务弹窗 -->
+        <div class="modal" v-if="showNewTask" @click.self="showNewTask = false">
+            <div class="modal-content">
+                <h2>📝 新建任务</h2>
+                <div class="form-group">
+                    <label>任务描述</label>
+                    <textarea v-model="newTask.task" placeholder="描述你要完成的任务..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>时间预算（分钟）</label>
+                    <input type="number" v-model="newTask.time_minutes" placeholder="留空表示无限制">
+                </div>
+                <div class="form-actions">
+                    <button class="btn" @click="showNewTask = false">取消</button>
+                    <button class="btn btn-primary" @click="createTask">创建</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
