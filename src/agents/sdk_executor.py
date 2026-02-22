@@ -118,13 +118,9 @@ class SDKExecutor:
                 "setting_sources": ["user", "project"],
             }
 
-            # 系统提示：通过 append 追加，不覆盖 Claude Code 默认行为
+            # 系统提示：直接作为字符串传入，追加到 CLAUDE.md 之后
             if system_prompt:
-                options_kwargs["system_prompt"] = {
-                    "type": "preset",
-                    "preset": "claude_code",
-                    "append": system_prompt,
-                }
+                options_kwargs["system_prompt"] = system_prompt
 
             # 模型配置（不指定则使用用户已配置的默认）
             if model and model not in ("inherit", ""):
