@@ -96,12 +96,22 @@ createApp({
 
         // WebSocket
         let ws = null;
+        let _wsEverConnected = false;
 
         const connectWebSocket = () => {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
-            ws.onopen = () => { wsConnected.value = true; };
+            ws.onopen = async () => {
+                wsConnected.value = true;
+                // 重连后做一次全量同步，拉平断线期间的状态差异
+                if (_wsEverConnected) {
+                    await fetchTasks();
+                    await fetchSystemStatus();
+                    await fetchGraph();
+                }
+                _wsEverConnected = true;
+            };
             ws.onclose = () => { wsConnected.value = false; setTimeout(connectWebSocket, 5000); };
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
@@ -229,14 +239,19 @@ createApp({
             }
         };
 
+        let _lastMermaidSrc = '';
         const fetchGraph = async () => {
             try {
                 const res = await fetch('/api/graph/mermaid');
+                if (!res.ok) return;
                 const data = await res.json();
-                const { svg } = await mermaid.render(`graph-${Date.now()}`, data.mermaid);
+                // 内容未变则跳过重绘，避免高频 CPU 消耗
+                if (data.mermaid === _lastMermaidSrc) return;
+                _lastMermaidSrc = data.mermaid;
+                const { svg } = await mermaid.render('graph-main-view', data.mermaid);
                 mermaidSvg.value = svg;
             } catch (e) {
-                // keep previous SVG or show nothing
+                console.error('fetchGraph error', e);
             }
         };
 
@@ -326,9 +341,12 @@ createApp({
             // Refresh from API to ensure result/subtasks are up to date
             try {
                 const res = await fetch(`/api/tasks/${task.id}`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const fresh = await res.json();
                 Object.assign(task, fresh);
-            } catch (e) {}
+            } catch (e) {
+                console.error('selectTask: failed to refresh task', task.id, e);
+            }
         };
 
         const selectSubtask = async (subtask) => {
@@ -349,6 +367,7 @@ createApp({
                         newMessage.value.from_agent = discussionParticipants.value[0];
                     }
                 } catch (e) {
+                    console.error('selectSubtask: failed to load discussion', subtask.id, e);
                     discussionMessages.value = [];
                 }
             }
@@ -430,14 +449,15 @@ createApp({
 
             if (!_terminalRestored) termLog('System ready. Waiting for tasks…', 'info');
 
-            // Poll every 3s when running
+            // 轮询仅作为 WebSocket 断线时的降级方案
+            // WS 连接正常时由事件驱动，不产生冗余请求
             setInterval(async () => {
+                if (wsConnected.value) return;   // WS 正常 → 跳过
+                console.warn('[Polling] WS disconnected, falling back to HTTP poll');
                 await fetchSystemStatus();
-                if (systemStatus.value === 'running') {
-                    await fetchTasks();
-                    fetchGraph();
-                }
-            }, 3000);
+                await fetchTasks();
+                await fetchGraph();
+            }, 5000);
         });
 
         return {
