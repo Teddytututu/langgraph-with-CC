@@ -226,9 +226,7 @@ class DiscussionCollaboration(BaseCollaboration):
         if not self.discussion_manager:
             return {"status": "consensus_reached", "discussion_id": discussion_id}
 
-        import asyncio
-
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
 
         while True:
             discussion = self.discussion_manager.get_discussion(discussion_id)
@@ -269,7 +267,7 @@ class DiscussionCollaboration(BaseCollaboration):
                         }
 
             # 超时检查
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed >= timeout:
                 return {
                     "status": "timeout",

@@ -2,7 +2,21 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import traceback
+
+logger = logging.getLogger(__name__)
+
+# 防止后台 Task 被 GC 回收 —— asyncio 不持有强引用
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire(coro):
+    """创建后台 Task 并保持强引用直到完成"""
+    t = asyncio.create_task(coro)
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+    return t
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -100,7 +114,7 @@ class AppState:
             )
             self._dirty = False
         except Exception as e:
-            pass  # 持久化失败不影响正常运行
+            logger.warning("State persist failed: %s", e)
 
     def load_from_disk(self):
         """从磁盘恢复状态"""
@@ -127,8 +141,8 @@ class AppState:
                 "level": "warn",
                 "ts": datetime.now().strftime("%H:%M:%S"),
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("State load failed: %s", e)
 
     async def broadcast(self, event: str, data: dict):
         """广播事件到所有连接的 WebSocket"""
@@ -240,7 +254,7 @@ def register_routes(app: FastAPI):
             await app_state.broadcast("task_started", {"id": task_id})
             await run_task(task_id)
 
-        asyncio.create_task(_auto_start())
+        _fire(_auto_start())
 
         return {"id": task_id, "status": "created"}
 
@@ -355,7 +369,7 @@ def register_routes(app: FastAPI):
                 "ts": datetime.now().isoformat(),
             })
 
-        asyncio.create_task(_run_chat())
+        _fire(_run_chat())
         return {"status": "thinking"}
 
     @app.post("/api/tasks/{task_id}/start")
@@ -378,7 +392,7 @@ def register_routes(app: FastAPI):
         })
 
         # 在后台执行任务
-        asyncio.create_task(run_task(task_id))
+        _fire(run_task(task_id))
 
         await app_state.broadcast("task_started", {"id": task_id})
 
@@ -492,7 +506,7 @@ def register_routes(app: FastAPI):
                                     "error"
                                 )
 
-                if state_update.get("final_output"):
+                    if state_update.get("final_output"):
                         task["result"] = state_update["final_output"]
                         task["status"] = "completed"
                         app_state.system_status = "completed"

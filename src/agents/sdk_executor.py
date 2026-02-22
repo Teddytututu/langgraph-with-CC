@@ -16,6 +16,8 @@ from datetime import datetime
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SubagentResult:
@@ -69,8 +71,8 @@ class SDKExecutor:
                         os.environ[k] = str(v)
                 if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to load ~/.claude/settings.json: %s", e)
         # 最后兜底：让 SDK 自己处理 auth，运行时失败会有具体报错
         return True
 
