@@ -151,19 +151,101 @@ class SubagentCaller:
         if agent_id:
             return agent_id
 
-        # 3. 获取空槽位，让写手填充
+        # 3. 获取空槽位，用 writer 填充
         agent_id = self.manager.get_next_empty()
         if agent_id:
-            # 标记为填充中
-            self.manager.mark_filling(agent_id)
+            # 调用 writer 填充这个槽位
+            await self._fill_specialist_slot(agent_id, skills, task_description)
             return agent_id
 
         # 4. 没有空槽位，循环清空最早使用的
         cleared = self.manager.cycle_clear(1)
         if cleared:
+            await self._fill_specialist_slot(cleared[0], skills, task_description)
             return cleared[0]
 
         return None
+
+    async def _fill_specialist_slot(self, agent_id: str, skills: list[str], task_description: str) -> bool:
+        """
+        用 writer 填充专业 subagent 槽位
+
+        Args:
+            agent_id: 槽位 ID
+            skills: 需要的技能
+            task_description: 任务描述
+
+        Returns:
+            是否成功
+        """
+        # 标记为填充中
+        self.manager.mark_filling(agent_id)
+
+        # 构建 writer 提示
+        skills_str = ", ".join(skills) if skills else "通用"
+        prompt = f"""请为以下任务创建一个专业 agent 的系统提示：
+
+任务描述: {task_description}
+需要的技能: {skills_str}
+
+请生成:
+1. name: agent 名称（简短，如 "代码审计专家"）
+2. description: agent 描述
+3. system_prompt: 完整的系统提示内容
+
+以 JSON 格式返回:
+{{"name": "...", "description": "...", "system_prompt": "..."}}
+"""
+
+        # 调用 writer 填充
+        context = {"task": prompt}
+        result = await self.call("writer_1", context)
+
+        if result.get("success"):
+            try:
+                import json
+                content = result.get("result", "{}")
+                if isinstance(content, str):
+                    # 尝试提取 JSON
+                    import re
+                    match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+                    if match:
+                        content = match.group(0)
+                    data = json.loads(content)
+                else:
+                    data = content
+
+                # 填充模板
+                self.pool.fill_agent(
+                    agent_id=agent_id,
+                    name=data.get("name", f"Specialist-{agent_id}"),
+                    description=data.get("description", task_description[:100]),
+                    content=data.get("system_prompt", f"你是一个{skills_str}专家。"),
+                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+                )
+
+                # 标记为 ready
+                self.manager.mark_ready(
+                    agent_id=agent_id,
+                    name=data.get("name", ""),
+                    description=data.get("description", ""),
+                    skills=skills
+                )
+                return True
+
+            except Exception as e:
+                print(f"填充 specialist 失败: {e}")
+
+        # 填充失败，使用默认模板
+        self.pool.fill_agent(
+            agent_id=agent_id,
+            name=f"Specialist-{agent_id}",
+            description=f"专业技能: {skills_str}",
+            content=f"你是一个{skills_str}专家。请根据任务要求完成工作。\n\n任务: {task_description}",
+            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+        )
+        self.manager.mark_ready(agent_id, skills=skills)
+        return True
 
     def complete_subtask(self, agent_id: str):
         """标记子任务完成（保留专业知识）"""

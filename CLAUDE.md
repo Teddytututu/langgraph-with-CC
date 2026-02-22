@@ -1,87 +1,118 @@
-# 系统运维与异常处理指南
+# Claude Code 任务执行指南
 
 本系统是一个基于 LangGraph 和 `claude-agent-sdk` 的多 Agent 执行器。
 
-**注意：你的角色是"核心开发者与运维专家"，请不要代替系统去执行具体的业务任务！**
+## 工作流程
 
-## 你的职责
+### 1. 启动阶段
+用户布置任务后，你需要：
+1. 启动主程序：`python -m src.main` 或 `uvicorn src.web.api:app`
+2. 程序会在后台运行，处理业务逻辑
+3. 你可以休息，等待被唤醒
 
-1. **处理报错**：当 Python 程序崩溃、抛出 Exception 时，阅读错误日志，定位源码问题并修复
-2. **处理卡壳**：如果 LangGraph 陷入死循环，或者在某个 Node 卡住，分析逻辑并修复
-3. **修复依赖**：如果 SDK 或其他库引发环境问题，负责修复
+### 2. 执行阶段
+Python 程序会自动：
+- 使用 LangGraph 调度各个 Agent 节点
+- 通过 claude-agent-sdk 调用 Claude 完成具体任务
+- 跟踪状态、管理时间预算
 
-## 故障排查入口
+### 3. 唤醒阶段
+当以下情况发生时，你会被唤醒：
 
-- 崩溃报告: `crash_report.json`
-- 图路由逻辑: `src/graph/builder.py`, `src/graph/nodes/`
-- Agent 执行: `src/agents/sdk_executor.py`
+#### 崩溃唤醒（crash_report.json）
+1. 读取 `crash_report.json` 查看错误信息
+2. 分析 Traceback 和崩溃时的状态
+3. 修复对应的 Python 代码
+4. 重新启动程序
 
-## 修复流程
+#### 决策唤醒（decision_request.json）
+1. 读取 `decision_request.json` 查看决策问题
+2. 分析选项和上下文
+3. 做出决策，写入 `decision_result.json`：
+   ```json
+   {
+     "decision": "选择的选项",
+     "reason": "决策理由",
+     "confidence": "high/medium/low"
+   }
+   ```
 
-1. 读取 `crash_report.json` 和 Traceback
-2. 检查崩溃时的图状态
-3. 修改对应的 Python 代码解决 Bug
-4. 运行测试或重新启动程序验证修复
+#### 卡壳唤醒（stuck_report.json）
+1. 读取 `stuck_report.json` 查看卡壳状态
+2. 分析当前状态和尝试记录
+3. 调整策略或修改代码
+4. 继续执行
 
 ## 系统架构
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     工作者 (Worker)                          │
+│                    CLAUDE.md 工作流程                        │
 │                                                             │
-│   Graph 节点 ─→ SubagentCaller ─→ SDKExecutor ─→ SDK       │
-│                                                             │
-│   • 纯 Python 程序 + LangGraph + claude-agent-sdk          │
-│   • 以最快、最标准化的方式跑完业务流                         │
-│   • 出错时直接抛异常，写入 crash_report.json                │
+│   1. 用户布置任务 ─→ Claude Code 启动 ─→ 读取 CLAUDE.md    │
+│   2. CLAUDE.md 启动 main 程序                               │
+│   3. Python 程序在后台跑业务流                              │
+│   4. CLAUDE.md 休息（等待唤醒）                             │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
                              │
-                             │ 异常时
+           ┌─────────────────┼─────────────────┐
+           │                 │                 │
+           ▼                 ▼                 ▼
+    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+    │   崩溃时    │   │ 重大决策时  │   │   卡壳时    │
+    │             │   │             │   │             │
+    │ crash_report│   │decision.json│   │ stuck.json  │
+    └─────────────┘   └─────────────┘   └─────────────┘
+           │                 │                 │
+           └─────────────────┼─────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   监管者 (Supervisor)                        │
+│                   CLAUDE.md 被唤醒                           │
 │                                                             │
-│   CLAUDE.md ─→ 读取 crash_report.json ─→ 修复代码          │
-│                                                             │
-│   • 平时不插手业务                                          │
-│   • 只在程序崩溃/卡壳时介入                                 │
-│   • 像 SRE 一样 Debug、修改源码、重新拉起服务               │
+│   根据唤醒原因执行不同操作：                                │
+│   - 崩溃：读取报告，修复代码，重启程序                      │
+│   - 决策：读取问题，做出决策，写入 decision_result.json     │
+│   - 卡壳：分析状态，调整策略，继续执行                      │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 关键文件说明
+## 关键文件
 
 | 文件 | 说明 |
 |------|------|
+| `src/main.py` | 程序入口 |
+| `src/web/api.py` | FastAPI Web 服务 |
+| `src/utils/claude_communication.py` | 与 CLAUDE.md 通信工具 |
 | `src/agents/sdk_executor.py` | SDK 执行器，负责调用 claude-agent-sdk |
 | `src/agents/caller.py` | Subagent 调用接口，封装执行逻辑 |
 | `src/agents/pool_registry.py` | Subagent 模板池管理 |
-| `src/agents/subagent_manager.py` | Subagent 状态管理 |
 | `src/graph/state.py` | GraphState 状态定义 |
 | `src/graph/builder.py` | LangGraph 构建器 |
 | `src/graph/nodes/*.py` | 各节点实现 |
-| `src/web/api.py` | FastAPI Web 服务 |
+| `crash_report.json` | 崩溃报告（崩溃时生成） |
+| `decision_request.json` | 决策请求（需要决策时生成） |
+| `decision_result.json` | 决策结果（CLAUDE.md 填写） |
+| `stuck_report.json` | 卡壳报告（卡壳时生成） |
+
+## 启动命令
+
+```bash
+# 方式 1: 直接运行
+python -m src.main
+
+# 方式 2: 启动 Web 服务
+uvicorn src.web.api:app --reload --port 8000
+```
 
 ## 环境要求
 
 - Python 3.10+
-- `claude-agent-sdk` 已安装
-- 环境变量 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN` 已设置
+- 已安装 `claude-agent-sdk`
+- 已设置 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`
 
 ## 常见问题
-
-### SDK 未配置
-
-如果看到错误：
-```
-Claude Agent SDK 或 API 密钥未配置！
-```
-
-请确保：
-1. 已安装 `claude-agent-sdk`
-2. 设置了 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN` 环境变量
 
 ### Subagent 模板缺失
 

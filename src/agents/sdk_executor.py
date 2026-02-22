@@ -127,18 +127,31 @@ class SDKExecutor:
             turns = 0
 
             async for message in query(prompt=task_prompt, options=options):
+                if message is None:
+                    continue
+
                 turns += 1
                 msg_dict = self._parse_message(message)
                 messages.append(msg_dict)
 
-                # 收集结果
-                if hasattr(message, "result"):
-                    result_data = message.result
+                # 收集结果 - 处理 ResultMessage 类型
+                msg_type = type(message).__name__
+                if msg_type == "ResultMessage":
+                    # ResultMessage 包含最终结果
+                    if hasattr(message, "result") and message.result:
+                        result_data = message.result
                 elif hasattr(message, "content"):
-                    result_data.append(message.content)
+                    content = message.content
+                    if content:
+                        if isinstance(content, str):
+                            result_data.append(content)
+                        elif isinstance(content, list):
+                            for block in content:
+                                if hasattr(block, "text"):
+                                    result_data.append(block.text)
 
             # 构建结果
-            final_result = result_data if result_data else messages[-1] if messages else None
+            final_result = result_data if result_data else (messages[-1] if messages else None)
 
             return SubagentResult(
                 success=True,
