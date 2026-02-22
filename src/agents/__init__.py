@@ -1,7 +1,7 @@
 """
 Agent 模块
 
-包含 Subagent 模板池管理、协作模式、写手、协调者、状态管理器等
+包含 Subagent 模板池管理、协作模式、写手、协调者、状态管理器、执行器等
 """
 
 from .pool_registry import (
@@ -40,6 +40,19 @@ from .caller import (
     get_caller,
     call_subagent,
 )
+from .executor_bridge import (
+    ExecutorBridge,
+    get_bridge,
+    reset_bridge,
+)
+from .sdk_executor import (
+    SDKExecutor,
+    FallbackExecutor,
+    HybridExecutor,
+    SubagentResult,
+    get_executor,
+    execute_subagent,
+)
 
 __all__ = [
     # Pool Registry
@@ -72,4 +85,15 @@ __all__ = [
     "SubagentCaller",
     "get_caller",
     "call_subagent",
+    # Executor Bridge
+    "ExecutorBridge",
+    "get_bridge",
+    "reset_bridge",
+    # SDK Executor
+    "SDKExecutor",
+    "FallbackExecutor",
+    "HybridExecutor",
+    "SubagentResult",
+    "get_executor",
+    "execute_subagent",
 ]
