@@ -1,4 +1,7 @@
 """src/graph/builder.py — 构建 LangGraph StateGraph"""
+import logging
+import sqlite3
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from src.graph.state import GraphState
@@ -14,17 +17,19 @@ from src.graph.edges import (
     should_continue_or_timeout,
 )
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_DB_PATH = "checkpoints.db"
 
 
 def _make_default_checkpointer():
     """创建默认检查点存储器（优先 SqliteSaver，失败则回退到 MemorySaver）"""
     try:
-        import sqlite3
         from langgraph.checkpoint.sqlite import SqliteSaver
         conn = sqlite3.connect(_DEFAULT_DB_PATH, check_same_thread=False)
         return SqliteSaver(conn)
-    except Exception:
+    except (ImportError, sqlite3.Error, OSError) as e:
+        logger.warning(f"SqliteSaver 初始化失败，回退到 MemorySaver: {e}")
         return MemorySaver()
 
 

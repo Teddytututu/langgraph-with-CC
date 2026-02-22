@@ -10,12 +10,15 @@ Subagent 状态管理器
 """
 
 import json
+import logging
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class SubagentState(str, Enum):
@@ -218,7 +221,7 @@ tools: []
         try:
             file_path.write_text(content, encoding='utf-8')
         except Exception as e:
-            print(f"重置 subagent 文件失败: {e}")
+            logger.error(f"重置 subagent 文件失败: {e}")
 
         # 重置状态
         self.states[agent_id] = SubagentInfo(agent_id=agent_id)
@@ -332,7 +335,7 @@ tools: []
             return True
 
         except Exception as e:
-            print(f"加载 subagent 状态失败: {e}")
+            logger.error(f"加载 subagent 状态失败: {e}")
             return False
 
 

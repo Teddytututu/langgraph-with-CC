@@ -5,7 +5,10 @@ Subagent 调用接口
 通过 SDK 直接执行，失败时抛出异常。
 """
 
+import logging
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from .subagent_manager import SubagentManager, get_manager, SubagentState
 from .pool_registry import SubagentPool, get_pool
@@ -239,7 +242,7 @@ class SubagentCaller:
                 return True
 
             except Exception as e:
-                print(f"填充 specialist 失败: {e}")
+                logger.error(f"填充 specialist 失败: {e}")
 
         # 填充失败，使用默认模板
         self.pool.fill_agent(

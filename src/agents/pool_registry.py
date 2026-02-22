@@ -4,11 +4,14 @@ Subagent 模板池管理
 管理 .claude/agents/ 目录下的 subagent 模板
 """
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class SubagentTemplate(BaseModel):
@@ -103,7 +106,7 @@ class SubagentPool:
                 self._templates[agent_id] = template
 
             except Exception as e:
-                print(f"加载模板 {file_path} 失败: {e}")
+                logger.error(f"加载模板 {file_path} 失败: {e}")
 
     def get_template(self, agent_id: str) -> Optional[SubagentTemplate]:
         """获取指定模板"""
@@ -169,7 +172,7 @@ tools: [{tools_str}]
             return True
 
         except Exception as e:
-            print(f"填充模板失败: {e}")
+            logger.error(f"填充模板失败: {e}")
             return False
 
     def reload(self):
