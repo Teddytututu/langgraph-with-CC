@@ -763,7 +763,7 @@ body {
 /* ========== Graph ========== */
 .graph-card {
     flex: 1;
-    min-height: 400px;
+    min-height: 480px;
     display: flex;
     flex-direction: column;
 }
@@ -775,6 +775,7 @@ body {
     justify-content: center;
     background: linear-gradient(135deg, var(--violet-bg) 0%, var(--blue-bg) 100%);
     position: relative;
+    padding: 24px;
 }
 
 /* Graph 背景装饰 */
@@ -796,7 +797,7 @@ body {
     overflow: auto;
     z-index: 1;
     position: relative;
-    padding: 16px 12px;
+    padding: 20px 16px;
     box-sizing: border-box;
     /* 美化滚动条 */
     scrollbar-width: thin;
@@ -819,11 +820,26 @@ body {
 .graph-card .card-body .edgeLabel .label {
     background: #1c1c22 !important;
     border: 1px solid #3f3f46 !important;
-    border-radius: 4px !important;
-    padding: 1px 6px !important;
-    font-size: 11px !important;
-    color: #71717a !important;
+    border-radius: 6px !important;
+    padding: 3px 8px !important;
+    font-size: 12px !important;
+    font-weight: 500 !important;
+    color: #d4d4d8 !important;
     white-space: nowrap;
+    font-family: "Inter", sans-serif !important;
+}
+/* Mermaid 节点文本优化 */
+.graph-card .card-body .nodeLabel {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    font-family: "Inter", sans-serif !important;
+    letter-spacing: 0.3px;
+}
+
+.graph-card .card-body .node text {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    font-family: "Inter", sans-serif !important;
 }
 
 /* 节点形状透明度修正（Mermaid dark 主题有时 fill:none 残影）*/

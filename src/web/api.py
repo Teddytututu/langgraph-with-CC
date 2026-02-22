@@ -619,11 +619,11 @@ def register_routes(app: FastAPI):
         status_icon = {"running": "⟳", "done": "✓", "failed": "✗",
                        "pending": "○", "skipped": "—"}
         status_fill = {
-            "running": "fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:3px",
-            "done":    "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:1px",
+            "running": "fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2px",
+            "done":    "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px",
             "failed":  "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px",
-            "pending": "fill:#18181b,color:#71717a,stroke:#3f3f46,stroke-width:1px",
-            "skipped": "fill:#18181b,color:#52525b,stroke:#27272a,stroke-width:1px",
+            "pending": "fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px",
+            "skipped": "fill:#1f1f27,color:#71717a,stroke:#3f3f46,stroke-width:1px",
         }
 
         lines = ["graph LR"]
@@ -638,22 +638,22 @@ def register_routes(app: FastAPI):
             phase = app_state.current_node or "running"
             lines.append(f'    {hid}(["⚙ {phase.upper()}"])')
             deferred_styles.append(
-                f"    style {hid} fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:2px"
+                f"    style {hid} fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2.5px"
             )
         elif task_status in ("completed", "done"):
             lines.append(f'    {hid}(["✓ {task_title}"])')
             deferred_styles.append(
-                f"    style {hid} fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px"
+                f"    style {hid} fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2.5px"
             )
         elif task_status == "failed":
             lines.append(f'    {hid}(["✗ {task_title}"])')
             deferred_styles.append(
-                f"    style {hid} fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px"
+                f"    style {hid} fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2.5px"
             )
         else:
             lines.append(f'    {hid}(["{task_title}"])')
             deferred_styles.append(
-                f"    style {hid} fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1px"
+                f"    style {hid} fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px"
             )
 
         # ── 子任务节点 ────────────────────────────────────────────────────────

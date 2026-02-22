@@ -19,7 +19,7 @@ mermaid.initialize({
         mainBkg: '#27272a',
         // Typography
         fontFamily: '"Inter", ui-sans-serif, system-ui, sans-serif',
-        fontSize: '13px',
+        fontSize: '14px',
         // Note/label
         noteBkgColor: '#3f3f46',
         noteTextColor: '#d4d4d8',
@@ -27,10 +27,14 @@ mermaid.initialize({
     },
     flowchart: {
         htmlLabels: true,
-        padding: 20,
-        nodeSpacing: 48,
-        rankSpacing: 64,
-        curve: 'basis',
+        padding: 30,
+        nodeSpacing: 100,
+        rankSpacing: 120,
+        curve: 'linear',
+        diagramMarginX: 50,
+        diagramMarginY: 50,
+        useMaxWidth: true,
+        arrowMarkerAbsolute: true,
     },
 });
 
