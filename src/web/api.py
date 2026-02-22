@@ -2,9 +2,11 @@
 from __future__ import annotations
 import asyncio
 import json
+import traceback
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -237,11 +239,28 @@ def register_routes(app: FastAPI):
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+
+            # 生成崩溃报告
+            crash_report = {
+                "task_id": task_id,
+                "failed_node": app_state.current_node,
+                "error_message": str(e),
+                "traceback": traceback.format_exc(),
+                "task": task["task"],
+                "time": datetime.now().isoformat()
+            }
+
+            # 保存崩溃报告到文件
+            crash_report_path = Path("crash_report.json")
+            with open(crash_report_path, "w", encoding="utf-8") as f:
+                json.dump(crash_report, f, indent=2, ensure_ascii=False)
+
             app_state.system_status = "failed"
             app_state.current_node = ""
             await app_state.broadcast("task_failed", {
                 "id": task_id,
                 "error": str(e),
+                "crash_report_saved": str(crash_report_path),
             })
             await app_state.broadcast("system_status_changed", {
                 "status": "failed",
