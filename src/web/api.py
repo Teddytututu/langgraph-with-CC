@@ -20,6 +20,22 @@ from src.graph.dynamic_builder import DynamicGraphBuilder
 from src.discussion.manager import DiscussionManager, discussion_manager
 
 
+# ── 请求体模型（必须在模块层定义，FastAPI 才能正确解析 body） ──
+
+class TaskCreate(BaseModel):
+    """创建任务请求"""
+    task: str
+    time_minutes: Optional[float] = None
+
+
+class MessagePost(BaseModel):
+    """发送消息请求"""
+    from_agent: str
+    content: str
+    to_agents: list[str] = []
+    message_type: str = "info"
+
+
 # 全局状态
 class AppState:
     def __init__(self):
@@ -93,11 +109,6 @@ def register_routes(app: FastAPI):
         return FileResponse("src/web/static/index.html")
 
     # ── 任务 API ──
-
-    class TaskCreate(BaseModel):
-        """创建任务请求"""
-        task: str
-        time_minutes: Optional[float] = None
 
     @app.post("/api/tasks")
     async def create_task(req: TaskCreate):
@@ -204,9 +215,11 @@ def register_routes(app: FastAPI):
                                 "id": t.id,
                                 "title": t.title,
                                 "status": t.status,
+                                "agent_type": t.agent_type,
                             }
                             for t in state_update.get("subtasks", [])
                         ],
+                        "result": state_update.get("final_output"),
                     })
 
                     # 更新任务数据
@@ -231,6 +244,7 @@ def register_routes(app: FastAPI):
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
                             "result": state_update["final_output"],
+                            "subtasks": task["subtasks"],
                         })
                         await app_state.broadcast("system_status_changed", {
                             "status": "completed",
@@ -316,13 +330,6 @@ def register_routes(app: FastAPI):
         if discussion:
             return discussion.to_dict()
         return {"node_id": node_id, "messages": [], "participants": []}
-
-    class MessagePost(BaseModel):
-        """发送消息请求"""
-        from_agent: str
-        content: str
-        to_agents: list[str] = []
-        message_type: str = "info"
 
     @app.post("/api/tasks/{task_id}/nodes/{node_id}/discussion")
     async def post_message(task_id: str, node_id: str, req: MessagePost):
