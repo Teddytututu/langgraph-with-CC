@@ -7,9 +7,14 @@ SDK 执行器
 import os
 import json
 import asyncio
+import logging
 from typing import Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
+
+# Windows 强制 UTF-8，避免中文传递给 SDK 子进程时乱码
+os.environ["PYTHONUTF8"] = "1"
+os.environ["PYTHONIOENCODING"] = "utf-8"
 
 
 @dataclass
@@ -106,8 +111,6 @@ class SDKExecutor:
                 tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
             # 配置选项
-            # system_prompt 使用 append 模式，在 Claude Code 默认系统提示基础上追加
-            # 这样不会破坏 GLM/自定义路由等配置
             options_kwargs: dict = {
                 "allowed_tools": tools,
                 "permission_mode": "bypassPermissions",
@@ -140,27 +143,40 @@ class SDKExecutor:
             got_result_message = False
             result_message_content: str | None = None
 
+            _log = logging.getLogger("sdk_executor")
+
             try:
                 async for message in query(prompt=task_prompt, options=options):
                     if message is None:
                         continue
 
                     turns += 1
+                    msg_type = type(message).__name__
                     msg_dict = self._parse_message(message)
                     messages.append(msg_dict)
 
-                    msg_type = type(message).__name__
                     if msg_type == "ResultMessage":
                         got_result_message = True
-                        # result 字段是最终输出（可能是空字符串）
-                        r = getattr(message, "result", None)
-                        if r is not None:
-                            result_message_content = str(r)
+                        # 遍历所有属性，找出非空字符串
+                        for attr in ("result", "content", "output", "text", "message"):
+                            v = getattr(message, attr, None)
+                            if v and isinstance(v, str) and v.strip():
+                                result_message_content = v.strip()
+                                break
+                        # 也检查 content 是 list 的情况
+                        if not result_message_content:
+                            c = getattr(message, "content", None)
+                            if isinstance(c, list):
+                                for block in c:
+                                    t = getattr(block, "text", None) or (block if isinstance(block, str) else None)
+                                    if t and str(t).strip():
+                                        result_message_content = str(t).strip()
+                                        break
                     elif hasattr(message, "content"):
                         content = message.content
                         if content:
-                            if isinstance(content, str):
-                                result_data.append(content)
+                            if isinstance(content, str) and content.strip():
+                                result_data.append(content.strip())
                             elif isinstance(content, list):
                                 for block in content:
                                     if hasattr(block, "text") and block.text:
@@ -180,17 +196,17 @@ class SDKExecutor:
                 # 从 messages 中找最后一条有实际内容的
                 final_result = None
                 for msg in reversed(messages):
-                    # 跳过 ResultMessage 的空 content 包装
                     if msg.get("type") == "ResultMessage":
                         v = msg.get("result") or msg.get("raw_result")
-                        if v:
-                            final_result = str(v)
+                        if v and str(v).strip():
+                            final_result = str(v).strip()
                             break
                     else:
                         v = msg.get("content")
-                        if v and not v.startswith("{'type':"):
-                            final_result = str(v)
+                        if v and str(v).strip() and not str(v).startswith("{'type':"):
+                            final_result = str(v).strip()
                             break
+                _log.warning("All result sources empty for agent=%s turns=%d", agent_id, turns)
 
             return SubagentResult(
                 success=True,
