@@ -19,6 +19,15 @@ async def router_node(state: GraphState) -> dict:
             "is_overtime": remaining <= 0,
         })
 
+    # 🆕 检查是否在等待 subagent 执行
+    if state.get("waiting_for_subagent"):
+        # 保持等待状态，等待下一轮检查
+        return {
+            "phase": "waiting",
+            "time_budget": budget,
+            "iteration": state.get("iteration", 0) + 1,
+        }
+
     # 全部完成 → 汇总输出
     subtasks = state.get("subtasks", [])
     if subtasks and all(

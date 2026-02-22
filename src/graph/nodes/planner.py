@@ -35,7 +35,7 @@ async def planner_node(state: GraphState) -> dict:
     分解用户任务为子任务 DAG
 
     通过 SubagentCaller 调用 planner subagent 执行任务分解
-    支持异步执行：先创建调用，等待结果返回后再处理
+    SDK 模式下同步执行，降级模式下需要等待
     """
     config = get_config()
     caller = get_caller()
@@ -43,9 +43,9 @@ async def planner_node(state: GraphState) -> dict:
     budget = state.get("time_budget")
     user_task = state["user_task"]
 
-    # 🆕 检查是否有等待中的调用
+    # 🆕 降级模式：检查是否有等待中的调用
     pending_id = state.get("pending_call_id")
-    if pending_id:
+    if pending_id and caller.mode == "fallback":
         result_info = caller.check_result(pending_id)
 
         if result_info.get("completed"):
@@ -63,6 +63,7 @@ async def planner_node(state: GraphState) -> dict:
                     "subtask_count": len(subtasks),
                     "subagent_called": "planner",
                     "call_id": pending_id,
+                    "mode": "fallback",
                 }],
             }
         else:
@@ -80,13 +81,13 @@ async def planner_node(state: GraphState) -> dict:
             "remaining_minutes": budget.remaining_minutes,
         }
 
-    # 调用 planner subagent
+    # 调用 planner subagent（SDK 模式下同步执行）
     call_result = await caller.call_planner(
         task=user_task,
         time_budget=time_budget_info
     )
 
-    # 🆕 检查是否需要等待 subagent 执行
+    # 🆕 降级模式：检查是否需要等待外部执行
     if call_result.get("status") == "pending_execution":
         return {
             "pending_call_id": call_result["call_id"],
@@ -98,10 +99,11 @@ async def planner_node(state: GraphState) -> dict:
                 "timestamp": datetime.now().isoformat(),
                 "call_id": call_result["call_id"],
                 "agent_id": "planner",
+                "mode": "fallback",
             }],
         }
 
-    # 解析 subagent 返回的子任务（同步结果）
+    # SDK 模式：直接获取结果
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
 
     # 如果 subagent 未返回有效结果，创建默认子任务
@@ -130,6 +132,7 @@ async def planner_node(state: GraphState) -> dict:
             "timestamp": datetime.now().isoformat(),
             "subtask_count": len(subtasks),
             "subagent_called": "planner",
+            "mode": call_result.get("mode", "sdk"),
         }],
     }
 
