@@ -54,6 +54,11 @@ class SubagentCaller:
                 "result": None
             }
 
+        # 当模板 content 为空时，使用默认 system_prompt
+        system_prompt = template.content
+        if not system_prompt:
+            system_prompt = f"你是一个专业的 AI 助手，负责执行 {agent_id} 相关任务。请根据上下文完成任务，并以 JSON 格式返回结果。"
+
         # 标记为使用中
         self.manager.mark_in_use(agent_id)
 
@@ -61,9 +66,9 @@ class SubagentCaller:
             # 使用 SDK 执行器执行
             result: SubagentResult = await self.executor.execute(
                 agent_id=agent_id,
-                system_prompt=template.content,
+                system_prompt=system_prompt,
                 context=context,
-                tools=template.tools,
+                tools=template.tools or ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
                 model=template.model,
             )
 

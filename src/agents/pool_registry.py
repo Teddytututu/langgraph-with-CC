@@ -33,8 +33,18 @@ class SubagentPool:
         self._templates: dict[str, SubagentTemplate] = {}
         self._load_templates()
 
+    def _strip_code_fence(self, content: str) -> str:
+        """剥除 ```chatagent ... ``` 包装，仅保留内部内容"""
+        # 支持 ```chatagent 或 ```agent 等 code fence 包装
+        stripped = content.strip()
+        match = re.match(r'^```[\w]*\n(.*?)\n?```\s*$', stripped, re.DOTALL)
+        if match:
+            return match.group(1)
+        return content
+
     def _parse_frontmatter(self, content: str) -> dict:
         """解析 YAML frontmatter"""
+        content = self._strip_code_fence(content)
         frontmatter = {}
 
         # 匹配 --- 之间的内容
@@ -61,6 +71,7 @@ class SubagentPool:
 
     def _get_body(self, content: str) -> str:
         """获取 frontmatter 之后的正文"""
+        content = self._strip_code_fence(content)
         match = re.match(r'^---\s*\n.*?\n---\s*\n(.*)$', content, re.DOTALL)
         if match:
             return match.group(1).strip()
