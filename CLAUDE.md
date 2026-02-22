@@ -37,8 +37,8 @@ netstat -ano | findstr ":8001" | findstr LISTENING
 ### Step 3 — 启动 Web 服务器
 
 ```bash
-# 必须用 venv Python，必须不加 --reload（anyio CancelScope 限制）
-.venv\Scripts\python.exe -m uvicorn src.web.api:app --port 8001
+# 必须用 venv Python，必须不加 --reload（anyio CancelScope 限制），-X utf8 避免中文乱码
+.venv\Scripts\python.exe -X utf8 -m uvicorn src.web.api:app --port 8001
 ```
 
 > 以后台任务启动。启动后等待 3 秒，再次运行 Step 2 确认端口可达。  
