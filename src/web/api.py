@@ -38,7 +38,8 @@ class AppState:
             try:
                 await ws.send_text(message)
             except:
-                self.active_websockets.remove(ws)
+                if ws in self.active_websockets:
+                    self.active_websockets.remove(ws)
 
 
 app_state = AppState()
@@ -169,7 +170,7 @@ def register_routes(app: FastAPI):
 
             initial_state: GraphState = {
                 "user_task": task["task"],
-                "time_budget": TimeBudget(total_minutes=task["time_minutes"]) if task["time_minutes"] else None,
+                "time_budget": TimeBudget(total_minutes=task["time_minutes"], started_at=datetime.now()) if task["time_minutes"] else None,
                 "subtasks": [],
                 "discussions": {},
                 "messages": [],
@@ -310,7 +311,8 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
 
-        discussion = app_state.discussion_manager.get_discussion(node_id)
+        discussion_key = f"{task_id}_{node_id}"
+        discussion = app_state.discussion_manager.get_discussion(discussion_key)
         if discussion:
             return discussion.to_dict()
         return {"node_id": node_id, "messages": [], "participants": []}
@@ -329,7 +331,7 @@ def register_routes(app: FastAPI):
             raise HTTPException(status_code=404, detail="Task not found")
 
         msg = await app_state.discussion_manager.post_message(
-            node_id=node_id,
+            node_id=f"{task_id}_{node_id}",
             from_agent=req.from_agent,
             content=req.content,
             to_agents=req.to_agents,
@@ -372,7 +374,8 @@ def register_routes(app: FastAPI):
                 except json.JSONDecodeError:
                     pass
         except WebSocketDisconnect:
-            app_state.active_websockets.remove(websocket)
+            if websocket in app_state.active_websockets:
+                app_state.active_websockets.remove(websocket)
 
 
 # 创建应用实例

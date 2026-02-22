@@ -36,7 +36,7 @@ async def run_task(task: str, time_minutes: float | None = None) -> dict:
     # 构建初始状态
     initial_state: GraphState = {
         "user_task": task,
-        "time_budget": TimeBudget(total_minutes=time_minutes) if time_minutes else None,
+        "time_budget": TimeBudget(total_minutes=time_minutes, started_at=datetime.now()) if time_minutes else None,
         "subtasks": [],
         "discussions": {},
         "messages": [],
