@@ -26,6 +26,7 @@ createApp({
         const selectedTask = ref(null);
         const selectedSubtask = ref(null);
         const discussionMessages = ref([]);
+        const discussionParticipants = ref([]);
         const mermaidSvg = ref('');
         const showNewTask = ref(false);
         const terminalLines = ref([]);
@@ -67,24 +68,29 @@ createApp({
             return selectedTask.value.subtasks.filter(s => s.status === 'done' || s.status === 'completed').length;
         });
 
-        // Discussion 面板：从当前任务的 subtasks 动态生成发言者列表
+        // Discussion 面板：当前选中节点的 subagent 列表
+        // 来源优先级： assigned_agents → participants → agent_type 兑底
         const discussionAgents = computed(() => {
-            const subs = selectedTask.value?.subtasks || [];
-            if (!subs.length) {
-                return [{ value: 'user', label: 'User' }, { value: 'coordinator', label: 'Coordinator' }];
-            }
+            const sub = selectedSubtask.value;
+            if (!sub) return [{ value: 'user', label: 'User' }];
+
             const seen = new Set();
             const agents = [];
-            subs.forEach(s => {
-                const val = s.title || s.agent_type || s.id;
-                if (!seen.has(val)) {
+            const add = (val) => {
+                if (val && !seen.has(val)) {
                     seen.add(val);
-                    agents.push({
-                        value: val,
-                        label: s.title ? `${s.title} [${s.agent_type}]` : s.agent_type,
-                    });
+                    agents.push({ value: val, label: val });
                 }
-            });
+            };
+
+            // 1、当前节点明确分配的 subagent
+            (sub.assigned_agents || []).forEach(add);
+            // 2、讨论库中已参与的 agent
+            discussionParticipants.value.forEach(add);
+            // 3、如果不为空就屏蔽默认，否则先添加 agent_type 作为兼容屏蔽
+            if (agents.length === 0 && sub.agent_type) add(sub.agent_type);
+
+            // 始终包含 User 选项（供人工介入）
             return [{ value: 'user', label: 'User' }, ...agents];
         });
 
@@ -327,13 +333,21 @@ createApp({
 
         const selectSubtask = async (subtask) => {
             selectedSubtask.value = subtask;
-            // 自动将发言者切换为当前 subtask 的 agent
-            newMessage.value.from_agent = subtask.title || subtask.agent_type || 'user';
+            // 自动将发言者切换为当前节点第一个已分配的 agent（没有则留在 user）
+            newMessage.value.from_agent =
+                subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
+            discussionParticipants.value = [];
             if (selectedTask.value) {
                 try {
                     const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${subtask.id}/discussion`);
                     const data = await res.json();
                     discussionMessages.value = data.messages || [];
+                    discussionParticipants.value = data.participants || [];
+                    // 如果记录到了更多参与者，刷新默选
+                    if (discussionParticipants.value.length > 0 &&
+                        !subtask.assigned_agents?.length) {
+                        newMessage.value.from_agent = discussionParticipants.value[0];
+                    }
                 } catch (e) {
                     discussionMessages.value = [];
                 }
@@ -428,7 +442,7 @@ createApp({
 
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
-            discussionMessages, mermaidSvg, showNewTask, newTask, newMessage,
+            discussionMessages, discussionParticipants, mermaidSvg, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks, discussionAgents,
