@@ -127,11 +127,16 @@ class GraphState(TypedDict, total=False):
     # 流程控制
     phase: Literal[
         "init", "planning", "budgeting", "executing",
-        "reviewing", "reflecting", "complete", "timeout"
+        "reviewing", "reflecting", "complete", "timeout", "waiting"
     ]
     iteration: int
     max_iterations: int
     error: str | None
+
+    # 🆕 执行层状态
+    pending_call_id: str | None      # 当前等待的调用 ID
+    waiting_for_subagent: bool        # 是否在等待 subagent 执行
+    pending_agent_type: str | None    # 等待的 subagent 类型（用于恢复流程）
 
     # 最终输出
     final_output: str | None
