@@ -20,8 +20,10 @@ _DEFAULT_DB_PATH = "checkpoints.db"
 def _make_default_checkpointer():
     """创建默认检查点存储器（优先 SqliteSaver，失败则回退到 MemorySaver）"""
     try:
+        import sqlite3
         from langgraph.checkpoint.sqlite import SqliteSaver
-        return SqliteSaver.from_conn_string(_DEFAULT_DB_PATH)
+        conn = sqlite3.connect(_DEFAULT_DB_PATH, check_same_thread=False)
+        return SqliteSaver(conn)
     except Exception:
         return MemorySaver()
 

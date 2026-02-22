@@ -14,8 +14,8 @@ _coordinator = CoordinatorAgent()
 
 
 def _compute_timeout(task: SubTask) -> float:
-    """计算子任务执行超时时间（秒），取估算时间的 2 倍，最低 60s 最高 600s"""
-    return max(60.0, min(task.estimated_minutes * 120, 600.0))
+    """计算子任务执行超时时间（秒），取估算时间的 2 倍，最低 120s 最高 1800s"""
+    return max(120.0, min(task.estimated_minutes * 120, 1800.0))
 
 
 async def executor_node(state: GraphState) -> dict:
