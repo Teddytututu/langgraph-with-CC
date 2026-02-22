@@ -18,6 +18,7 @@ from src.graph.state import GraphState, SubTask, TimeBudget
 from src.graph.builder import build_graph
 from src.graph.dynamic_builder import DynamicGraphBuilder
 from src.discussion.manager import DiscussionManager, discussion_manager
+from src.agents.sdk_executor import get_executor
 
 
 # ── 请求体模型（必须在模块层定义，FastAPI 才能正确解析 body） ──
@@ -48,6 +49,12 @@ class SubtaskUpdate(BaseModel):
     agent_type: Optional[str] = None
     priority: Optional[int] = None
     estimated_minutes: Optional[float] = None
+
+
+class ChatRequest(BaseModel):
+    """与监控AI对话请求"""
+    message: str
+    history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]
 
 
 # 全局状态
@@ -147,6 +154,22 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_created", task_data)
 
+        # 自动启动：创建后立即触发执行
+        async def _auto_start():
+            await asyncio.sleep(0.1)
+            task_data["status"] = "running"
+            app_state.system_status = "running"
+            app_state.current_task_id = task_id
+            await app_state.broadcast("system_status_changed", {
+                "status": "running",
+                "task_id": task_id,
+                "task": task_data["task"],
+            })
+            await app_state.broadcast("task_started", {"id": task_id})
+            await run_task(task_id)
+
+        asyncio.create_task(_auto_start())
+
         return {"id": task_id, "status": "created"}
 
     @app.get("/api/tasks")
@@ -210,6 +233,56 @@ def register_routes(app: FastAPI):
         })
 
         return {"status": "queued", "timestamp": entry["timestamp"]}
+
+    @app.post("/api/chat")
+    async def chat_with_monitor(req: ChatRequest):
+        """与监控AI对话（拥有完整系统上下文）"""
+        executor = get_executor()
+
+        running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
+        task_summaries = "\n".join(
+            f"  - [{t['status']}] {t['id']}: {t['task'][:60]}"
+            for t in list(app_state.tasks.values())[-8:]
+        ) or "  （暂无任务）"
+
+        system_prompt = f"""你是这个 LangGraph 多Agent系统的监控助手。
+你与用户共同监督系统的运行状态，帮助分析问题、解读日志、给出建议。
+
+当前系统快照：
+- 系统状态: {app_state.system_status}
+- 当前节点: {app_state.current_node or '无'}
+- 运行中任务: {len(running)} 个
+- 任务列表（最近8条）:
+{task_summaries}
+
+请用简洁、直接的中文回答。如果用户询问具体任务，结合上面的信息作答。"""
+
+        # 拼接历史
+        history_lines = ""
+        for h in req.history[-6:]:
+            role_label = "用户" if h.get("role") == "user" else "助手"
+            history_lines += f"{role_label}: {h.get('content', '')}\n"
+
+        full_prompt = f"{history_lines}用户: {req.message}\n助手:"
+
+        result = await executor.execute(
+            agent_id="monitor_chat",
+            system_prompt=system_prompt,
+            context={"task": full_prompt},
+            tools=[],
+            max_turns=5,
+        )
+
+        reply = (result.result or "（暂时无法回复）").strip()
+        ts = datetime.now().isoformat()
+
+        await app_state.broadcast("chat_reply", {
+            "role": "assistant",
+            "content": reply,
+            "ts": ts,
+        })
+
+        return {"reply": reply, "timestamp": ts}
 
     @app.post("/api/tasks/{task_id}/start")
     async def start_task(task_id: str):

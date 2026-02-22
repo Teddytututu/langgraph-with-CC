@@ -303,6 +303,50 @@
 
             <!-- 右侧边栏 -->
             <aside class="sidebar sidebar-right">
+
+                <!-- Chat with Monitor AI -->
+                <div class="card chat-card">
+                    <div class="card-header">
+                        <span class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 2C6.48 2 2 5.92 2 10.5c0 2.3 1.03 4.38 2.7 5.9L4 20l3.85-1.55C9.14 18.78 10.54 19 12 19c5.52 0 10-3.92 10-8.5S17.52 2 12 2z"/>
+                                <circle cx="8" cy="10.5" r="1" fill="currentColor"/>
+                                <circle cx="12" cy="10.5" r="1" fill="currentColor"/>
+                                <circle cx="16" cy="10.5" r="1" fill="currentColor"/>
+                            </svg>
+                            Monitor AI
+                        </span>
+                        <span v-if="chatThinking" class="node-badge" style="font-size:0.7rem">
+                            <span class="pulse"></span>thinking…
+                        </span>
+                    </div>
+                    <div class="chat-messages" id="chat-messages">
+                        <div v-for="(msg, i) in chatMessages" :key="i"
+                             class="chat-msg" :class="msg.role">
+                            <div class="chat-bubble">{{ msg.content }}</div>
+                            <div class="chat-time">{{ msg.time }}</div>
+                        </div>
+                        <div v-if="chatMessages.length === 0" class="empty" style="padding:20px">
+                            <p class="empty-desc">共同监控系统运行状态…</p>
+                        </div>
+                    </div>
+                    <div class="chat-composer">
+                        <input
+                            v-model="chatInput"
+                            @keyup.enter="sendChat"
+                            placeholder="问监控AI…"
+                            class="chat-input"
+                            :disabled="chatThinking"
+                        />
+                        <button class="composer-btn" @click="sendChat"
+                                :disabled="!chatInput.trim() || chatThinking">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <line x1="22" y1="2" x2="11" y2="13"/>
+                                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
                 <div class="card" style="display: flex; flex-direction: column;">
                     <div class="card-header">
                         <span class="card-title">

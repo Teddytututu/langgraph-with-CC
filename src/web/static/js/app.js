@@ -30,6 +30,9 @@ createApp({
         const showNewTask = ref(false);
         const terminalLines = ref([]);
         const terminalInput = ref('');
+        const chatMessages = ref([]);
+        const chatInput = ref('');
+        const chatThinking = ref(false);
 
         const newTask = ref({ task: '', time_minutes: null });
         const newMessage = ref({ from_agent: 'director', content: '' });
@@ -137,6 +140,16 @@ createApp({
                     termLog(`💬 [${payload.node_id}] ${payload.message?.content?.slice(0,60)}`, 'info');
                     break;
                 }
+                case 'chat_reply': {
+                    const ts = payload.ts ? new Date(payload.ts).toLocaleTimeString() : new Date().toLocaleTimeString();
+                    chatMessages.value.push({ role: 'assistant', content: payload.content, time: ts });
+                    chatThinking.value = false;
+                    Vue.nextTick(() => {
+                        const el = document.getElementById('chat-messages');
+                        if (el) el.scrollTop = el.scrollHeight;
+                    });
+                    break;
+                }
             }
         };
 
@@ -242,6 +255,43 @@ createApp({
 
         const clearTerminal = () => { terminalLines.value = []; };
 
+        const sendChat = async () => {
+            const msg = chatInput.value.trim();
+            if (!msg || chatThinking.value) return;
+            chatInput.value = '';
+
+            const now = new Date().toLocaleTimeString();
+            chatMessages.value.push({ role: 'user', content: msg, time: now });
+            chatThinking.value = true;
+
+            Vue.nextTick(() => {
+                const el = document.getElementById('chat-messages');
+                if (el) el.scrollTop = el.scrollHeight;
+            });
+
+            // build history (exclude the message we just appended)
+            const history = chatMessages.value.slice(-9, -1).map(m => ({ role: m.role, content: m.content }));
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: msg, history }),
+                });
+                const data = await res.json();
+                const replyTime = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+                chatMessages.value.push({ role: 'assistant', content: data.reply, time: replyTime });
+            } catch (e) {
+                chatMessages.value.push({ role: 'assistant', content: `请求失败: ${e.message}`, time: new Date().toLocaleTimeString() });
+            } finally {
+                chatThinking.value = false;
+                Vue.nextTick(() => {
+                    const el = document.getElementById('chat-messages');
+                    if (el) el.scrollTop = el.scrollHeight;
+                });
+            }
+        };
+
         const selectTask = async (task) => {
             selectedTask.value = task;
             selectedSubtask.value = null;
@@ -345,9 +395,10 @@ createApp({
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
             discussionMessages, mermaidSvg, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
+            chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime,
-            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal,
+            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat,
         };
     }
 }).mount('#app');
