@@ -52,11 +52,27 @@ class SDKExecutor:
             return False
 
     def _check_api_config(self) -> bool:
-        """检查 API 是否已配置"""
-        # 检查环境变量
-        has_key = bool(os.getenv("ANTHROPIC_API_KEY"))
-        has_token = bool(os.getenv("ANTHROPIC_AUTH_TOKEN"))
-        return has_key or has_token
+        """检查 API 是否已配置，并从 ~/.claude/settings.json 的 env 段注入密钥"""
+        # 先看当前进程 env
+        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+            return True
+        # 从 Claude Code 的用户设置读取（env 字段）
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            settings_path = _Path.home() / ".claude" / "settings.json"
+            if settings_path.exists():
+                settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+                env_vars = settings.get("env", {})
+                for k, v in env_vars.items():
+                    if v and k not in os.environ:
+                        os.environ[k] = str(v)
+                if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+                    return True
+        except Exception:
+            pass
+        # 最后兜底：让 SDK 自己处理 auth，运行时失败会有具体报错
+        return True
 
     @property
     def is_available(self) -> bool:
