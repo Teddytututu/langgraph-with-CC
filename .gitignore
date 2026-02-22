@@ -14,3 +14,5 @@ downloads/
 src/web/FRONTEND_GUIDE.md
 report/
 crash_report.json
+
+app_state.json

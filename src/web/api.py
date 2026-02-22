@@ -57,6 +57,10 @@ class ChatRequest(BaseModel):
     history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]
 
 
+# 持久化文件路径
+_STATE_FILE = Path("app_state.json")
+
+
 # 全局状态
 class AppState:
     def __init__(self):
@@ -64,29 +68,75 @@ class AppState:
         self.graph_builder = DynamicGraphBuilder()
         self.discussion_manager = discussion_manager
         self.active_websockets: list[WebSocket] = []
-        self.system_status: str = "idle"  # idle, running, completed, failed
-        self.current_node: str = ""  # 当前执行的节点
-        self.current_task_id: str = ""  # 当前执行的任务 ID
-        # 实时干预：task_id -> 待注入指令列表
+        self.system_status: str = "idle"
+        self.current_node: str = ""
+        self.current_task_id: str = ""
         self.intervention_queues: dict[str, list[str]] = {}
-        # 终端日志持久化（最近 500 条，刷新后可恢复）
         self.terminal_log: list[dict] = []
-        _MAX_TERMINAL_LOG = 500
+        self._dirty: bool = False  # 标记是否有未保存的变更
 
     def append_terminal_log(self, entry: dict):
-        """追加终端日志（超出上限时丢弃最旧的）"""
         self.terminal_log.append(entry)
         if len(self.terminal_log) > 500:
             self.terminal_log = self.terminal_log[-500:]
+        self._dirty = True
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def save_to_disk(self):
+        """把核心状态序列化到磁盘"""
+        try:
+            data = {
+                "tasks": self.tasks,
+                "system_status": self.system_status,
+                "current_node": self.current_node,
+                "current_task_id": self.current_task_id,
+                "terminal_log": self.terminal_log[-300:],
+            }
+            _STATE_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._dirty = False
+        except Exception as e:
+            pass  # 持久化失败不影响正常运行
+
+    def load_from_disk(self):
+        """从磁盘恢复状态"""
+        if not _STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+            self.tasks = data.get("tasks", {})
+            self.system_status = data.get("system_status", "idle")
+            # 重启后正在运行中的任务实际已停止，标为 failed
+            for t in self.tasks.values():
+                if t.get("status") == "running":
+                    t["status"] = "failed"
+                    t["error"] = "服务器重启，任务中断"
+            if self.system_status == "running":
+                self.system_status = "idle"
+            self.current_node = ""
+            self.current_task_id = data.get("current_task_id", "")
+            self.terminal_log = data.get("terminal_log", [])
+            # 注入一条重启提示日志
+            self.terminal_log.append({
+                "task_id": "",
+                "line": f"⚡ 服务器已重启，已恢复 {len(self.tasks)} 个历史任务",
+                "level": "warn",
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
 
     async def broadcast(self, event: str, data: dict):
         """广播事件到所有连接的 WebSocket"""
         message = json.dumps({"event": event, "data": data}, ensure_ascii=False)
-        for ws in self.active_websockets[:]:  # 复制列表避免迭代时修改
+        for ws in self.active_websockets[:]:
             try:
                 await ws.send_text(message)
             except (ConnectionError, RuntimeError, OSError):
-                # WebSocket 连接异常，移除断开的连接
                 if ws in self.active_websockets:
                     self.active_websockets.remove(ws)
 
@@ -97,10 +147,22 @@ app_state = AppState()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    # 启动时初始化标准工作流
+    # 启动时初始化标准工作流并恢复磁盘状态
     app_state.graph_builder.create_standard_workflow()
+    app_state.load_from_disk()
+
+    # 后台定时保存（每 5 秒）
+    async def _periodic_save():
+        while True:
+            await asyncio.sleep(5)
+            if app_state._dirty:
+                app_state.save_to_disk()
+
+    save_task = asyncio.create_task(_periodic_save())
     yield
-    # 关闭时清理
+    # 关闭时保存最终状态
+    app_state.save_to_disk()
+    save_task.cancel()
     app_state.active_websockets.clear()
 
 
@@ -160,6 +222,7 @@ def register_routes(app: FastAPI):
         }
 
         app_state.tasks[task_id] = task_data
+        app_state.mark_dirty()
 
         await app_state.broadcast("task_created", task_data)
 
@@ -303,6 +366,7 @@ def register_routes(app: FastAPI):
 
         task = app_state.tasks[task_id]
         task["status"] = "running"
+        app_state.mark_dirty()
 
         # 更新系统状态
         app_state.system_status = "running"
@@ -415,6 +479,7 @@ def register_routes(app: FastAPI):
                             }
                             for t in state_update.get("subtasks", [])
                         ]
+                        app_state.mark_dirty()
                         for t in state_update["subtasks"]:
                             if t.status == "running":
                                 await emit(
@@ -432,6 +497,7 @@ def register_routes(app: FastAPI):
                         task["status"] = "completed"
                         app_state.system_status = "completed"
                         app_state.current_node = ""
+                        app_state.mark_dirty()
                         await emit(f"✓ 任务完成", "success")
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
@@ -459,6 +525,7 @@ def register_routes(app: FastAPI):
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            app_state.mark_dirty()
             await emit(f"✗ 崩溃: {str(e)[:200]}", "error")
 
             # 生成崩溃报告
