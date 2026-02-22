@@ -1,7 +1,7 @@
 """
 Agent 模块
 
-包含 Subagent 模板池管理、协作模式、写手、协调者等
+包含 Subagent 模板池管理、协作模式、写手、协调者、状态管理器等
 """
 
 from .pool_registry import (
@@ -28,6 +28,18 @@ from .coordinator import (
     TaskAnalysis,
     COORDINATOR_SYSTEM_PROMPT,
 )
+from .subagent_manager import (
+    SubagentState,
+    SubagentInfo,
+    SubagentManager,
+    get_manager,
+    reset_manager,
+)
+from .caller import (
+    SubagentCaller,
+    get_caller,
+    call_subagent,
+)
 
 __all__ = [
     # Pool Registry
@@ -50,4 +62,14 @@ __all__ = [
     "CoordinatorAgent",
     "TaskAnalysis",
     "COORDINATOR_SYSTEM_PROMPT",
+    # Subagent Manager
+    "SubagentState",
+    "SubagentInfo",
+    "SubagentManager",
+    "get_manager",
+    "reset_manager",
+    # Subagent Caller
+    "SubagentCaller",
+    "get_caller",
+    "call_subagent",
 ]
