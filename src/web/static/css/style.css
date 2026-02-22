@@ -509,10 +509,12 @@ body {
     display: flex;
     flex-direction: column;
     min-height: 400px;
+    flex: 1;
 }
 
 .task-list {
     flex: 1;
+    min-height: 300px;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -676,10 +678,12 @@ body {
 
 /* ========== 空状态 ========== */
 .empty {
+    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
+    min-height: 200px;
     padding: 40px 20px;
     text-align: center;
     position: relative;
@@ -937,10 +941,23 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ========== 活动 ========== */
+.activity-card {
+    margin-top: 24px;
+    border-top: 3px solid;
+    border-image: var(--gradient) 1;
+    background: linear-gradient(180deg, var(--bg-elevated) 0%, var(--bg-surface) 100%);
+}
+
+.activity-card::before {
+    display: none;
+}
+
 .activity-list {
     display: flex;
     flex-direction: column;
     min-height: 200px;
+    max-height: 300px;
+    overflow-y: auto;
 }
 
 .activity-item {
