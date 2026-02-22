@@ -580,9 +580,18 @@ def register_routes(app: FastAPI):
     def _build_task_mermaid() -> str:
         """根据当前任务的子任务动态生成 Mermaid 字符串。
         有子任务时显示子任务 DAG；无子任务时退回标准骨架图。"""
+        # 优先用 current_task_id；若无子任务则找最近一个有子任务的任务
         task_id = app_state.current_task_id
         task = app_state.tasks.get(task_id) if task_id else None
         subtasks: list[dict] = (task or {}).get("subtasks") or []
+
+        if not subtasks:
+            # 找所有任务中最后一个有子任务的（按 tasks 字典保留插入顺序）
+            for t in reversed(list(app_state.tasks.values())):
+                if t.get("subtasks"):
+                    subtasks = t["subtasks"]
+                    task = t
+                    break
 
         if not subtasks:
             return app_state.graph_builder.to_mermaid()
