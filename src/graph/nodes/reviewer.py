@@ -44,8 +44,12 @@ async def reviewer_node(state: GraphState) -> dict:
     review = _parse_review_result(call_result)
 
     # 纯函数式更新
+    max_iter = state.get("max_iterations", 3)
     if review["verdict"] == "PASS":
         new_status, new_retry = "done", current.retry_count
+    elif current.retry_count + 1 >= max_iter:
+        # 达到最大重试次数，标记为失败
+        new_status, new_retry = "failed", current.retry_count + 1
     else:
         new_status, new_retry = "pending", current.retry_count + 1
 
@@ -81,6 +85,8 @@ def _find_current_subtask(subtasks: list[SubTask], cid: Optional[str]) -> Option
 
 def _parse_review_result(call_result: dict) -> dict:
     """解析审查结果"""
+    import json
+    import re
     default_review = {
         "verdict": "PASS",
         "score": 7,
@@ -92,6 +98,16 @@ def _parse_review_result(call_result: dict) -> dict:
         return default_review
 
     result = call_result.get("result")
+
+    # SDK 可能返回字符串（含 JSON）
+    if isinstance(result, str):
+        match = re.search(r'\{.*\}', result, re.DOTALL)
+        if match:
+            try:
+                result = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                result = None
+
     if result and isinstance(result, dict):
         return {
             "verdict": result.get("verdict", "PASS"),

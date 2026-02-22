@@ -92,10 +92,25 @@ async def planner_node(state: GraphState) -> dict:
 
 def _parse_subtasks_from_result(result_data, budget) -> list[SubTask]:
     """从 subagent 结果中解析子任务"""
+    import re as _re
     subtasks = []
+
+    # SDK 可能返回字符串（含 JSON）或列表
+    if isinstance(result_data, str):
+        # 从字符串中提取 JSON 数组
+        match = _re.search(r'\[.*\]', result_data, _re.DOTALL)
+        if match:
+            try:
+                result_data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                result_data = []
+        else:
+            result_data = []
 
     if result_data and isinstance(result_data, list):
         for task_data in result_data:
+            if not isinstance(task_data, dict):
+                continue
             subtasks.append(SubTask(
                 id=task_data.get("id", f"task-{len(subtasks)+1:03d}"),
                 title=task_data.get("title", "未命名任务"),

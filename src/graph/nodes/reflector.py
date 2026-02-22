@@ -95,10 +95,24 @@ def _get_last_review(state: GraphState, task_id: str) -> Optional[dict]:
 
 def _parse_reflection_result(call_result: dict, issues: list) -> str:
     """解析反思结果"""
+    import json
+    import re
+
     if not call_result.get("success"):
         return f"\n需要改进的问题: {issues if issues else '无特定问题，请重新执行'}"
 
     result = call_result.get("result")
+
+    # SDK 可能返回字符串（含 JSON）
+    if isinstance(result, str):
+        match = re.search(r'\{.*\}', result, re.DOTALL)
+        if match:
+            try:
+                result = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                # 无法解析为 JSON，直接作为改进描述返回
+                return f"\n改进建议:\n{result}"
+
     if result and isinstance(result, dict):
         improved_description = result.get("improved_description", "")
         root_cause = result.get("root_cause", "")
