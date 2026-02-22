@@ -577,15 +577,77 @@ def register_routes(app: FastAPI):
         """获取 Graph 结构"""
         return app_state.graph_builder.to_dict()
 
+    def _build_task_mermaid() -> str:
+        """根据当前任务的子任务动态生成 Mermaid 字符串。
+        有子任务时显示子任务 DAG；无子任务时退回标准骨架图。"""
+        task_id = app_state.current_task_id
+        task = app_state.tasks.get(task_id) if task_id else None
+        subtasks: list[dict] = (task or {}).get("subtasks") or []
+
+        if not subtasks:
+            return app_state.graph_builder.to_mermaid()
+
+        # ── 动态子任务 DAG ────────────────────────────────────────────────────
+        # mermaid 节点 ID 不能含连字符，将 "task-001" → "t001"
+        def safe_id(raw: str) -> str:
+            return raw.replace("-", "").replace("_", "").replace(" ", "")
+
+        lines = ["graph TD"]
+        deferred_styles = []
+
+        # 状态 → 颜色
+        status_fill = {
+            "running": "fill:#6c63ff,color:#fff,stroke:#a78bfa,stroke-width:3px",
+            "done":    "fill:#166534,color:#bbf7d0,stroke:#22c55e",
+            "failed":  "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444",
+            "pending": "fill:#27272a,color:#a1a1aa,stroke:#52525b",
+            "skipped": "fill:#1c1c1f,color:#71717a,stroke:#3f3f46",
+        }
+
+        # 当前执行的 LangGraph 阶段（executor/reviewer 等）作为顶部说明节点
+        phase = app_state.current_node
+        if phase:
+            phase_sid = f"_phase_{phase}"
+            lines.append(f'    {phase_sid}[["⚙ {phase.upper()}"]]')
+            deferred_styles.append(
+                f"    style {phase_sid} fill:#4c1d95,color:#e9d5ff,stroke:#7c3aed,stroke-width:2px"
+            )
+
+        # 节点
+        for st in subtasks:
+            sid = safe_id(st["id"])
+            label = st["title"].replace('"', "'")[:30]
+            agent = st.get("agent_type", "")
+            lines.append(f'    {sid}["{st["id"]}\\n{label}\\n[{agent}]"]')
+            fill = status_fill.get(st.get("status", "pending"), status_fill["pending"])
+            deferred_styles.append(f"    style {sid} {fill}")
+
+        # 如果有 phase 节点，第一批无依赖的子任务从 phase 节点出发
+        if phase:
+            phase_sid = f"_phase_{phase}"
+            dep_ids = {dep for st in subtasks for dep in (st.get("dependencies") or [])}
+            roots = [st for st in subtasks if st["id"] not in dep_ids]
+            for st in roots:
+                lines.append(f"    {phase_sid} --> {safe_id(st['id'])}")
+
+        # 依赖边
+        for st in subtasks:
+            for dep_id in (st.get("dependencies") or []):
+                # 只连接 subtasks 中存在的依赖
+                if any(s["id"] == dep_id for s in subtasks):
+                    lines.append(f"    {safe_id(dep_id)} --> {safe_id(st['id'])}")
+
+        lines.extend(deferred_styles)
+        return "\n".join(lines)
+
     @app.get("/api/graph/mermaid")
     async def get_graph_mermaid(current_node: str = ""):
-        """获取 Mermaid 图形语法。高亮由前端通过 classDef 注入，后端仅在调用者明确传 current_node 时追加兼容样式。"""
-        mermaid_code = app_state.graph_builder.to_mermaid()
+        """获取 Mermaid 图形语法。有子任务时显示动态 DAG，否则显示标准骨架。"""
+        mermaid_code = _build_task_mermaid()
 
-        # 仅当调用者显式传入 current_node 参数时才追加样式（前端直接请求不传参，避免污染 rawMermaid 缓存）
+        # 仅当调用者显式传入 current_node 时追加静态高亮（兼容旧用法）
         if current_node:
-            highlight_line = f"    style {current_node} stroke:#ff0000,stroke-width:4px"
-            mermaid_code = mermaid_code + "\n" + highlight_line
+            mermaid_code += f"\n    style {current_node} stroke:#ff0000,stroke-width:4px"
 
         return {"mermaid": mermaid_code, "current_node": app_state.current_node}
 

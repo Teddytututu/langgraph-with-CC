@@ -131,8 +131,8 @@ createApp({
                     break;
                 case 'node_changed':
                     currentNode.value = payload.node;
-                    // 不重新请求网络，直接用缓存的原始图重渲染
-                    updateGraphRender();
+                    // 后端动态图内容随节点变化，需重新 fetch
+                    fetchGraph();
                     break;
                 case 'terminal_output':
                     termLog(payload.line, payload.level || 'info', payload.ts);
@@ -203,7 +203,10 @@ createApp({
         const handleTaskProgress = (payload) => {
             const task = tasks.value.find(t => t.id === payload.task_id);
             if (!task) return;
-            if (payload.subtasks) task.subtasks = payload.subtasks;
+            if (payload.subtasks) {
+                task.subtasks = payload.subtasks;
+                fetchGraph(); // 子任务更新时重绘 DAG
+            }
             if (payload.result) task.result = payload.result;
         };
 
