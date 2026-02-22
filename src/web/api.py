@@ -245,17 +245,15 @@ def register_routes(app: FastAPI):
             for t in list(app_state.tasks.values())[-8:]
         ) or "  （暂无任务）"
 
-        system_prompt = f"""你是这个 LangGraph 多Agent系统的监控助手。
-你与用户共同监督系统的运行状态，帮助分析问题、解读日志、给出建议。
-
-当前系统快照：
-- 系统状态: {app_state.system_status}
-- 当前节点: {app_state.current_node or '无'}
-- 运行中任务: {len(running)} 个
-- 任务列表（最近8条）:
+        # 注入当前状态作为上下文，但不覆盖角色——让 CLAUDE.md 的 supervisor 身份生效
+        state_context = f"""[web对话上下文]
+当前系统状态: {app_state.system_status}
+当前节点: {app_state.current_node or '无'}
+运行中任务: {len(running)} 个
+任务列表（最近8条）:
 {task_summaries}
-
-请用简洁、直接的中文回答。如果用户询问具体任务，结合上面的信息作答。"""
+---
+用户通过 Web UI 发来消息，请以 CLAUDE.md supervisor 身份回答。"""
 
         # 拼接历史
         history_lines = ""
@@ -263,17 +261,27 @@ def register_routes(app: FastAPI):
             role_label = "用户" if h.get("role") == "user" else "助手"
             history_lines += f"{role_label}: {h.get('content', '')}\n"
 
-        full_prompt = f"{history_lines}用户: {req.message}\n助手:"
+        full_prompt = f"{state_context}\n\n{history_lines}用户: {req.message}\n助手:"
 
-        result = await executor.execute(
-            agent_id="monitor_chat",
-            system_prompt=system_prompt,
-            context={"task": full_prompt},
-            tools=[],
-            max_turns=5,
-        )
-
-        reply = (result.result or "（暂时无法回复）").strip()
+        try:
+            result = await asyncio.wait_for(
+                executor.execute(
+                    agent_id="monitor_chat",
+                    system_prompt="",   # 空 system_prompt → 完全使用 CLAUDE.md + 用户设置
+                    context={"task": full_prompt},
+                    tools=[],
+                    max_turns=5,
+                ),
+                timeout=90,
+            )
+            if not result.success:
+                reply = f"⚠️ 执行错误: {result.error or '未知错误'}"
+            else:
+                reply = (result.result or "（无回复内容）").strip()
+        except asyncio.TimeoutError:
+            reply = "⏱️ 响应超时（>90s），请稍后重试。"
+        except Exception as e:
+            reply = f"⚠️ 请求失败: {str(e)[:150]}"
         ts = datetime.now().isoformat()
 
         await app_state.broadcast("chat_reply", {
