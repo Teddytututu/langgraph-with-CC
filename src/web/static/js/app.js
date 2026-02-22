@@ -67,6 +67,27 @@ createApp({
             return selectedTask.value.subtasks.filter(s => s.status === 'done' || s.status === 'completed').length;
         });
 
+        // Discussion 面板：从当前任务的 subtasks 动态生成发言者列表
+        const discussionAgents = computed(() => {
+            const subs = selectedTask.value?.subtasks || [];
+            if (!subs.length) {
+                return [{ value: 'user', label: 'User' }, { value: 'coordinator', label: 'Coordinator' }];
+            }
+            const seen = new Set();
+            const agents = [];
+            subs.forEach(s => {
+                const val = s.title || s.agent_type || s.id;
+                if (!seen.has(val)) {
+                    seen.add(val);
+                    agents.push({
+                        value: val,
+                        label: s.title ? `${s.title} [${s.agent_type}]` : s.agent_type,
+                    });
+                }
+            });
+            return [{ value: 'user', label: 'User' }, ...agents];
+        });
+
         // WebSocket
         let ws = null;
 
@@ -306,6 +327,8 @@ createApp({
 
         const selectSubtask = async (subtask) => {
             selectedSubtask.value = subtask;
+            // 自动将发言者切换为当前 subtask 的 agent
+            newMessage.value.from_agent = subtask.title || subtask.agent_type || 'user';
             if (selectedTask.value) {
                 try {
                     const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${subtask.id}/discussion`);
@@ -408,7 +431,7 @@ createApp({
             discussionMessages, mermaidSvg, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
-            stats, getCompletedSubtasks,
+            stats, getCompletedSubtasks, discussionAgents,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd,
             fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat,
         };

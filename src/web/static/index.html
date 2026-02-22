@@ -403,10 +403,7 @@
                         </div>
                         <div class="composer">
                             <select v-model="newMessage.from_agent" class="composer-select">
-                                <option value="director">Director</option>
-                                <option value="coder">Coder</option>
-                                <option value="researcher">Researcher</option>
-                                <option value="writer">Writer</option>
+                                <option v-for="agent in discussionAgents" :key="agent.value" :value="agent.value">{{ agent.label }}</option>
                             </select>
                             <div class="composer-row">
                                 <input v-model="newMessage.content" @keyup.enter="sendMessage" placeholder="Message..." class="composer-input">
