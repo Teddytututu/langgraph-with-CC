@@ -213,12 +213,19 @@ createApp({
             }
         };
 
-        const fetchSystemStatus = async () => {
+        let _terminalRestored = false;
+        const fetchSystemStatus = async (restoreTerminal = false) => {
             try {
                 const res = await fetch('/api/system/status');
                 const data = await res.json();
                 systemStatus.value = data.status;
                 currentNode.value = data.current_node || '';
+                // 刷新后一次性恢复终端日志
+                if (restoreTerminal && !_terminalRestored && data.terminal_log?.length) {
+                    _terminalRestored = true;
+                    terminalLines.value = [];
+                    data.terminal_log.forEach(e => termLog(e.line, e.level || 'info', e.ts));
+                }
             } catch (e) {
                 console.warn('fetchSystemStatus error', e);
             }
@@ -370,9 +377,16 @@ createApp({
         onMounted(async () => {
             connectWebSocket();
             await fetchTasks();
-            await fetchSystemStatus();
+            await fetchSystemStatus(true);  // true = 恢复终端日志
             fetchGraph();
-            termLog('System ready. Waiting for tasks…', 'info');
+
+            // 刷新后自动选中正在运行的任务，否则选最新任务
+            if (!selectedTask.value && tasks.value.length) {
+                const running = tasks.value.find(t => t.status === 'running');
+                selectedTask.value = running || tasks.value[0];
+            }
+
+            if (!_terminalRestored) termLog('System ready. Waiting for tasks…', 'info');
 
             // Poll every 3s when running
             setInterval(async () => {

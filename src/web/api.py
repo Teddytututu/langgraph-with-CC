@@ -69,6 +69,15 @@ class AppState:
         self.current_task_id: str = ""  # 当前执行的任务 ID
         # 实时干预：task_id -> 待注入指令列表
         self.intervention_queues: dict[str, list[str]] = {}
+        # 终端日志持久化（最近 500 条，刷新后可恢复）
+        self.terminal_log: list[dict] = []
+        _MAX_TERMINAL_LOG = 500
+
+    def append_terminal_log(self, entry: dict):
+        """追加终端日志（超出上限时丢弃最旧的）"""
+        self.terminal_log.append(entry)
+        if len(self.terminal_log) > 500:
+            self.terminal_log = self.terminal_log[-500:]
 
     async def broadcast(self, event: str, data: dict):
         """广播事件到所有连接的 WebSocket"""
@@ -316,13 +325,15 @@ def register_routes(app: FastAPI):
         task = app_state.tasks[task_id]
 
         async def emit(line: str, level: str = "info"):
-            """broadcast 一行终端输出"""
-            await app_state.broadcast("terminal_output", {
+            """broadcast 一行终端输出并持久化到 terminal_log"""
+            entry = {
                 "task_id": task_id,
                 "line": line,
                 "level": level,
                 "ts": datetime.now().strftime("%H:%M:%S"),
-            })
+            }
+            app_state.append_terminal_log(entry)
+            await app_state.broadcast("terminal_output", entry)
 
         try:
             graph = app_state.graph_builder.compile()
@@ -503,13 +514,14 @@ def register_routes(app: FastAPI):
 
     @app.get("/api/system/status")
     async def get_system_status():
-        """获取系统状态"""
+        """获取系统状态（含终端日志，供刷新后恢复）"""
         return {
             "status": app_state.system_status,
             "current_node": app_state.current_node,
             "current_task_id": app_state.current_task_id,
             "tasks_count": len(app_state.tasks),
             "running_tasks": len([t for t in app_state.tasks.values() if t["status"] == "running"]),
+            "terminal_log": app_state.terminal_log[-300:],
         }
 
     # ── 讨论 API ──
