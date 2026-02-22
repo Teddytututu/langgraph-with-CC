@@ -579,14 +579,12 @@ def register_routes(app: FastAPI):
 
     @app.get("/api/graph/mermaid")
     async def get_graph_mermaid(current_node: str = ""):
-        """获取 Mermaid 图形语法，支持高亮当前节点"""
+        """获取 Mermaid 图形语法。高亮由前端通过 classDef 注入，后端仅在调用者明确传 current_node 时追加兼容样式。"""
         mermaid_code = app_state.graph_builder.to_mermaid()
 
-        # 如果有当前执行节点，添加高亮样式
-        if current_node or app_state.current_node:
-            node = current_node or app_state.current_node
-            # 在 mermaid 代码中添加高亮样式
-            highlight_line = f"    style {node} stroke:#ff0000,stroke-width:4px"
+        # 仅当调用者显式传入 current_node 参数时才追加样式（前端直接请求不传参，避免污染 rawMermaid 缓存）
+        if current_node:
+            highlight_line = f"    style {current_node} stroke:#ff0000,stroke-width:4px"
             mermaid_code = mermaid_code + "\n" + highlight_line
 
         return {"mermaid": mermaid_code, "current_node": app_state.current_node}

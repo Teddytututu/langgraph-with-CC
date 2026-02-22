@@ -249,10 +249,8 @@ createApp({
             if (!rawMermaid.value) return;
             let mStr = rawMermaid.value;
 
-            // 基础样式：统一节点外观
-            mStr += '\nclassDef default fill:#252526,stroke:#444,stroke-width:2px,color:#ddd;';
-            // 活跃节点：紫色发光
-            mStr += '\nclassDef active fill:#6c63ff,stroke:#fff,stroke-width:4px,color:#fff,filter:drop-shadow(0 0 10px rgba(108,99,255,0.8));';
+            // 活跃节点：紫色高亮（不能用 filter: 括号会触发 Mermaid 解析错误；default 是保留字不能覆盖）
+            mStr += '\nclassDef active fill:#6c63ff,stroke:#a78bfa,stroke-width:4px,color:#fff;';
 
             if (currentNode.value) {
                 mStr += `\nclass ${currentNode.value} active;`;
