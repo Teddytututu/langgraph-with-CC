@@ -13,8 +13,14 @@
         <!-- 头部 -->
         <header class="header">
             <h1>🤖 Claude LangGraph 多 Agent 协作系统</h1>
-            <div class="connection-status" :class="{ connected: wsConnected }">
-                {{ wsConnected ? '🟢 已连接' : '🔴 断开' }}
+            <div class="header-status">
+                <div class="system-status" :class="systemStatus">
+                    <span class="status-icon">{{ getStatusIcon(systemStatus) }}</span>
+                    <span class="status-text">{{ getStatusText(systemStatus) }}</span>
+                </div>
+                <div class="connection-status" :class="{ connected: wsConnected }">
+                    {{ wsConnected ? '🟢 已连接' : '🔴 断开' }}
+                </div>
             </div>
         </header>
 
@@ -55,12 +61,21 @@
             <!-- 中间：Graph 可视化 -->
             <section class="content">
                 <div class="panel">
-                    <h2>🔄 Graph 可视化</h2>
-                    <div class="graph-container" v-html="mermaidSvg"></div>
+                    <h2>🔄 Graph 可视化
+                        <span v-if="currentNode" class="current-node-badge">当前: {{ currentNode }}</span>
+                    </h2>
+                    <div v-if="systemStatus === 'running' || systemStatus === 'completed'" class="graph-container" v-html="mermaidSvg"></div>
+                    <div v-else class="graph-placeholder">
+                        <div class="placeholder-content">
+                            <div class="placeholder-icon">📊</div>
+                            <p>等待任务启动...</p>
+                            <p class="placeholder-hint">创建并启动任务后，Graph 将动态生成</p>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- 子任务进度 -->
-                <div class="panel" v-if="selectedTask">
+                <div class="panel" v-if="selectedTask && selectedTask.subtasks?.length > 0">
                     <h2>📊 任务进度</h2>
                     <div class="subtask-list">
                         <div

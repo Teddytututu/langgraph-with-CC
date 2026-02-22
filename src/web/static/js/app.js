@@ -16,6 +16,9 @@ createApp({
     setup() {
         // 状态
         const wsConnected = ref(false);
+        const systemStatus = ref('idle');  // idle, running, completed, failed
+        const currentNode = ref('');
+        const currentTaskId = ref('');
         const tasks = ref([]);
         const selectedTask = ref(null);
         const selectedSubtask = ref(null);
@@ -68,6 +71,22 @@ createApp({
             const { event, data: payload } = data;
 
             switch (event) {
+                case 'system_status_changed':
+                    systemStatus.value = payload.status;
+                    if (payload.task_id) {
+                        currentTaskId.value = payload.task_id;
+                    }
+                    // 状态改变时刷新 Graph
+                    if (payload.status === 'running' || payload.status === 'completed') {
+                        fetchGraph();
+                    }
+                    break;
+
+                case 'node_changed':
+                    currentNode.value = payload.node;
+                    fetchGraph();  // 刷新 Graph 以高亮当前节点
+                    break;
+
                 case 'task_created':
                     tasks.value.unshift(payload);
                     break;
@@ -133,9 +152,24 @@ createApp({
                 const data = await response.json();
                 const { svg } = await mermaid.render('graph-svg', data.mermaid);
                 mermaidSvg.value = svg;
+                if (data.current_node) {
+                    currentNode.value = data.current_node;
+                }
             } catch (error) {
                 console.error('Failed to fetch graph:', error);
                 mermaidSvg.value = '<p>加载 Graph 失败</p>';
+            }
+        };
+
+        const fetchSystemStatus = async () => {
+            try {
+                const response = await fetch('/api/system/status');
+                const data = await response.json();
+                systemStatus.value = data.status;
+                currentNode.value = data.current_node;
+                currentTaskId.value = data.current_task_id;
+            } catch (error) {
+                console.error('Failed to fetch system status:', error);
             }
         };
 
@@ -232,17 +266,41 @@ createApp({
         onMounted(() => {
             connectWebSocket();
             fetchTasks();
-            fetchGraph();
+            fetchSystemStatus();
+            // 只有在有任务运行时才获取 Graph
+            if (systemStatus.value === 'running' || systemStatus.value === 'completed') {
+                fetchGraph();
+            }
         });
 
         // 监听任务选择变化，更新 Graph
         watch(selectedTask, () => {
-            fetchGraph();
+            if (systemStatus.value === 'running' || systemStatus.value === 'completed') {
+                fetchGraph();
+            }
         });
+
+        // 工具函数 - 状态文本
+        const getStatusText = (status) => {
+            const texts = {
+                idle: '待机中',
+                running: '执行中',
+                completed: '已完成',
+                failed: '执行失败',
+                created: '已创建',
+                pending: '等待中',
+                done: '已完成',
+                skipped: '已跳过'
+            };
+            return texts[status] || status;
+        };
 
         return {
             // 状态
             wsConnected,
+            systemStatus,
+            currentNode,
+            currentTaskId,
             tasks,
             selectedTask,
             selectedSubtask,
@@ -258,6 +316,7 @@ createApp({
             selectSubtask,
             sendMessage,
             getStatusIcon,
+            getStatusText,
             formatTime
         };
     }

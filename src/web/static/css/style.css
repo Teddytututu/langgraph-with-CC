@@ -47,6 +47,48 @@ body {
     font-weight: 600;
 }
 
+.header-status {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.system-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius);
+    background: var(--gray-200);
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.system-status.idle {
+    background: var(--gray-200);
+    color: var(--gray-700);
+}
+
+.system-status.running {
+    background: #fef3c7;
+    color: #92400e;
+    animation: pulse 1.5s infinite;
+}
+
+.system-status.completed {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.system-status.failed {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.status-icon {
+    font-size: 1rem;
+}
+
 .connection-status {
     padding: 0.5rem 1rem;
     border-radius: var(--radius);
@@ -59,14 +101,52 @@ body {
     color: #166534;
 }
 
+/* 当前节点徽章 */
+.current-node-badge {
+    font-size: 0.75rem;
+    font-weight: normal;
+    padding: 0.25rem 0.5rem;
+    background: var(--primary);
+    color: white;
+    border-radius: 4px;
+    margin-left: 0.5rem;
+}
+
+/* Graph 占位 */
+.graph-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+    background: var(--gray-100);
+    border-radius: var(--radius);
+    border: 2px dashed var(--gray-300);
+}
+
+.placeholder-content {
+    text-align: center;
+    color: var(--gray-500);
+}
+
+.placeholder-icon {
+    font-size: 4rem;
+    margin-bottom: 1rem;
+}
+
+.placeholder-hint {
+    font-size: 0.875rem;
+    color: var(--gray-400);
+    margin-top: 0.5rem;
+}
+
 /* 主容器 */
 .main-container {
     display: grid;
     grid-template-columns: 280px 1fr 320px;
     gap: 1rem;
     padding: 1rem;
-    max-height: calc(100vh - 70px);
-    overflow: hidden;
+    min-height: calc(100vh - 70px);
+    overflow: visible;
 }
 
 /* 侧边栏 */

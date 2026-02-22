@@ -25,6 +25,9 @@ class AppState:
         self.graph_builder = DynamicGraphBuilder()
         self.discussion_manager = discussion_manager
         self.active_websockets: list[WebSocket] = []
+        self.system_status: str = "idle"  # idle, running, completed, failed
+        self.current_node: str = ""  # 当前执行的节点
+        self.current_task_id: str = ""  # 当前执行的任务 ID
 
     async def broadcast(self, event: str, data: dict):
         """广播事件到所有连接的 WebSocket"""
@@ -139,6 +142,15 @@ def register_routes(app: FastAPI):
         task = app_state.tasks[task_id]
         task["status"] = "running"
 
+        # 更新系统状态
+        app_state.system_status = "running"
+        app_state.current_task_id = task_id
+        await app_state.broadcast("system_status_changed", {
+            "status": "running",
+            "task_id": task_id,
+            "task": task["task"],
+        })
+
         # 在后台执行任务
         asyncio.create_task(run_task(task_id))
 
@@ -172,6 +184,13 @@ def register_routes(app: FastAPI):
 
             async for event in graph.astream(initial_state, config):
                 for node_name, state_update in event.items():
+                    # 更新当前节点
+                    app_state.current_node = node_name
+                    await app_state.broadcast("node_changed", {
+                        "task_id": task_id,
+                        "node": node_name,
+                    })
+
                     # 广播状态更新
                     await app_state.broadcast("task_progress", {
                         "task_id": task_id,
@@ -204,16 +223,29 @@ def register_routes(app: FastAPI):
                     if state_update.get("final_output"):
                         task["result"] = state_update["final_output"]
                         task["status"] = "completed"
+                        app_state.system_status = "completed"
+                        app_state.current_node = ""
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
                             "result": state_update["final_output"],
+                        })
+                        await app_state.broadcast("system_status_changed", {
+                            "status": "completed",
+                            "task_id": task_id,
                         })
 
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            app_state.system_status = "failed"
+            app_state.current_node = ""
             await app_state.broadcast("task_failed", {
                 "id": task_id,
+                "error": str(e),
+            })
+            await app_state.broadcast("system_status_changed", {
+                "status": "failed",
+                "task_id": task_id,
                 "error": str(e),
             })
 
@@ -225,9 +257,31 @@ def register_routes(app: FastAPI):
         return app_state.graph_builder.to_dict()
 
     @app.get("/api/graph/mermaid")
-    async def get_graph_mermaid():
-        """获取 Mermaid 图形语法"""
-        return {"mermaid": app_state.graph_builder.to_mermaid()}
+    async def get_graph_mermaid(current_node: str = ""):
+        """获取 Mermaid 图形语法，支持高亮当前节点"""
+        mermaid_code = app_state.graph_builder.to_mermaid()
+
+        # 如果有当前执行节点，添加高亮样式
+        if current_node or app_state.current_node:
+            node = current_node or app_state.current_node
+            # 在 mermaid 代码中添加高亮样式
+            highlight_line = f"    style {node} stroke:#ff0000,stroke-width:4px"
+            mermaid_code = mermaid_code + "\n" + highlight_line
+
+        return {"mermaid": mermaid_code, "current_node": app_state.current_node}
+
+    # ── 系统状态 API ──
+
+    @app.get("/api/system/status")
+    async def get_system_status():
+        """获取系统状态"""
+        return {
+            "status": app_state.system_status,
+            "current_node": app_state.current_node,
+            "current_task_id": app_state.current_task_id,
+            "tasks_count": len(app_state.tasks),
+            "running_tasks": len([t for t in app_state.tasks.values() if t["status"] == "running"]),
+        }
 
     # ── 讨论 API ──
 
