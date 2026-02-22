@@ -142,6 +142,15 @@ netstat -ano | findstr ":8001" | findstr LISTENING
 
 ## 三、服务器重启流程（Restart Procedure）
 
+> ⚠️ **重启前必须检查是否有任务正在运行**：
+>
+> ```bash
+> .venv\Scripts\python.exe -c "import urllib.request,json; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8001/api/system/status',timeout=3).read()); print('status:', d['status'])"
+> ```
+>
+> 若输出 `status: running` → **禁止重启**，等任务完成或用户明确指示放弃后再重启。  
+> 若输出 `status: idle / completed / failed` → 可以安全重启。
+
 ```bash
 # 1. 找到占用 8001 端口的 PID
 netstat -ano | findstr ":8001"
@@ -150,7 +159,7 @@ netstat -ano | findstr ":8001"
 taskkill /PID <PID> /F /T
 
 # 3. 等待端口释放后重新启动（后台）
-.venv\Scripts\python.exe -m uvicorn src.web.api:app --port 8001
+.venv\Scripts\python.exe -X utf8 -m uvicorn src.web.api:app --port 8001 --host 127.0.0.1
 ```
 
 > 启动后 **3 秒内**应在 `scripts/watch.py` stdout 看到 `server_up` 事件。  

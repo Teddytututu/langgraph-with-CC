@@ -207,28 +207,28 @@ class DynamicGraphBuilder:
     # ── Graph 信息导出 ──
 
     def to_mermaid(self) -> str:
-        """导出为 Mermaid 图形语法"""
+        """导出为 Mermaid 图形语法（style 声明必须在所有边之后，否则 v11 解析报错）"""
         lines = ["graph TD"]
 
-        # 定义节点样式
+        # 节点样式映射（只收集，稍后统一追加到边的后面）
         node_styles = {
             "planner": "style {} fill:#e1f5fe",
             "executor": "style {} fill:#e8f5e9",
             "reviewer": "style {} fill:#fff3e0",
             "reflector": "style {} fill:#fce4ec",
         }
+        deferred_styles = []
 
-        # 添加节点
+        # 添加节点（不在此处输出 style）
         for node in self._nodes.values():
-            style = node_styles.get(node.node_type, "")
             lines.append(f"    {node.id}[{node.name}]")
+            style = node_styles.get(node.node_type, "")
             if style:
-                lines.append(f"    {style.format(node.id)}")
+                deferred_styles.append(f"    {style.format(node.id)}")
 
         # 添加边
         for edge in self._edges.values():
             if hasattr(edge, 'metadata') and edge.metadata.get("type") == "conditional":
-                # 条件边
                 targets = edge.metadata.get("targets", {})
                 for condition, target in targets.items():
                     if target == END:
@@ -241,6 +241,9 @@ class DynamicGraphBuilder:
                 lines.append(f"    {edge.from_node} --> {edge.to_node}")
             else:
                 lines.append(f"    START --> {edge.to_node}")
+
+        # style 声明放在最后（Mermaid v11 语法要求）
+        lines.extend(deferred_styles)
 
         return "\n".join(lines)
 
