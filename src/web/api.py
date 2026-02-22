@@ -41,6 +41,15 @@ class TaskIntervene(BaseModel):
     instruction: str  # 注入到运行中任务的指令
 
 
+class SubtaskUpdate(BaseModel):
+    """子任务编辑请求"""
+    title: Optional[str] = None
+    description: Optional[str] = None
+    agent_type: Optional[str] = None
+    priority: Optional[int] = None
+    estimated_minutes: Optional[float] = None
+
+
 # 全局状态
 class AppState:
     def __init__(self):
@@ -153,6 +162,26 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
         return app_state.tasks[task_id]
+
+    @app.patch("/api/tasks/{task_id}/subtasks/{subtask_id}")
+    async def update_subtask(task_id: str, subtask_id: str, req: SubtaskUpdate):
+        """编辑子任务字段（title / description / agent_type / priority / estimated_minutes）"""
+        if task_id not in app_state.tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
+        task = app_state.tasks[task_id]
+        subtasks = task.get("subtasks", [])
+        target = next((s for s in subtasks if s["id"] == subtask_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Subtask not found")
+
+        updates = req.model_dump(exclude_none=True)
+        target.update(updates)
+
+        await app_state.broadcast("task_progress", {
+            "task_id": task_id,
+            "subtasks": subtasks,
+        })
+        return target
 
     @app.post("/api/tasks/{task_id}/intervene")
     async def intervene_task(task_id: str, req: TaskIntervene):

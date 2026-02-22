@@ -217,6 +217,16 @@
                                     <h4>{{ s.title }}</h4>
                                     <span class="agent">{{ s.agent_type }}</span>
                                 </div>
+                                <button
+                                    class="subtask-edit-btn"
+                                    @click.stop="openEditSubtask(s)"
+                                    title="Edit subtask"
+                                >
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+                                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                    </svg>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -364,7 +374,61 @@
             </aside>
         </main>
 
-        <!-- 弹窗 -->
+        <!-- Edit Subtask Modal -->
+        <div class="modal-backdrop" v-if="editingSubtask" @click.self="editingSubtask = null">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                        </svg>
+                        Edit Subtask
+                    </span>
+                    <button class="modal-close" @click="editingSubtask = null">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div class="field">
+                        <label>Title</label>
+                        <input v-model="editForm.title" placeholder="Subtask title">
+                    </div>
+                    <div class="field">
+                        <label>Description</label>
+                        <textarea v-model="editForm.description" rows="4" placeholder="Detailed description and acceptance criteria"></textarea>
+                    </div>
+                    <div class="field">
+                        <label>Agent Type</label>
+                        <select v-model="editForm.agent_type">
+                            <option value="coder">coder</option>
+                            <option value="researcher">researcher</option>
+                            <option value="writer">writer</option>
+                            <option value="analyst">analyst</option>
+                        </select>
+                    </div>
+                    <div style="display:flex;gap:12px">
+                        <div class="field" style="flex:1">
+                            <label>Priority (1=highest)</label>
+                            <input type="number" v-model.number="editForm.priority" min="1" max="10">
+                        </div>
+                        <div class="field" style="flex:1">
+                            <label>Est. Minutes</label>
+                            <input type="number" v-model.number="editForm.estimated_minutes" min="1">
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-ghost" @click="editingSubtask = null">Cancel</button>
+                    <button class="btn btn-primary" @click="saveSubtask">Save</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- New Task Modal -->
         <div class="modal-backdrop" v-if="showNewTask" @click.self="showNewTask = false">
             <div class="modal">
                 <div class="modal-header">

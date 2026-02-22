@@ -34,6 +34,10 @@ createApp({
         const newMessage = ref({ from_agent: 'director', content: '' });
         const interveneText = ref('');
 
+        // Subtask edit state
+        const editingSubtask = ref(null);
+        const editForm = ref({ title: '', description: '', agent_type: 'coder', priority: 1, estimated_minutes: 10 });
+
         // Stats
         const stats = computed(() => ({
             totalTasks: tasks.value.length,
@@ -105,6 +109,18 @@ createApp({
                         t.interventions.push({ content: payload.instruction, timestamp: payload.timestamp });
                     }
                     addActivity(`⚡ Injected: ${payload.instruction.slice(0, 40)}`);
+                    break;
+                }
+                case 'discussion_message': {
+                    // Update live discussion panel if the message belongs to the open subtask
+                    if (
+                        selectedTask.value?.id === payload.task_id &&
+                        selectedSubtask.value?.id === payload.node_id
+                    ) {
+                        const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
+                        if (!exists) discussionMessages.value.push(payload.message);
+                    }
+                    addActivity(`💬 ${payload.node_id}: ${payload.message?.content?.slice(0, 40)}`);
                     break;
                 }
             }
@@ -229,12 +245,45 @@ createApp({
 
         const sendMessage = async () => {
             if (!newMessage.value.content.trim() || !selectedSubtask.value) return;
-            await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
+            const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(newMessage.value)
             });
+            const saved = await res.json();
+            // Optimistically add to local list (WS event may also arrive)
+            if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
+                discussionMessages.value.push(saved);
+            }
             newMessage.value.content = '';
+        };
+
+        const openEditSubtask = (subtask) => {
+            editingSubtask.value = subtask;
+            editForm.value = {
+                title: subtask.title || '',
+                description: subtask.description || '',
+                agent_type: subtask.agent_type || 'coder',
+                priority: subtask.priority || 1,
+                estimated_minutes: subtask.estimated_minutes || 10,
+            };
+        };
+
+        const saveSubtask = async () => {
+            if (!editingSubtask.value || !selectedTask.value) return;
+            const res = await fetch(
+                `/api/tasks/${selectedTask.value.id}/subtasks/${editingSubtask.value.id}`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(editForm.value),
+                }
+            );
+            if (res.ok) {
+                const updated = await res.json();
+                Object.assign(editingSubtask.value, updated);
+            }
+            editingSubtask.value = null;
         };
 
         const intervene = async () => {
@@ -270,10 +319,10 @@ createApp({
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
             discussionMessages, mermaidSvg, showNewTask, newTask, newMessage, activityLogs,
-            interveneText,
+            interveneText, editingSubtask, editForm,
             stats, getCompletedSubtasks,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime,
-            fetchGraph,
+            fetchGraph, openEditSubtask, saveSubtask,
         };
     }
 }).mount('#app');
