@@ -118,13 +118,25 @@ class SDKExecutor:
                 tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
             # 配置选项
-            options_kwargs = {
+            # system_prompt 使用 append 模式，在 Claude Code 默认系统提示基础上追加
+            # 这样不会破坏 GLM/自定义路由等配置
+            options_kwargs: dict = {
                 "allowed_tools": tools,
-                "system_prompt": system_prompt,
+                "permission_mode": "bypassPermissions",
+                # 加载用户和项目设置（包含 GLM 路由、CLAUDE.md 等）
+                "setting_sources": ["user", "project"],
             }
 
-            # 模型配置
-            if model and model != "inherit":
+            # 系统提示：通过 append 追加，不覆盖 Claude Code 默认行为
+            if system_prompt:
+                options_kwargs["system_prompt"] = {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": system_prompt,
+                }
+
+            # 模型配置（不指定则使用用户已配置的默认）
+            if model and model not in ("inherit", ""):
                 options_kwargs["model"] = model
 
             # 工作目录
@@ -133,40 +145,55 @@ class SDKExecutor:
 
             options = ClaudeAgentOptions(**options_kwargs)
 
-            # 执行
-            result_data = []
+            # 执行，迭代完所有消息
+            result_data: list[str] | str = []
             messages = []
             turns = 0
+            got_result_message = False
 
-            async for message in query(prompt=task_prompt, options=options):
-                if message is None:
-                    continue
+            try:
+                async for message in query(prompt=task_prompt, options=options):
+                    if message is None:
+                        continue
 
-                turns += 1
-                msg_dict = self._parse_message(message)
-                messages.append(msg_dict)
+                    turns += 1
+                    msg_dict = self._parse_message(message)
+                    messages.append(msg_dict)
 
-                # 收集结果 - 处理 ResultMessage 类型
-                msg_type = type(message).__name__
-                if msg_type == "ResultMessage":
-                    # ResultMessage 包含最终结果
-                    if hasattr(message, "result") and message.result:
-                        result_data = message.result
-                elif hasattr(message, "content"):
-                    content = message.content
-                    if content:
-                        if isinstance(content, str):
-                            result_data.append(content)
-                        elif isinstance(content, list):
-                            for block in content:
-                                if hasattr(block, "text"):
-                                    result_data.append(block.text)
+                    msg_type = type(message).__name__
+                    if msg_type == "ResultMessage":
+                        got_result_message = True
+                        # ResultMessage 是最终结果，is_error=True 时当作成功但内容为错误文本
+                        if hasattr(message, "result") and message.result:
+                            result_data = message.result
+                        # 拿到 ResultMessage 后不再需要继续迭代
+                    elif hasattr(message, "content"):
+                        content = message.content
+                        if content:
+                            if isinstance(content, str):
+                                assert isinstance(result_data, list)
+                                result_data.append(content)
+                            elif isinstance(content, list):
+                                assert isinstance(result_data, list)
+                                for block in content:
+                                    if hasattr(block, "text") and block.text:
+                                        result_data.append(block.text)
+            except Exception as stream_err:
+                # SDK 有时在拿到 ResultMessage 后仍会抛出进程退出异常，忽略它
+                if not got_result_message and not messages:
+                    raise stream_err
+                # 否则已有足够数据，继续
 
-            # 构建结果：将字符串列表合并为单个字符串
+            # 构建结果
             if isinstance(result_data, list):
                 final_result = "\n".join(str(s) for s in result_data) if result_data else None
             else:
-                final_result = result_data if result_data else (messages[-1] if messages else None)
+                final_result = result_data if result_data else None
+
+            # 如果所有内容都空，从 messages 取最后一条
+            if not final_result and messages:
+                last = messages[-1]
+                final_result = last.get("content") or str(last)
 
             return SubagentResult(
                 success=True,
