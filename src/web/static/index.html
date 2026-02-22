@@ -4,55 +4,104 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Claude LangGraph 多 Agent 协作系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
 </head>
 <body>
     <div id="app">
+        <!-- 背景装饰 -->
+        <div class="bg-decoration">
+            <div class="bg-blob bg-blob-1"></div>
+            <div class="bg-blob bg-blob-2"></div>
+            <div class="bg-blob bg-blob-3"></div>
+        </div>
+
         <!-- 头部 -->
         <header class="header">
-            <h1>🤖 Claude LangGraph 多 Agent 协作系统</h1>
-            <div class="header-status">
+            <div class="header-left">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div class="logo-text">
+                        <h1>Claude LangGraph</h1>
+                        <span>多 Agent 协作系统</span>
+                    </div>
+                </div>
+            </div>
+            <div class="header-right">
                 <div class="system-status" :class="systemStatus">
-                    <span class="status-icon">{{ getStatusIcon(systemStatus) }}</span>
+                    <span class="status-dot"></span>
                     <span class="status-text">{{ getStatusText(systemStatus) }}</span>
                 </div>
-                <div class="connection-status" :class="{ connected: wsConnected }">
-                    {{ wsConnected ? '🟢 已连接' : '🔴 断开' }}
+                <div class="connection-indicator" :class="{ connected: wsConnected }">
+                    <span class="connection-dot"></span>
+                    <span>{{ wsConnected ? '已连接' : '断开' }}</span>
                 </div>
             </div>
         </header>
 
+        <!-- 主体 -->
         <main class="main-container">
             <!-- 左侧：任务列表 -->
-            <aside class="sidebar">
-                <div class="panel">
-                    <h2>📋 任务列表</h2>
-                    <button class="btn btn-primary" @click="showNewTask = true">
-                        + 新建任务
-                    </button>
+            <aside class="sidebar sidebar-left">
+                <div class="panel glass-panel">
+                    <div class="panel-header">
+                        <h2>
+                            <svg class="panel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                            </svg>
+                            任务列表
+                        </h2>
+                        <button class="btn btn-primary" @click="showNewTask = true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 5v14M5 12h14"/>
+                            </svg>
+                            新建
+                        </button>
+                    </div>
                     <div class="task-list">
                         <div
                             v-for="task in tasks"
                             :key="task.id"
-                            class="task-item"
+                            class="task-card"
                             :class="{ active: selectedTask?.id === task.id }"
                             @click="selectTask(task)"
                         >
-                            <div class="task-header">
-                                <span class="task-status" :class="task.status">
+                            <div class="task-card-header">
+                                <span class="task-status-badge" :class="task.status">
                                     {{ getStatusIcon(task.status) }}
                                 </span>
-                                <span class="task-title">{{ task.task.slice(0, 30) }}...</span>
+                                <span class="task-time">{{ task.time_minutes || '∞' }} min</span>
                             </div>
-                            <div class="task-meta">
-                                <span>{{ task.subtasks?.length || 0 }} 子任务</span>
-                                <span>{{ task.time_minutes || '∞' }} 分钟</span>
+                            <p class="task-preview">{{ task.task.slice(0, 50) }}{{ task.task.length > 50 ? '...' : '' }}</p>
+                            <div class="task-card-footer">
+                                <span class="subtask-count">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M9 11l3 3L22 4"/>
+                                        <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
+                                    </svg>
+                                    {{ task.subtasks?.length || 0 }} 子任务
+                                </span>
+                                <span class="task-id">#{{ task.id }}</span>
                             </div>
                         </div>
                         <div v-if="tasks.length === 0" class="empty-state">
-                            暂无任务，点击上方按钮创建
+                            <div class="empty-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>
+                                </svg>
+                            </div>
+                            <p>暂无任务</p>
+                            <span>点击"新建"创建第一个任务</span>
                         </div>
                     </div>
                 </div>
@@ -60,43 +109,110 @@
 
             <!-- 中间：Graph 可视化 -->
             <section class="content">
-                <div class="panel">
-                    <h2>🔄 Graph 可视化
-                        <span v-if="currentNode" class="current-node-badge">当前: {{ currentNode }}</span>
-                    </h2>
-                    <div v-if="systemStatus === 'running' || systemStatus === 'completed'" class="graph-container" v-html="mermaidSvg"></div>
-                    <div v-else class="graph-placeholder">
-                        <div class="placeholder-content">
-                            <div class="placeholder-icon">📊</div>
-                            <p>等待任务启动...</p>
-                            <p class="placeholder-hint">创建并启动任务后，Graph 将动态生成</p>
+                <div class="panel glass-panel graph-panel">
+                    <div class="panel-header">
+                        <h2>
+                            <svg class="panel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="3"/>
+                                <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+                            </svg>
+                            工作流可视化
+                        </h2>
+                        <div v-if="currentNode" class="current-node-indicator">
+                            <span class="pulse-ring"></span>
+                            <span class="node-name">{{ currentNode }}</span>
+                        </div>
+                    </div>
+                    <div class="graph-content">
+                        <div v-if="systemStatus === 'running' || systemStatus === 'completed'" class="graph-container" v-html="mermaidSvg"></div>
+                        <div v-else class="graph-placeholder">
+                            <div class="placeholder-visual">
+                                <div class="placeholder-node node-1">
+                                    <span>Router</span>
+                                </div>
+                                <div class="placeholder-node node-2">
+                                    <span>Planner</span>
+                                </div>
+                                <div class="placeholder-node node-3">
+                                    <span>Executor</span>
+                                </div>
+                                <svg class="placeholder-connections" viewBox="0 0 200 60">
+                                    <path d="M30 30 L80 30" stroke="currentColor" stroke-width="2" stroke-dasharray="4 2"/>
+                                    <path d="M120 30 L170 30" stroke="currentColor" stroke-width="2" stroke-dasharray="4 2"/>
+                                </svg>
+                            </div>
+                            <div class="placeholder-text">
+                                <h3>等待任务启动</h3>
+                                <p>创建并启动任务后，工作流 Graph 将动态生成并实时展示执行进度</p>
+                            </div>
                         </div>
                     </div>
                 </div>
 
                 <!-- 子任务进度 -->
-                <div class="panel" v-if="selectedTask && selectedTask.subtasks?.length > 0">
-                    <h2>📊 任务进度</h2>
-                    <div class="subtask-list">
+                <div class="panel glass-panel subtask-panel" v-if="selectedTask && selectedTask.subtasks?.length > 0">
+                    <div class="panel-header">
+                        <h2>
+                            <svg class="panel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
+                                <polyline points="22,4 12,14.01 9,11.01"/>
+                            </svg>
+                            任务进度
+                        </h2>
+                        <div class="progress-stats">
+                            <span class="progress-stat">
+                                <strong>{{ getCompletedSubtasks }}</strong>
+                                <span>/ {{ selectedTask.subtasks?.length || 0 }} 完成</span>
+                            </span>
+                        </div>
+                    </div>
+                    <div class="subtask-grid">
                         <div
                             v-for="subtask in selectedTask.subtasks"
                             :key="subtask.id"
-                            class="subtask-item"
+                            class="subtask-card"
                             :class="subtask.status"
                             @click="selectSubtask(subtask)"
                         >
-                            <span class="subtask-status">{{ getStatusIcon(subtask.status) }}</span>
-                            <span class="subtask-title">{{ subtask.title }}</span>
-                            <span class="subtask-agent">{{ subtask.agent_type }}</span>
+                            <div class="subtask-status-icon">
+                                <span v-if="subtask.status === 'done'">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polyline points="20,6 9,17 4,12"/>
+                                    </svg>
+                                </span>
+                                <span v-else-if="subtask.status === 'running'" class="spinner"></span>
+                                <span v-else-if="subtask.status === 'failed'">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <line x1="18" y1="6" x2="6" y2="18"/>
+                                        <line x1="6" y1="6" x2="18" y2="18"/>
+                                    </svg>
+                                </span>
+                                <span v-else>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <circle cx="12" cy="12" r="10"/>
+                                    </svg>
+                                </span>
+                            </div>
+                            <div class="subtask-info">
+                                <h4>{{ subtask.title }}</h4>
+                                <span class="subtask-agent-badge">{{ subtask.agent_type }}</span>
+                            </div>
                         </div>
                     </div>
                 </div>
             </section>
 
             <!-- 右侧：讨论库 -->
-            <aside class="sidebar right">
-                <div class="panel" v-if="selectedSubtask">
-                    <h2>💬 讨论 - {{ selectedSubtask.title }}</h2>
+            <aside class="sidebar sidebar-right">
+                <div class="panel glass-panel" v-if="selectedSubtask">
+                    <div class="panel-header">
+                        <h2>
+                            <svg class="panel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                            </svg>
+                            协作讨论
+                        </h2>
+                    </div>
                     <div class="discussion-container">
                         <div
                             v-for="msg in discussionMessages"
@@ -104,56 +220,106 @@
                             class="message"
                             :class="msg.message_type"
                         >
-                            <div class="message-header">
-                                <span class="from-agent">{{ msg.from_agent }}</span>
-                                <span class="timestamp">{{ formatTime(msg.timestamp) }}</span>
+                            <div class="message-avatar">{{ msg.from_agent?.charAt(0)?.toUpperCase() }}</div>
+                            <div class="message-body">
+                                <div class="message-header">
+                                    <span class="from-agent">{{ msg.from_agent }}</span>
+                                    <span class="timestamp">{{ formatTime(msg.timestamp) }}</span>
+                                </div>
+                                <div class="message-content">{{ msg.content }}</div>
                             </div>
-                            <div class="message-content">{{ msg.content }}</div>
                         </div>
-                        <div v-if="discussionMessages.length === 0" class="empty-state">
-                            暂无讨论
+                        <div v-if="discussionMessages.length === 0" class="empty-discussion">
+                            <p>暂无讨论</p>
                         </div>
                     </div>
-                    <div class="message-input">
-                        <select v-model="newMessage.from_agent">
+                    <div class="message-input-area">
+                        <select v-model="newMessage.from_agent" class="agent-select">
                             <option value="director">Director</option>
                             <option value="coder">Coder</option>
                             <option value="researcher">Researcher</option>
                             <option value="writer">Writer</option>
                             <option value="analyst">Analyst</option>
                         </select>
-                        <input
-                            v-model="newMessage.content"
-                            @keyup.enter="sendMessage"
-                            placeholder="输入消息..."
-                        >
-                        <button class="btn btn-primary" @click="sendMessage">发送</button>
+                        <div class="input-wrapper">
+                            <input
+                                v-model="newMessage.content"
+                                @keyup.enter="sendMessage"
+                                placeholder="输入消息..."
+                                class="message-input"
+                            >
+                            <button class="send-btn" @click="sendMessage">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="22" y1="2" x2="11" y2="13"/>
+                                    <polygon points="22,2 15,22 11,13 2,9"/>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
                 </div>
-                <div class="panel" v-else>
-                    <h2>💬 讨论</h2>
+                <div class="panel glass-panel" v-else>
+                    <div class="panel-header">
+                        <h2>
+                            <svg class="panel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                            </svg>
+                            协作讨论
+                        </h2>
+                    </div>
                     <div class="empty-state">
-                        选择一个子任务查看讨论
+                        <div class="empty-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                            </svg>
+                        </div>
+                        <p>选择子任务</p>
+                        <span>查看相关讨论内容</span>
                     </div>
                 </div>
             </aside>
         </main>
 
         <!-- 新建任务弹窗 -->
-        <div class="modal" v-if="showNewTask" @click.self="showNewTask = false">
-            <div class="modal-content">
-                <h2>📝 新建任务</h2>
-                <div class="form-group">
-                    <label>任务描述</label>
-                    <textarea v-model="newTask.task" placeholder="描述你要完成的任务..."></textarea>
+        <div class="modal-overlay" v-if="showNewTask" @click.self="showNewTask = false">
+            <div class="modal">
+                <div class="modal-header">
+                    <h2>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="12" y1="8" x2="12" y2="16"/>
+                            <line x1="8" y1="12" x2="16" y2="12"/>
+                        </svg>
+                        创建新任务
+                    </h2>
+                    <button class="modal-close" @click="showNewTask = false">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
                 </div>
-                <div class="form-group">
-                    <label>时间预算（分钟）</label>
-                    <input type="number" v-model="newTask.time_minutes" placeholder="留空表示无限制">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>任务描述</label>
+                        <textarea v-model="newTask.task" placeholder="详细描述你希望完成的任务..." rows="4"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>时间预算 (分钟)</label>
+                        <div class="time-input-wrapper">
+                            <input type="number" v-model="newTask.time_minutes" placeholder="可选，留空表示无限制">
+                            <span class="time-hint">留空则不限制时间</span>
+                        </div>
+                    </div>
                 </div>
-                <div class="form-actions">
-                    <button class="btn" @click="showNewTask = false">取消</button>
-                    <button class="btn btn-primary" @click="createTask">创建</button>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" @click="showNewTask = false">取消</button>
+                    <button class="btn btn-primary" @click="createTask" :disabled="!newTask.task.trim()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19"/>
+                            <line x1="5" y1="12" x2="19" y2="12"/>
+                        </svg>
+                        创建并启动
+                    </button>
                 </div>
             </div>
         </div>
