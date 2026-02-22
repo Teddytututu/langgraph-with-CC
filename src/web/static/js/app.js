@@ -189,6 +189,12 @@ createApp({
                     });
                     break;
                 }
+                case 'tasks_cleared':
+                    tasks.value = [];
+                    selectedTask.value = null;
+                    terminalLines.value = [];
+                    fetchGraph();
+                    break;
             }
         };
 
@@ -341,6 +347,24 @@ createApp({
         };
 
         const clearTerminal = () => { terminalLines.value = []; };
+
+        const clearAllTasks = async () => {
+            if (!confirm('确定清空所有任务记录？此操作不可撤销。')) return;
+            try {
+                const res = await fetch('/api/tasks', { method: 'DELETE' });
+                if (!res.ok) {
+                    const err = await res.json();
+                    alert(err.detail || '清空失败');
+                    return;
+                }
+                tasks.value = [];
+                selectedTask.value = null;
+                terminalLines.value = [];
+                fetchGraph();
+            } catch (e) {
+                alert('请求失败: ' + e.message);
+            }
+        };
 
         const sendChat = async () => {
             const msg = chatInput.value.trim();
@@ -505,7 +529,7 @@ createApp({
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks, discussionAgents,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd,
-            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat,
+            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
         };
     }
 }).mount('#app');

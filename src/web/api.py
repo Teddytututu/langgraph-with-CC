@@ -266,6 +266,22 @@ def register_routes(app: FastAPI):
             "count": len(app_state.tasks),
         }
 
+    @app.delete("/api/tasks")
+    async def clear_all_tasks():
+        """清空所有任务及子任务，重置系统状态"""
+        running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
+        if running:
+            raise HTTPException(status_code=409, detail="任务正在运行，无法清空")
+        app_state.tasks.clear()
+        app_state.current_task_id = None
+        app_state.current_node = ""
+        app_state.system_status = "idle"
+        app_state.terminal_log.clear()
+        app_state.intervention_queues.clear()
+        app_state.mark_dirty()
+        await app_state.broadcast("tasks_cleared", {})
+        return {"status": "cleared"}
+
     @app.get("/api/tasks/{task_id}")
     async def get_task(task_id: str):
         """获取任务详情"""
