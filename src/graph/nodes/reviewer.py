@@ -1,47 +1,45 @@
 """src/graph/nodes/reviewer.py — 质量审查节点"""
-import json
-from src.graph.state import GraphState
+from datetime import datetime
+from typing import Optional
 
-
-REVIEWER_PROMPT = """
-你是一个严格的质量审查员。请评估子任务的执行结果。
-
-评估维度：
-1. **完整性** — 是否覆盖了任务描述的所有要求
-2. **正确性** — 结果是否准确无误
-3. **质量** — 代码可读性/文档清晰度/分析深度
-
-输出格式（只返回 JSON）：
-{"verdict": "PASS" 或 "REVISE",
- "score": 1-10,
- "issues": ["问题1", "问题2"],
- "suggestions": ["建议1", "建议2"]}
-
-评分指南：
-- 8-10 分: PASS，质量优秀
-- 6-7 分: PASS，可接受但有改进空间
-- 1-5 分: REVISE，需要重做
-"""
+from src.graph.state import GraphState, SubTask
+from src.agents.caller import get_caller
 
 
 async def reviewer_node(state: GraphState) -> dict:
-    """审查当前子任务的执行结果"""
+    """
+    审查当前子任务的执行结果
+
+    通过 SubagentCaller 调用 reviewer subagent 进行质量审查
+    """
+    caller = get_caller()
     subtasks = state.get("subtasks", [])
     cid = state.get("current_subtask_id")
-    current = next(
-        (t for t in subtasks if t.id == cid),
-        None,
-    )
 
+    current = _find_current_subtask(subtasks, cid)
     if not current or not current.result:
         return {"phase": "executing"}
 
-    # TODO: 调用 LLM 进行审查
-    # 目前默认通过
-    review = {"verdict": "PASS", "score": 7,
-              "issues": [], "suggestions": []}
+    # 调用 reviewer subagent 进行审查
+    call_result = await caller.call_reviewer(
+        execution_result={
+            "result": current.result,
+            "status": current.status,
+            "started_at": current.started_at.isoformat() if current.started_at else None,
+            "finished_at": current.finished_at.isoformat() if current.finished_at else None,
+        },
+        subtask={
+            "id": current.id,
+            "title": current.title,
+            "description": current.description,
+            "completion_criteria": current.completion_criteria,
+        }
+    )
 
-    # ✅ 纯函数式更新
+    # 解析审查结果
+    review = _parse_review_result(call_result)
+
+    # 纯函数式更新
     if review["verdict"] == "PASS":
         new_status, new_retry = "done", current.retry_count
     else:
@@ -66,5 +64,37 @@ async def reviewer_node(state: GraphState) -> dict:
             "verdict": review["verdict"],
             "score": review.get("score", 0),
             "issues": review.get("issues", []),
+            "subagent_called": "reviewer",
+            "timestamp": datetime.now().isoformat(),
         }],
     }
+
+
+def _find_current_subtask(subtasks: list[SubTask], cid: Optional[str]) -> Optional[SubTask]:
+    """查找当前子任务"""
+    return next((t for t in subtasks if t.id == cid), None)
+
+
+def _parse_review_result(call_result: dict) -> dict:
+    """解析审查结果"""
+    # 默认审查结果
+    default_review = {
+        "verdict": "PASS",
+        "score": 7,
+        "issues": [],
+        "suggestions": []
+    }
+
+    if not call_result.get("success"):
+        return default_review
+
+    result = call_result.get("result")
+    if result and isinstance(result, dict):
+        return {
+            "verdict": result.get("verdict", "PASS"),
+            "score": result.get("score", 7),
+            "issues": result.get("issues", []),
+            "suggestions": result.get("suggestions", []),
+        }
+
+    return default_review

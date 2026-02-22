@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from src.graph.state import GraphState, SubTask
 from src.utils.config import get_config
+from src.agents.caller import get_caller
 
 PLANNER_SYSTEM_PROMPT = """
 你是一个任务规划专家。你的职责是将用户的复杂任务分解为可执行的子任务。
@@ -30,32 +31,67 @@ PLANNER_SYSTEM_PROMPT = """
 
 
 async def planner_node(state: GraphState) -> dict:
-    """分解用户任务为子任务 DAG"""
+    """
+    分解用户任务为子任务 DAG
+
+    通过 SubagentCaller 调用 planner subagent 执行任务分解
+    """
     config = get_config()
+    caller = get_caller()
 
     budget = state.get("time_budget")
     user_task = state["user_task"]
-    time_info = ""
-    if budget:
-        time_info = (
-            f"\n用户给定的总时间预算：{budget.total_minutes} 分钟。"
-            f"请确保所有子任务的预估总耗时不超过此预算的 80%（留 20% 作为审查缓冲）。"
-        )
 
-    # TODO: 调用 LLM 分解任务
-    # 目前返回一个简单的默认子任务
-    subtasks = [
-        SubTask(
-            id="task-001",
-            title="执行完整任务",
-            description=user_task,
-            agent_type="coder",
-            estimated_minutes=(
-                budget.total_minutes * 0.8
-                if budget else 30
-            ),
-        )
-    ]
+    # 构建时间预算信息
+    time_budget_info = None
+    if budget:
+        time_budget_info = {
+            "total_minutes": budget.total_minutes,
+            "remaining_minutes": budget.remaining_minutes,
+        }
+
+    # 调用 planner subagent
+    call_result = await caller.call_planner(
+        task=user_task,
+        time_budget=time_budget_info
+    )
+
+    # 解析 subagent 返回的子任务
+    subtasks = []
+
+    if call_result.get("success"):
+        # 从 subagent 结果中获取子任务列表
+        # 实际执行时，subagent 会返回 JSON 格式的子任务数组
+        result_data = call_result.get("result")
+
+        if result_data and isinstance(result_data, list):
+            for task_data in result_data:
+                subtasks.append(SubTask(
+                    id=task_data.get("id", f"task-{len(subtasks)+1:03d}"),
+                    title=task_data.get("title", "未命名任务"),
+                    description=task_data.get("description", ""),
+                    agent_type=task_data.get("agent_type", "coder"),
+                    dependencies=task_data.get("dependencies", []),
+                    priority=task_data.get("priority", 1),
+                    estimated_minutes=task_data.get("estimated_minutes", 10),
+                    knowledge_domains=task_data.get("knowledge_domains", []),
+                    completion_criteria=task_data.get("completion_criteria", []),
+                ))
+
+    # 如果 subagent 未返回有效结果，创建默认子任务
+    if not subtasks:
+        subtasks = [
+            SubTask(
+                id="task-001",
+                title="执行完整任务",
+                description=user_task,
+                agent_type="coder",
+                estimated_minutes=(
+                    budget.total_minutes * 0.8
+                    if budget else 30
+                ),
+            )
+        ]
 
     return {
         "subtasks": subtasks,
@@ -64,5 +100,6 @@ async def planner_node(state: GraphState) -> dict:
             "event": "planning_complete",
             "timestamp": datetime.now().isoformat(),
             "subtask_count": len(subtasks),
+            "subagent_called": "planner",
         }],
     }
