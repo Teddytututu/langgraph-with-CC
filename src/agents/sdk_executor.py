@@ -222,117 +222,23 @@ class SDKExecutor:
         return {"raw": str(message)}
 
 
-class FallbackExecutor:
-    """
-    降级执行器
-
-    当 SDK 不可用时，返回提示信息，等待外部执行
-    """
-
-    def __init__(self, bridge=None):
-        from .executor_bridge import get_bridge
-        self.bridge = bridge or get_bridge()
-
-    async def execute(
-        self,
-        agent_id: str,
-        system_prompt: str,
-        context: dict[str, Any],
-        tools: list[str] = None,
-        **kwargs
-    ) -> SubagentResult:
-        """
-        创建调用指令，等待外部执行
-
-        这个方法不会真正执行，而是将调用信息写入文件，
-        等待 CLAUDE.md 或其他外部系统来执行
-        """
-        # 创建调用
-        call_id = self.bridge.create_call(
-            agent_id=agent_id,
-            system_prompt=system_prompt,
-            context=context,
-            tools=tools or [],
-        )
-
-        return SubagentResult(
-            success=True,
-            result={
-                "call_id": call_id,
-                "status": "pending_external_execution",
-                "message": "SDK 不可用，已创建调用指令等待外部执行",
-            },
-        )
-
-    def check_result(self, call_id: str) -> Optional[SubagentResult]:
-        """检查外部执行的结果"""
-        result = self.bridge.get_result(call_id)
-        if result:
-            return SubagentResult(
-                success=result.get("success", True),
-                result=result.get("result"),
-                error=result.get("error"),
-                completed_at=result.get("completed_at", ""),
-            )
-        return None
-
-
-class HybridExecutor:
-    """
-    混合执行器
-
-    优先使用 SDK 执行，SDK 不可用时降级到文件方式
-    """
-
-    def __init__(self):
-        self.sdk_executor = SDKExecutor()
-        self.fallback_executor = FallbackExecutor()
-
-    async def execute(
-        self,
-        agent_id: str,
-        system_prompt: str,
-        context: dict[str, Any],
-        tools: list[str] = None,
-        model: str = None,
-        **kwargs
-    ) -> SubagentResult:
-        """执行 subagent"""
-        if self.sdk_executor.is_available:
-            # SDK 可用，直接执行
-            return await self.sdk_executor.execute(
-                agent_id=agent_id,
-                system_prompt=system_prompt,
-                context=context,
-                tools=tools,
-                model=model,
-                **kwargs
-            )
-        else:
-            # SDK 不可用，降级到文件方式
-            return await self.fallback_executor.execute(
-                agent_id=agent_id,
-                system_prompt=system_prompt,
-                context=context,
-                tools=tools,
-                **kwargs
-            )
-
-    @property
-    def mode(self) -> str:
-        """当前执行模式"""
-        return "sdk" if self.sdk_executor.is_available else "fallback"
-
-
 # 全局单例
-_executor_instance: Optional[HybridExecutor] = None
+_executor_instance: Optional[SDKExecutor] = None
 
 
-def get_executor() -> HybridExecutor:
+def get_executor() -> SDKExecutor:
     """获取全局执行器实例"""
     global _executor_instance
     if _executor_instance is None:
-        _executor_instance = HybridExecutor()
+        _executor_instance = SDKExecutor()
+
+    # 如果环境不满足，启动时就报错
+    if not _executor_instance.is_available:
+        raise RuntimeError(
+            "Claude Agent SDK 或 API 密钥未配置！\n"
+            "请设置 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN 环境变量。"
+        )
+
     return _executor_instance
 
 

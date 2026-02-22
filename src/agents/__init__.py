@@ -40,15 +40,8 @@ from .caller import (
     get_caller,
     call_subagent,
 )
-from .executor_bridge import (
-    ExecutorBridge,
-    get_bridge,
-    reset_bridge,
-)
 from .sdk_executor import (
     SDKExecutor,
-    FallbackExecutor,
-    HybridExecutor,
     SubagentResult,
     get_executor,
     execute_subagent,
@@ -85,14 +78,8 @@ __all__ = [
     "SubagentCaller",
     "get_caller",
     "call_subagent",
-    # Executor Bridge
-    "ExecutorBridge",
-    "get_bridge",
-    "reset_bridge",
     # SDK Executor
     "SDKExecutor",
-    "FallbackExecutor",
-    "HybridExecutor",
     "SubagentResult",
     "get_executor",
     "execute_subagent",

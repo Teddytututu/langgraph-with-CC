@@ -2,16 +2,14 @@
 Subagent 调用接口
 
 提供统一的 subagent 调用方式，供 Graph 节点使用。
-支持两种模式：
-1. SDK 模式：直接通过 claude-agent-sdk 执行（推荐）
-2. 文件模式：写入 pending_calls.json 等待外部执行
+通过 SDK 直接执行，失败时抛出异常。
 """
 
 from typing import Any, Optional
 
 from .subagent_manager import SubagentManager, get_manager, SubagentState
 from .pool_registry import SubagentPool, get_pool
-from .sdk_executor import HybridExecutor, get_executor, SubagentResult
+from .sdk_executor import SDKExecutor, get_executor, SubagentResult
 
 
 class SubagentCaller:
@@ -21,7 +19,7 @@ class SubagentCaller:
         self,
         manager: SubagentManager = None,
         pool: SubagentPool = None,
-        executor: HybridExecutor = None
+        executor: SDKExecutor = None
     ):
         self.manager = manager or get_manager()
         self.pool = pool or get_pool()
@@ -60,7 +58,7 @@ class SubagentCaller:
         self.manager.mark_in_use(agent_id)
 
         try:
-            # 使用执行器执行
+            # 使用 SDK 执行器执行
             result: SubagentResult = await self.executor.execute(
                 agent_id=agent_id,
                 system_prompt=template.content,
@@ -69,37 +67,16 @@ class SubagentCaller:
                 model=template.model,
             )
 
-            # 处理执行结果
             if result.success:
-                # 检查是否是降级模式（需要外部执行）
-                if isinstance(result.result, dict) and result.result.get("status") == "pending_external_execution":
-                    return {
-                        "success": True,
-                        "call_id": result.result.get("call_id"),
-                        "agent_id": agent_id,
-                        "status": "pending_execution",
-                        "result": None,
-                        "mode": "fallback",
-                        "call_info": {
-                            "agent_id": agent_id,
-                            "name": template.name,
-                            "description": template.description,
-                            "tools": template.tools,
-                            "system_prompt": template.content,
-                            "context": context,
-                        }
-                    }
-
-                # SDK 直接执行成功
                 return {
                     "success": True,
                     "agent_id": agent_id,
                     "status": "completed",
                     "result": result.result,
-                    "mode": "sdk",
                     "turns": result.turns,
                 }
             else:
+                # 直接返回错误，不降级
                 return {
                     "success": False,
                     "error": result.error,
@@ -112,38 +89,6 @@ class SubagentCaller:
                 "error": str(e),
                 "result": None
             }
-
-    def check_result(self, call_id: str) -> dict[str, Any]:
-        """
-        检查调用结果（仅用于降级模式）
-
-        Args:
-            call_id: 调用 ID
-
-        Returns:
-            包含结果状态和数据的字典
-        """
-        result = self.executor.fallback_executor.check_result(call_id)
-
-        if result is None:
-            return {
-                "status": "pending",
-                "result": None,
-                "completed": False
-            }
-
-        return {
-            "status": "completed",
-            "result": result.result,
-            "success": result.success,
-            "error": result.error,
-            "completed": True
-        }
-
-    @property
-    def mode(self) -> str:
-        """当前执行模式"""
-        return self.executor.mode
 
     async def call_planner(self, task: str, time_budget: dict = None) -> dict:
         """调用 planner subagent 进行任务分解"""
