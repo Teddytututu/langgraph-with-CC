@@ -134,10 +134,11 @@ class SDKExecutor:
             options = ClaudeAgentOptions(**options_kwargs)
 
             # 执行，迭代完所有消息
-            result_data: list[str] | str = []
+            result_data: list[str] = []
             messages = []
             turns = 0
             got_result_message = False
+            result_message_content: str | None = None
 
             try:
                 async for message in query(prompt=task_prompt, options=options):
@@ -151,18 +152,16 @@ class SDKExecutor:
                     msg_type = type(message).__name__
                     if msg_type == "ResultMessage":
                         got_result_message = True
-                        # ResultMessage 是最终结果，is_error=True 时当作成功但内容为错误文本
-                        if hasattr(message, "result") and message.result:
-                            result_data = message.result
-                        # 拿到 ResultMessage 后不再需要继续迭代
+                        # result 字段是最终输出（可能是空字符串）
+                        r = getattr(message, "result", None)
+                        if r is not None:
+                            result_message_content = str(r)
                     elif hasattr(message, "content"):
                         content = message.content
                         if content:
                             if isinstance(content, str):
-                                assert isinstance(result_data, list)
                                 result_data.append(content)
                             elif isinstance(content, list):
-                                assert isinstance(result_data, list)
                                 for block in content:
                                     if hasattr(block, "text") and block.text:
                                         result_data.append(block.text)
@@ -172,16 +171,26 @@ class SDKExecutor:
                     raise stream_err
                 # 否则已有足够数据，继续
 
-            # 构建结果
-            if isinstance(result_data, list):
-                final_result = "\n".join(str(s) for s in result_data) if result_data else None
+            # 优先使用 ResultMessage.result，其次是流式收集的内容
+            if result_message_content:
+                final_result = result_message_content
+            elif result_data:
+                final_result = "\n".join(result_data)
             else:
-                final_result = result_data if result_data else None
-
-            # 如果所有内容都空，从 messages 取最后一条
-            if not final_result and messages:
-                last = messages[-1]
-                final_result = last.get("content") or str(last)
+                # 从 messages 中找最后一条有实际内容的
+                final_result = None
+                for msg in reversed(messages):
+                    # 跳过 ResultMessage 的空 content 包装
+                    if msg.get("type") == "ResultMessage":
+                        v = msg.get("result") or msg.get("raw_result")
+                        if v:
+                            final_result = str(v)
+                            break
+                    else:
+                        v = msg.get("content")
+                        if v and not v.startswith("{'type':"):
+                            final_result = str(v)
+                            break
 
             return SubagentResult(
                 success=True,
@@ -257,12 +266,20 @@ class SDKExecutor:
 
     def _parse_message(self, message) -> dict:
         """解析消息为字典"""
+        msg_type = type(message).__name__
+        if msg_type == "ResultMessage":
+            # ResultMessage 的实际文字在 .result，不在 .content
+            return {
+                "type": msg_type,
+                "result": str(getattr(message, "result", "") or ""),
+                "content": "",   # 保持结构一致
+            }
         if hasattr(message, "__dict__"):
             return {
-                "type": type(message).__name__,
-                "content": str(getattr(message, "content", "")),
+                "type": msg_type,
+                "content": str(getattr(message, "content", "") or ""),
             }
-        return {"raw": str(message)}
+        return {"type": "unknown", "content": str(message)}
 
 
 # 全局单例
