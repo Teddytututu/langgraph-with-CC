@@ -303,10 +303,11 @@ class DynamicGraphBuilder:
         # 添加边
         self.add_edge(START, "router")
         self.add_conditional_edges("router", route_after_router, {
-            "planning": "planner",
+            "planning":  "planner",
             "executing": "executor",
-            "complete": END,
-            "timeout": END,
+            "reviewing": "reviewer",
+            "complete":  END,
+            "timeout":   END,
         })
         self.add_edge("planner", "budget_manager")
         self.add_edge("budget_manager", "executor")

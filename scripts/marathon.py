@@ -105,17 +105,24 @@ def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
 
 
 def _wait_for_idle(timeout: int = 600) -> bool:
-    """等待系统变为 idle，最多等待 timeout 秒。返回是否成功空闲。"""
+    """等待系统彻底空闲（无 running/created 任务），最多等待 timeout 秒。"""
     deadline = time.monotonic() + timeout
     ticks = 0
     while time.monotonic() < deadline:
         try:
-            s = _api("GET", "/api/system/status").get("status", "idle")
-            if s not in ("running",):
+            sys_status = _api("GET", "/api/system/status").get("status", "idle")
+            tasks = _api("GET", "/api/tasks").get("tasks", [])
+            active = [t for t in tasks if t.get("status") in ("running", "created")]
+            if sys_status not in ("running",) and not active:
                 return True
             if ticks % 4 == 0:
                 elapsed = int(time.monotonic() - (deadline - timeout))
-                _log(f"  系统仍在运行中，等待空闲... ({elapsed}s)")
+                reasons = []
+                if sys_status == "running":
+                    reasons.append(f"system={sys_status}")
+                if active:
+                    reasons.append(f"active_tasks={len(active)}")
+                _log(f"  等待系统空闲... ({elapsed}s) [{', '.join(reasons)}]")
         except Exception:
             pass
         ticks += 1
@@ -163,18 +170,18 @@ def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
 
 
 def _clear_old_tasks() -> None:
-    """清空已结束的旧任务（completed/failed），避免堆积。"""
+    """清空所有已结束的旧任务（completed/failed/cancelled），避免堆积。"""
     try:
         tasks = _api("GET", "/api/tasks").get("tasks", [])
-        done = [t for t in tasks if t.get("status") in ("completed", "failed")]
-        if done:
-            # API 有 DELETE /api/tasks，但要求 idle 状态
-            sys_status = _api("GET", "/api/system/status").get("status", "")
-            if sys_status == "idle":
-                _api("DELETE", "/api/tasks")
-                _log(f"已清空 {len(done)} 个旧任务")
-    except Exception:
-        pass
+        running = [t for t in tasks if t.get("status") in ("running", "created")]
+        if running:
+            _log(f"  跳过清空：仍有 {len(running)} 个活跃任务")
+            return
+        if tasks:
+            _api("DELETE", "/api/tasks")
+            _log(f"  已清空 {len(tasks)} 个旧任务")
+    except Exception as e:
+        _log(f"  清空旧任务失败: {e}")
 
 
 def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int) -> None:

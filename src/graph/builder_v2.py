@@ -73,6 +73,7 @@ def build_graph_v2(checkpointer=None):
     g.add_conditional_edges("router", route_after_router, {
         "planning":  "planner",
         "executing": "executor",
+        "reviewing": "reviewer",
         "complete":  END,
         "timeout":   END,
     })

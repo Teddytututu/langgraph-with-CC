@@ -30,12 +30,23 @@ AGENTS_DIR = ROOT / ".claude" / "agents"
 RUNTIME_FILES = [
     "app_state.json",
     "sdk_debug.log",
-    "crash_report.json",
+    "reports/crash_report.json",
     "decision_request.json",
     "decision_result.json",
     "stuck_report.json",
     "fix_request.json",
     "checkpoints.db",
+]
+
+# reports 目录下需要清空的文件
+REPORTS_FILES = [
+    "reports/task.md",
+    "reports/task.json",
+]
+
+# reports 子目录需要清理
+REPORTS_DIRS = [
+    "reports/inspections",
 ]
 
 # 根目录白名单：这些文件永远不删
@@ -142,6 +153,50 @@ def delete_task_outputs(dry: bool = False) -> int:
     return count
 
 
+def clear_reports(dry: bool = False) -> int:
+    """清空 reports 目录下的任务产物
+
+    1. 删除 REPORTS_FILES 中指定的文件
+    2. 清空 REPORTS_DIRS 中的所有文件（保留 .gitkeep）
+    """
+    count = 0
+
+    # 删除指定的 reports 文件
+    for name in REPORTS_FILES:
+        path = ROOT / name
+        if path.exists():
+            log(f"  DELETE {name}", dry)
+            if not dry:
+                try:
+                    path.unlink()
+                except PermissionError as e:
+                    log(f"  WARN   {name}: {e} (跳过)", dry)
+                    continue
+            count += 1
+        else:
+            log(f"  SKIP   {name}  (not found)", dry)
+
+    # 清空 inspections 等子目录
+    for dir_name in REPORTS_DIRS:
+        dir_path = ROOT / dir_name
+        if dir_path.exists() and dir_path.is_dir():
+            for f in sorted(dir_path.iterdir()):
+                if f.is_file() and f.name != ".gitkeep":
+                    rel_path = f.relative_to(ROOT)
+                    log(f"  DELETE {rel_path}", dry)
+                    if not dry:
+                        try:
+                            f.unlink()
+                        except PermissionError as e:
+                            log(f"  WARN   {f.name}: {e} (跳过)", dry)
+                            continue
+                    count += 1
+        else:
+            log(f"  SKIP   {dir_name}/  (not found)", dry)
+
+    return count
+
+
 
 
 def main():
@@ -165,9 +220,12 @@ def main():
     print("\n[3] 清理任务产出文件（根目录散落):")
     n_outputs = delete_task_outputs(dry)
 
-    total = n_agents + n_files + n_outputs
+    print("\n[4] 清理 reports 目录:")
+    n_reports = clear_reports(dry)
+
+    total = n_agents + n_files + n_outputs + n_reports
     print("\n" + "=" * 60)
-    print(f"  完成：重置 {n_agents} 个 agent 槽位，删除 {n_files + n_outputs} 个文件")
+    print(f"  完成：重置 {n_agents} 个 agent 槽位，删除 {n_files + n_outputs + n_reports} 个文件")
     if dry:
         print("  （DRY-RUN：以上均未实际执行）")
     print("=" * 60)

@@ -22,7 +22,7 @@ from datetime import datetime
 
 # ── 配置 ──────────────────────────────────────────────────────────────
 SIGNAL_FILES = {
-    "crash":       Path("crash_report.json"),
+    "crash":       Path("reports/crash_report.json"),
     "decision":    Path("decision_request.json"),
     "stuck":       Path("stuck_report.json"),
     "fix_request": Path("fix_request.json"),

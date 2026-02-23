@@ -107,7 +107,9 @@ async def run_task(task: str, time_minutes: float | None = None) -> dict:
             "time": datetime.now().isoformat(),
         }
 
-        crash_path = Path("crash_report.json")
+        # 确保 reports/ 目录存在
+        Path("reports").mkdir(exist_ok=True)
+        crash_path = Path("reports/crash_report.json")
         with open(crash_path, "w", encoding="utf-8") as f:
             json.dump(crash_report, f, indent=2, ensure_ascii=False)
 

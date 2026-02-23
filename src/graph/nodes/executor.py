@@ -121,18 +121,28 @@ async def executor_node(state: GraphState) -> dict:
                     timeout=timeout,
                 )
             else:
-                # specialist 创建失败，强制用 agent_01 兜底（绝不调用系统 executor agent）
-                logger.warning(f"[executor] 无法获取 specialist，使用 agent_01 兜底执行 {next_task.id}")
-                specialist_id = "agent_01"
-                call_result = await asyncio.wait_for(
-                    caller.call_specialist(
-                        agent_id="agent_01",
-                        subtask=subtask_dict,
-                        previous_results=previous_results,
-                        time_budget=budget_ctx,
-                    ),
-                    timeout=timeout,
-                )
+                # specialist 创建失败，不使用 agent_01 兜底，标记任务为 failed 触发 reflector 重试
+                logger.error(f"[executor] 无法获取 specialist，任务 {next_task.id} 标记为 failed 等待重试")
+                fail_subtasks = [
+                    t.model_copy(update={
+                        "status": "failed",
+                        "result": f"[NO_SPECIALIST] 无法创建专业 subagent 执行任务",
+                        "started_at": started_at,
+                        "finished_at": datetime.now(),
+                    }) if t.id == next_task.id else t
+                    for t in subtasks
+                ]
+                return {
+                    "subtasks": fail_subtasks,
+                    "current_subtask_id": next_task.id,
+                    "phase": "reviewing",
+                    "execution_log": [{
+                        "event": "no_specialist",
+                        "task_id": next_task.id,
+                        "error": "无法创建专业 subagent",
+                        "timestamp": datetime.now().isoformat(),
+                    }],
+                }
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"Executor 超时：任务 {next_task.id}（{next_task.title}）"

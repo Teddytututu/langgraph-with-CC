@@ -138,11 +138,13 @@ def report_crash(
         "created_at": datetime.now().isoformat(),
     }
 
-    path = Path("crash_report.json")
+    # 确保 reports/ 目录存在
+    Path("reports").mkdir(exist_ok=True)
+    path = Path("reports/crash_report.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=2, ensure_ascii=False)
 
-    return "crash_report.json"
+    return "reports/crash_report.json"
 
 
 def clear_stuck_report() -> bool:
@@ -156,7 +158,7 @@ def clear_stuck_report() -> bool:
 
 def clear_crash_report() -> bool:
     """清除崩溃报告"""
-    path = Path("crash_report.json")
+    path = Path("reports/crash_report.json")
     if path.exists():
         path.unlink()
         return True

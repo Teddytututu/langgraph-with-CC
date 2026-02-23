@@ -7,16 +7,47 @@ logger = logging.getLogger(__name__)
 
 
 def route_after_router(state: GraphState) -> str:
-    """Router 之后的路由决策"""
+    """Router 之后的路由决策
+
+    路由规则（按优先级）：
+    1. 超时 → timeout
+    2. phase == init → planning
+    3. phase == budgeting → executing（等待预算管理完成）
+    4. phase == executing/reviewing → 继续当前阶段
+    5. phase == reflecting → executing（reflector 已完成反思）
+    6. phase == complete/timeout → 保持当前状态
+    7. 所有任务完成 → complete
+    8. 默认 → executing
+    """
     budget = state.get("time_budget")
     if budget and budget.is_overtime:
         return "timeout"
+
     phase = state.get("phase", "init")
     subtasks = state.get("subtasks", [])
-    if phase == "init" or not subtasks:
+
+    # 显式处理各 phase
+    if phase == "init":
+        return "planning"
+    if phase == "budgeting":
+        # 预算管理完成，进入执行
+        return "executing"
+    if phase == "reviewing":
+        # 审查中，继续到 reviewer
+        return "reviewing"
+    if phase == "reflecting":
+        # 反思完成，返回执行
+        return "executing"
+    if phase == "complete" or phase == "timeout":
+        # 终态，保持
+        return phase
+
+    # 检查任务完成状态
+    if not subtasks:
         return "planning"
     if all(t.status in ("done", "skipped", "failed") for t in subtasks):
         return "complete"
+
     return "executing"
 
 

@@ -83,7 +83,7 @@ createApp({
             totalTasks: tasks.value.length,
             runningTasks: tasks.value.filter(t => t.status === 'running').length,
             completedTasks: tasks.value.filter(t => t.status === 'completed').length,
-            totalSubtasks: tasks.value.reduce((acc, t) => acc + (t.subtasks?.length || 0), 0)
+            totalSubtasks: selectedTask.value?.subtasks?.length || 0
         }));
 
         const getCompletedSubtasks = computed(() => {
@@ -161,6 +161,10 @@ createApp({
                     break;
                 case 'task_created':
                     if (!tasks.value.find(t => t.id === payload.id)) tasks.value.unshift(payload);
+                    // 新任务开始，清空旧报告
+                    reports.value = [];
+                    activeReport.value = '';
+                    activeReportContent.value = '';
                     termLog(`⊕ 任务创建: ${payload.id}`, 'info');
                     break;
                 case 'task_started':
@@ -215,6 +219,9 @@ createApp({
                     tasks.value = [];
                     selectedTask.value = null;
                     terminalLines.value = [];
+                    reports.value = [];
+                    activeReport.value = '';
+                    activeReportContent.value = '';
                     fetchGraph();
                     break;
             }
@@ -228,14 +235,52 @@ createApp({
             });
         };
 
+        // 防抖定时器（用于减少频繁重绘）
+        let _graphDebounceTimer = null;
+
         const handleTaskProgress = (payload) => {
             const task = tasks.value.find(t => t.id === payload.task_id);
             if (!task) return;
             if (payload.subtasks) {
-                task.subtasks = payload.subtasks;
-                fetchGraph(); // 子任务更新时重绘 DAG
+                // 合并子任务数据而不是直接覆盖，保留 description/result 等完整字段
+                const incomingMap = new Map(payload.subtasks.map(s => [s.id, s]));
+                if (!task.subtasks) task.subtasks = [];
+
+                // 检测是否有实质性变化（新增子任务或状态变化）
+                let hasRealChange = false;
+                const existingIds = new Set(task.subtasks.map(s => s.id));
+
+                task.subtasks = task.subtasks.map(existing => {
+                    const update = incomingMap.get(existing.id);
+                    if (update) {
+                        // 只检测 status 变化（这是用户可见的关键变化）
+                        if (update.status && update.status !== existing.status) {
+                            hasRealChange = true;
+                        }
+                        return { ...existing, ...update };
+                    }
+                    return existing;
+                });
+
+                // 检测新增子任务
+                incomingMap.forEach((incoming, id) => {
+                    if (!existingIds.has(id)) {
+                        hasRealChange = true;
+                        task.subtasks.push(incoming);
+                    }
+                });
+
+                // 只在状态变化时才重绘图（防抖 500ms，避免频繁刷新导致页面跳动）
+                if (hasRealChange) {
+                    if (_graphDebounceTimer) clearTimeout(_graphDebounceTimer);
+                    _graphDebounceTimer = setTimeout(() => fetchGraph(), 500);
+                }
             }
             if (payload.result) task.result = payload.result;
+            // Force selectedTask reactivity refresh when subtasks change
+            if (payload.subtasks && selectedTask.value?.id === payload.task_id) {
+                selectedTask.value = task;
+            }
         };
 
         const handleTaskCompleted = (payload) => {
@@ -244,6 +289,10 @@ createApp({
             task.status = 'completed';
             if (payload.result !== undefined) task.result = payload.result;
             if (payload.subtasks) task.subtasks = payload.subtasks;
+            // If this is the currently selected task, refresh the ref to ensure UI updates
+            if (selectedTask.value?.id === payload.id) {
+                selectedTask.value = task;
+            }
             fetchGraph();
             fetchReports();
         };
@@ -429,8 +478,9 @@ createApp({
                 if (!res.ok) return;
                 const data = await res.json();
                 reports.value = data.files || [];
-                // 自动加载第一个 md 文件
-                if (reports.value.length > 0 && !activeReport.value) {
+                // 自动加载最新的 md 文件：当前无选中，或选中的文件已不在列表中时自动切换
+                const stillExists = reports.value.some(r => r.name === activeReport.value);
+                if (reports.value.length > 0 && !stillExists) {
                     const first = reports.value.find(r => r.ext === '.md') || reports.value[0];
                     if (first) loadReport(first.name);
                 }
@@ -462,6 +512,8 @@ createApp({
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const fresh = await res.json();
                 Object.assign(task, fresh);
+                // Re-assign selectedTask to trigger Vue reactivity for nested updates
+                selectedTask.value = task;
             } catch (e) {
                 console.error('selectTask: failed to refresh task', task.id, e);
             }
