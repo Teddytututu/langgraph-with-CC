@@ -283,10 +283,10 @@ def register_routes(app: FastAPI):
         }
 
     @app.delete("/api/tasks")
-    async def clear_all_tasks():
-        """清空所有任务及子任务，重置系统状态"""
+    async def clear_all_tasks(force: bool = False):
+        """清空所有任务及子任务，重置系统状态。force=true 时强制清空（用于服务器重启后清除僵尸任务）"""
         running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
-        if running:
+        if running and not force:
             raise HTTPException(status_code=409, detail="任务正在运行，无法清空")
         app_state.tasks.clear()
         app_state.current_task_id = None
@@ -501,6 +501,9 @@ def register_routes(app: FastAPI):
                 for node_name, state_update in event.items():
                     # 更新当前节点
                     app_state.current_node = node_name
+                    # budget_manager 完成后，executor 即将开始 —— 提前标记
+                    if node_name == "budget_manager":
+                        app_state.current_node = "executor"
                     await app_state.broadcast("node_changed", {
                         "task_id": task_id,
                         "node": node_name,

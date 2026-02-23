@@ -209,70 +209,45 @@ class SubagentCaller:
         # 标记为填充中
         self.manager.mark_filling(agent_id)
 
-        # 构建 writer 提示
+        # 直接本地生成 specialist 模板，无需调用 writer_1（避免额外 SDK 调用和超时风险）
         skills_str = ", ".join(skills) if skills else "通用"
-        prompt = f"""请为以下任务创建一个专业 agent 的系统提示：
+        name = f"{skills[0]}-specialist" if skills else f"specialist-{agent_id}"
+        description = f"专注于 {skills_str} 的执行专家"
+        system_prompt = (
+            f"你是一个专注于 {skills_str} 领域的执行专家。\n"
+            f"请严格按照任务描述完成工作，输出完整、具体、可直接使用的结果。\n"
+            f"任务上下文：{task_description[:200]}"
+        )
 
-任务描述: {task_description}
-需要的技能: {skills_str}
-
-请生成:
-1. name: agent 名称（简短，如 "代码审计专家"）
-2. description: agent 描述
-3. system_prompt: 完整的系统提示内容
-
-以 JSON 格式返回:
-{{"name": "...", "description": "...", "system_prompt": "..."}}
-"""
-
-        # 调用 writer 填充
-        context = {"task": prompt}
-        result = await self.call("writer_1", context)
-
-        if result.get("success"):
+        try:
+            self.pool.fill_agent(
+                agent_id=agent_id,
+                name=name,
+                description=description,
+                content=system_prompt,
+                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+            )
+            self.manager.mark_ready(
+                agent_id=agent_id,
+                name=name,
+                description=description,
+                skills=skills
+            )
+            return True
+        except Exception as e:
+            logger.error(f"填充 specialist 失败: {e}")
+            # 兜底：使用最简模板
             try:
-                import json
-                content = result.get("result", "{}")
-                if isinstance(content, str):
-                    # 尝试提取 JSON
-                    import re
-                    match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-                    if match:
-                        content = match.group(0)
-                    data = json.loads(content)
-                else:
-                    data = content
-
-                # 填充模板
                 self.pool.fill_agent(
                     agent_id=agent_id,
-                    name=data.get("name", f"Specialist-{agent_id}"),
-                    description=data.get("description", task_description[:100]),
-                    content=data.get("system_prompt", f"你是一个{skills_str}专家。"),
+                    name=f"Specialist-{agent_id}",
+                    description=f"专业技能: {skills_str}",
+                    content=f"你是一个{skills_str}专家。请根据任务要求完成工作。\n\n任务: {task_description}",
                     tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
                 )
-
-                # 标记为 ready
-                self.manager.mark_ready(
-                    agent_id=agent_id,
-                    name=data.get("name", ""),
-                    description=data.get("description", ""),
-                    skills=skills
-                )
-                return True
-
-            except Exception as e:
-                logger.error(f"填充 specialist 失败: {e}")
-
-        # 填充失败，使用默认模板
-        self.pool.fill_agent(
-            agent_id=agent_id,
-            name=f"Specialist-{agent_id}",
-            description=f"专业技能: {skills_str}",
-            content=f"你是一个{skills_str}专家。请根据任务要求完成工作。\n\n任务: {task_description}",
-            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
-        )
-        self.manager.mark_ready(agent_id, skills=skills)
+                self.manager.mark_ready(agent_id, skills=skills)
+            except Exception:
+                pass
         return True
 
     def complete_subtask(self, agent_id: str):
