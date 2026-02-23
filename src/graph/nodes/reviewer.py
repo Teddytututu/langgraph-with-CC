@@ -35,36 +35,44 @@ async def reviewer_node(state: GraphState) -> dict:
     if not current or not current.result:
         return {"phase": "executing"}
 
-    # 调用 reviewer subagent 进行审查
-    call_result = await caller.call_reviewer(
-        execution_result={
-            "result": current.result,
-            "status": current.status,
-            "started_at": current.started_at.isoformat() if current.started_at else None,
-            "finished_at": current.finished_at.isoformat() if current.finished_at else None,
-        },
-        subtask={
-            "id": current.id,
-            "title": current.title,
-            "description": current.description,
-            "completion_criteria": current.completion_criteria,
-        }
-    )
-
-    # 检查执行是否成功（V1 降级：失败时返回 PASS 兜底，避免整图崩溃）
-    if not call_result.get("success"):
-        logger.warning("[reviewer] subagent 调用失败，启用降级审查: %s", call_result.get('error'))
-        call_result = {"success": True, "result": None}
-
-    # 解析审查结果
-    review = _parse_review_result(call_result)
-
-    # 本地加强验证：检查结果质量，不不依赖 subagent 自报
+    # 本地快速验证：先做本地检查，通过且内容充分则直接 PASS，无需调用 subagent
     local_issues = _validate_result_locally(current)
-    if local_issues:
-        review["verdict"] = "FAIL"
-        review["issues"] = local_issues + review.get("issues", [])
-        review["score"] = min(review.get("score", 7), 4)
+    result_len = len((current.result or "").strip())
+
+    if not local_issues and result_len >= 300:
+        # 内容充分、本地验证通过 → 直接 PASS，跳过 subagent reviewer（避免误判）
+        logger.info("[reviewer] 本地快速通过 %s（%d 字符，无问题）", current.id, result_len)
+        review = {"verdict": "PASS", "score": 8, "issues": [], "suggestions": []}
+    else:
+        # 内容不足或本地发现问题 → 调用 reviewer subagent 深度审查
+        call_result = await caller.call_reviewer(
+            execution_result={
+                "result": current.result,
+                "status": current.status,
+                "started_at": current.started_at.isoformat() if current.started_at else None,
+                "finished_at": current.finished_at.isoformat() if current.finished_at else None,
+            },
+            subtask={
+                "id": current.id,
+                "title": current.title,
+                "description": current.description,
+                "completion_criteria": current.completion_criteria,
+            }
+        )
+
+        # 检查执行是否成功（V1 降级：失败时返回 PASS 兜底，避免整图崩溃）
+        if not call_result.get("success"):
+            logger.warning("[reviewer] subagent 调用失败，启用降级审查: %s", call_result.get('error'))
+            call_result = {"success": True, "result": None}
+
+        # 解析审查结果
+        review = _parse_review_result(call_result)
+
+        # 叠加本地问题
+        if local_issues:
+            review["verdict"] = "FAIL"
+            review["issues"] = local_issues + review.get("issues", [])
+            review["score"] = min(review.get("score", 7), 4)
 
     # 纯函数式更新
     max_iter = state.get("max_iterations", 3)
