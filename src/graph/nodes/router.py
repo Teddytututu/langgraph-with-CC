@@ -1,6 +1,9 @@
 """src/graph/nodes/router.py — 全局路由节点"""
 from datetime import datetime
+from pathlib import Path
 from src.graph.state import GraphState
+
+_REPORTS_DIR = Path("reports")
 
 
 async def router_node(state: GraphState) -> dict:
@@ -67,4 +70,38 @@ def _build_final_output(state: GraphState, timeout: bool = False) -> str:
             f"\n---\n总耗时 {budget.elapsed_minutes:.1f} 分钟 "
             f"/ 预算 {budget.total_minutes:.0f} 分钟"
         )
+
+    # 扫描 reports/ 目录，将所有 .md 文件追加到输出
+    if _REPORTS_DIR.exists():
+        md_files = sorted(
+            _REPORTS_DIR.glob("*.md"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if md_files:
+            lines.append("\n---\n## 📁 详细分析报告\n")
+            for f in md_files:
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    lines.append(f"### {f.stem}\n")
+                    lines.append(content)
+                    lines.append("\n")
+                except Exception:
+                    pass
+
+        # 扫描 JSON 报告
+        json_files = sorted(
+            _REPORTS_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if json_files:
+            lines.append("\n---\n## 📊 数据文件\n")
+            import json as _json
+            for f in json_files:
+                try:
+                    data = _json.loads(f.read_text(encoding="utf-8", errors="replace"))
+                    lines.append(f"### {f.stem}\n")
+                    lines.append(f"```json\n{_json.dumps(data, ensure_ascii=False, indent=2)}\n```\n")
+                except Exception:
+                    pass
+
     return "\n".join(lines)

@@ -750,6 +750,43 @@ def register_routes(app: FastAPI):
             ]
         }
 
+    # ── Reports ──
+
+    @app.get("/api/reports")
+    async def list_reports():
+        """列出 reports/ 目录下所有报告文件"""
+        import os
+        reports_dir = Path("reports")
+        if not reports_dir.exists():
+            return {"files": []}
+        files = []
+        for f in sorted(reports_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.suffix in (".md", ".json") and f.is_file():
+                try:
+                    stat = f.stat()
+                    files.append({
+                        "name": f.name,
+                        "stem": f.stem,
+                        "ext": f.suffix,
+                        "size": stat.st_size,
+                        "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    })
+                except Exception:
+                    pass
+        return {"files": files}
+
+    @app.get("/api/reports/{filename}")
+    async def get_report(filename: str):
+        """读取 reports/ 下指定文件内容"""
+        # 防目录穿越
+        if "/" in filename or ".." in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        path = Path("reports") / filename
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
+        content = path.read_text(encoding="utf-8", errors="replace")
+        return {"name": filename, "content": content}
+
     # ── WebSocket ──
 
     @app.websocket("/ws")

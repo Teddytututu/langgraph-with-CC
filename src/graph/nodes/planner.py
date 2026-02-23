@@ -66,21 +66,55 @@ async def planner_node(state: GraphState) -> dict:
     # 解析子任务
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
 
-    # 如果 subagent 未返回有效结果，创建默认子任务
+    # 如果 subagent 未返回有效结果，生成标准四阶段子任务
     if not subtasks:
+        base_mins = budget.total_minutes if budget else 60
+        task_preview = user_task[:200]
         subtasks = [
             SubTask(
                 id="task-001",
-                title="执行完整任务",
-                description=user_task,
+                title="需求分析与方案规划",
+                description=f"深入理解任务目标，分析关键约束与风险，制定可行的实施方案。\n原始任务：{task_preview}",
+                agent_type="analyst",
+                dependencies=[],
+                priority=1,
+                estimated_minutes=max(5.0, base_mins * 0.15),
+                knowledge_domains=["analysis", "planning"],
+                completion_criteria=["明确了任务目标与范围", "制定了分步实施方案", "识别了主要风险"],
+            ),
+            SubTask(
+                id="task-002",
+                title="核心内容实现",
+                description=f"按照方案完成核心功能/内容的实现，确保满足主要需求。\n原始任务：{task_preview}",
                 agent_type="coder",
-                estimated_minutes=(
-                    budget.total_minutes * 0.8
-                    if budget else 30
-                ),
-                knowledge_domains=["general"],
-                completion_criteria=["任务已完成"],
-            )
+                dependencies=["task-001"],
+                priority=2,
+                estimated_minutes=max(10.0, base_mins * 0.50),
+                knowledge_domains=["implementation"],
+                completion_criteria=["完成了所有核心功能", "代码/内容质量达标"],
+            ),
+            SubTask(
+                id="task-003",
+                title="质量验证与问题修复",
+                description="对实现成果进行全面质量验证，识别并修复存在的问题，确保满足验收标准。",
+                agent_type="analyst",
+                dependencies=["task-002"],
+                priority=3,
+                estimated_minutes=max(5.0, base_mins * 0.20),
+                knowledge_domains=["testing", "review"],
+                completion_criteria=["通过了功能验证", "关键缺陷已修复", "满足验收标准"],
+            ),
+            SubTask(
+                id="task-004",
+                title="成果整理与交付输出",
+                description="整理所有阶段成果，撰写说明文档，提供完整清晰的最终交付物。",
+                agent_type="writer",
+                dependencies=["task-003"],
+                priority=4,
+                estimated_minutes=max(5.0, base_mins * 0.15),
+                knowledge_domains=["documentation", "writing"],
+                completion_criteria=["交付物完整且清晰", "包含使用说明"],
+            ),
         ]
 
     return {
@@ -102,15 +136,30 @@ def _parse_subtasks_from_result(result_data, budget) -> list[SubTask]:
 
     # SDK 可能返回字符串（含 JSON）或列表
     if isinstance(result_data, str):
-        # 从字符串中提取 JSON 数组
-        match = _re.search(r'\[.*\]', result_data, _re.DOTALL)
-        if match:
-            try:
-                result_data = json.loads(match.group(0))
-            except json.JSONDecodeError:
+        # 先尝试去掉 markdown 代码块包装
+        cleaned = _re.sub(r'^```(?:json)?\s*', '', result_data.strip(), flags=_re.MULTILINE)
+        cleaned = _re.sub(r'```\s*$', '', cleaned.strip(), flags=_re.MULTILINE)
+        # 尝试直接解析整个字符串作为 JSON
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                result_data = parsed
+            elif isinstance(parsed, dict) and 'subtasks' in parsed:
+                result_data = parsed['subtasks']
+            elif isinstance(parsed, dict) and 'tasks' in parsed:
+                result_data = parsed['tasks']
+            else:
                 result_data = []
-        else:
-            result_data = []
+        except json.JSONDecodeError:
+            # 从字符串中提取 JSON 数组
+            match = _re.search(r'\[.*?\]', cleaned, _re.DOTALL)
+            if match:
+                try:
+                    result_data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    result_data = []
+            else:
+                result_data = []
 
     if result_data and isinstance(result_data, list):
         for task_data in result_data:

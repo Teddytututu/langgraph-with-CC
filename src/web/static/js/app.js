@@ -245,6 +245,7 @@ createApp({
             if (payload.result !== undefined) task.result = payload.result;
             if (payload.subtasks) task.subtasks = payload.subtasks;
             fetchGraph();
+            fetchReports();
         };
 
         // Fetch all tasks from API, merge in-place to keep object references stable
@@ -417,6 +418,40 @@ createApp({
             // chatThinking 由 WS chat_reply 事件处理器关闭
         };
 
+        // ── Reports ──
+        const reports = Vue.ref([]);
+        const activeReport = Vue.ref('');
+        const activeReportContent = Vue.ref('');
+
+        const fetchReports = async () => {
+            try {
+                const res = await fetch('/api/reports');
+                if (!res.ok) return;
+                const data = await res.json();
+                reports.value = data.files || [];
+                // 自动加载第一个 md 文件
+                if (reports.value.length > 0 && !activeReport.value) {
+                    const first = reports.value.find(r => r.ext === '.md') || reports.value[0];
+                    if (first) loadReport(first.name);
+                }
+            } catch (e) {
+                console.error('fetchReports error', e);
+            }
+        };
+
+        const loadReport = async (name) => {
+            activeReport.value = name;
+            activeReportContent.value = '';
+            try {
+                const res = await fetch(`/api/reports/${encodeURIComponent(name)}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                activeReportContent.value = data.content || '';
+            } catch (e) {
+                console.error('loadReport error', e);
+            }
+        };
+
         const selectTask = async (task) => {
             selectedTask.value = task;
             selectedSubtask.value = null;
@@ -430,6 +465,8 @@ createApp({
             } catch (e) {
                 console.error('selectTask: failed to refresh task', task.id, e);
             }
+            // 加载报告
+            await fetchReports();
         };
 
         const selectSubtask = async (subtask) => {
@@ -523,6 +560,7 @@ createApp({
             await fetchTasks();
             await fetchSystemStatus(true);  // true = 恢复终端日志
             fetchGraph();
+            fetchReports();
 
             // 刷新后自动选中正在运行的任务，否则选最新任务
             if (!selectedTask.value && tasks.value.length) {
@@ -549,8 +587,9 @@ createApp({
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks, discussionAgents,
+            reports, activeReport, activeReportContent,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd,
-            fetchGraph, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
+            fetchGraph, fetchReports, loadReport, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
         };
     }
 }).mount('#app');

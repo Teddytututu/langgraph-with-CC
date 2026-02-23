@@ -5,6 +5,17 @@ from typing import Optional
 from src.graph.state import GraphState, SubTask
 from src.agents.caller import get_caller
 
+# 诨评为伪结果的特征樣式
+_FAKE_PATTERNS = [
+    "2026-02-23T10:00:00Z",
+    "2026-02-23T11:00:00Z",
+    "Agent 123", "Agent 456",
+    "虚假",
+    "fake_",
+    "placeholder",
+]
+_MIN_RESULT_LEN = 50   # 结果少于 50 字符认为空白
+
 
 async def reviewer_node(state: GraphState) -> dict:
     """
@@ -42,6 +53,13 @@ async def reviewer_node(state: GraphState) -> dict:
 
     # 解析审查结果
     review = _parse_review_result(call_result)
+
+    # 本地加强验证：检查结果质量，不不依赖 subagent 自报
+    local_issues = _validate_result_locally(current)
+    if local_issues:
+        review["verdict"] = "FAIL"
+        review["issues"] = local_issues + review.get("issues", [])
+        review["score"] = min(review.get("score", 7), 4)
 
     # 纯函数式更新
     max_iter = state.get("max_iterations", 3)
@@ -81,6 +99,28 @@ async def reviewer_node(state: GraphState) -> dict:
 def _find_current_subtask(subtasks: list[SubTask], cid: Optional[str]) -> Optional[SubTask]:
     """查找当前子任务"""
     return next((t for t in subtasks if t.id == cid), None)
+
+
+def _validate_result_locally(task: SubTask) -> list[str]:
+    """本地质量检查：不调用 subagent，直接检查结果内容正确性"""
+    issues = []
+    result = task.result or ""
+
+    # 1. 结果过短
+    if len(result.strip()) < _MIN_RESULT_LEN:
+        issues.append(f"结果内容过短（{len(result.strip())} 字符），可能未完成")
+
+    # 2. 包含已知伪造模式
+    for pat in _FAKE_PATTERNS:
+        if pat.lower() in result.lower():
+            issues.append(f"结果包含伪造模式：'{pat}'，需要重新执行")
+            break
+
+    # 3. 验收标准检查（交由 subagent 摈判） — 此处仅做基础模式检测
+    if not result or result.strip() == f"任务 {task.title} 执行完成":
+        issues.append("结果是默认占位符，实际未执行")
+
+    return issues
 
 
 def _parse_review_result(call_result: dict) -> dict:

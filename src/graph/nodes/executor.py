@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
-from src.graph.state import GraphState, SubTask
+from src.graph.state import GraphState, SubTask, NodeDiscussion, DiscussionMessage
 from src.agents.caller import get_caller
 from src.agents.coordinator import CoordinatorAgent
 from src.agents.collaboration import (
@@ -114,12 +114,37 @@ async def executor_node(state: GraphState) -> dict:
 
     # 获取结果
     result_data = call_result.get("result")
+    result_text = str(result_data) if result_data else f"任务 {next_task.title} 执行完成"
     result = {
         "status": "done",
-        "result": str(result_data) if result_data else f"任务 {next_task.title} 执行完成",
+        "result": result_text,
         "specialist_id": specialist_id,
         "finished_at": datetime.now(),
     }
+
+    # 构建讨论记录（写入 GraphState.discussions）
+    existing_discussions: dict = dict(state.get("discussions") or {})
+    agent_name = specialist_id or next_task.agent_type
+    disc = existing_discussions.get(next_task.id) or NodeDiscussion(
+        node_id=next_task.id,
+    )
+    disc.add_message(DiscussionMessage(
+        node_id=next_task.id,
+        from_agent=agent_name,
+        content=result_text[:2000],   # 截断过长文本
+        message_type="info",
+        metadata={
+            "task_title": next_task.title,
+            "agent_type": next_task.agent_type,
+            "started_at": started_at.isoformat(),
+            "finished_at": result["finished_at"].isoformat(),
+            "mode": mode.value if hasattr(mode, 'value') else str(mode),
+        }
+    ))
+    disc.status = "resolved"
+    disc.consensus_reached = True
+    disc.consensus_topic = next_task.title
+    existing_discussions[next_task.id] = disc
 
     # 标记专业 subagent 完成（子任务级别）
     if specialist_id:
@@ -144,6 +169,7 @@ async def executor_node(state: GraphState) -> dict:
         "current_subtask_id": next_task.id,
         "time_budget": state.get("time_budget"),
         "phase": "executing",
+        "discussions": existing_discussions,
         "execution_log": [{
             "event": "task_executed",
             "task_id": next_task.id,
