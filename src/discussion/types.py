@@ -14,7 +14,7 @@ class DiscussionMessage(BaseModel):
     to_agents: list[str] = []       # 接收者（空=广播）
     content: str
     timestamp: datetime = Field(default_factory=datetime.now)
-    message_type: Literal["query", "response", "consensus", "conflict", "info"] = "info"
+    message_type: Literal["query", "response", "consensus", "conflict", "info", "proposal", "reflection", "agreement", "error", "review_opinion"] = "info"
     metadata: dict[str, Any] = {}   # 附加元数据（如附件引用）
 
     def is_broadcast(self) -> bool:
