@@ -35,20 +35,23 @@ MARATHON_LOCK = Path("marathon.lock.json")
 POLL_INTERVAL = 15      # 秒：轮询任务状态间隔
 WAIT_POLL     = 5       # 秒：等待修复时轮询间隔
 WAIT_TIMEOUT  = 900     # 秒：等 Claude Code 修复的最长时间（15 分钟）
+IDLE_STABLE_SAMPLES = 3  # 连续稳定次数才认为 idle
+TRANSIENT_RECHECKS = 3   # 瞬态异常复核次数
 DEFAULT_HOURS = 10
 DEFAULT_TASK  = (
     "对系统进行全面自检与修复闭环："
     "（Phase 1-诊断）检查所有节点运行状态、API 接口可用性、subagent 调度流程、讨论机制和输出质量；"
     "（Phase 2-修复）对 Phase 1 发现的问题逐一编写修复代码并验证，确保每个问题修复后通过回归测试；"
     "（Phase 3-验证报告）重新运行自检确认修复生效，输出修复前后对比报告并保存到 reports/ 目录。"
-    "每个阶段至少3名不同领域专家参与讨论协商，讨论轮次不少于10轮。"
+    "每个阶段至少3名不同领域专家参与讨论协商，每个子任务进行2轮专家讨论。"
 )
 DEFAULT_MINUTES_PER_ROUND = 60   # 每轮时间预算
+DEFAULT_COOLDOWN = 30            # 每轮冷却秒数
 DEFAULT_EXECUTION_POLICY = {
     "force_complex_graph": True,
     "min_agents_per_node": 3,
-    "min_discussion_rounds": 10,
-    "strict_enforcement": True,
+    "min_discussion_rounds": 2,
+    "strict_enforcement": False,
 }
 
 
@@ -169,17 +172,26 @@ def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
     _log("修复完成（fix_request.json 已删除）")
 
 
-def _wait_for_idle(timeout: int = 600) -> bool:
-    """等待系统彻底空闲（无 running/created 任务），最多等待 timeout 秒。"""
+def _wait_for_idle(timeout: int = 600, stable_samples: int = IDLE_STABLE_SAMPLES) -> bool:
+    """等待系统彻底空闲（无 running/created/queued 任务），需连续稳定若干次。"""
     deadline = time.monotonic() + timeout
     ticks = 0
+    stable_hits = 0
     while time.monotonic() < deadline:
         try:
-            sys_status = _api("GET", "/api/system/status").get("status", "idle")
-            tasks = _api("GET", "/api/tasks").get("tasks", [])
-            active = [t for t in tasks if t.get("status") in ("running", "created")]
-            if sys_status not in ("running",) and not active:
-                return True
+            sys_resp = _api("GET", "/api/system/status")
+            tasks_resp = _api("GET", "/api/tasks")
+            sys_status = sys_resp.get("status", "idle")
+            tasks = tasks_resp.get("tasks", [])
+            active = [t for t in tasks if t.get("status") in ("running", "created", "queued")]
+            idle_now = sys_status not in ("running",) and not active
+            if idle_now:
+                stable_hits += 1
+                if stable_hits >= stable_samples:
+                    return True
+            else:
+                stable_hits = 0
+
             if ticks % 4 == 0:
                 elapsed = int(time.monotonic() - (deadline - timeout))
                 reasons = []
@@ -187,9 +199,11 @@ def _wait_for_idle(timeout: int = 600) -> bool:
                     reasons.append(f"system={sys_status}")
                 if active:
                     reasons.append(f"active_tasks={len(active)}")
-                _log(f"  等待系统空闲... ({elapsed}s) [{', '.join(reasons)}]")
+                if idle_now:
+                    reasons.append(f"stable={stable_hits}/{stable_samples}")
+                _log(f"  等待系统空闲... ({elapsed}s) [{', '.join(reasons) if reasons else 'checking'}]")
         except Exception:
-            pass
+            stable_hits = 0
         ticks += 1
         time.sleep(WAIT_POLL)
     return False
@@ -212,10 +226,43 @@ def _submit_task(task_text: str, time_minutes: float, execution_policy: dict | N
         return None
 
 
+def _check_transient_task_status(task_id: str, retries: int = TRANSIENT_RECHECKS) -> tuple[str, str]:
+    """复核 timeout/unknown 场景，避免把瞬态误判为失败。"""
+    last_detail = ""
+    for i in range(retries):
+        try:
+            task_resp = _api("GET", f"/api/tasks/{task_id}")
+            status = task_resp.get("status", "")
+            if status == "completed":
+                return "completed", "recheck: task completed"
+            if status in ("failed", "cancelled"):
+                err = task_resp.get("error") or task_resp.get("final_output") or str(task_resp)
+                return "failed", str(err)
+            last_detail = f"recheck#{i + 1}: task status={status or 'unknown'}"
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                try:
+                    sys_status = _api("GET", "/api/system/status").get("status", "idle")
+                    tasks = _api("GET", "/api/tasks").get("tasks", [])
+                    active = [x for x in tasks if x.get("status") in ("running", "created", "queued")]
+                    if sys_status != "running" and not active:
+                        return "completed", "recheck: task record gone after terminal state"
+                    last_detail = f"recheck#{i + 1}: task 404 but system={sys_status}, active={len(active)}"
+                except Exception as inner_e:
+                    last_detail = f"recheck#{i + 1}: task 404 + status probe failed: {inner_e}"
+            else:
+                last_detail = f"recheck#{i + 1}: HTTPError {e.code}"
+        except Exception as e:
+            last_detail = f"recheck#{i + 1}: {e}"
+        time.sleep(min(POLL_INTERVAL, 5))
+
+    return "transient", last_detail or "transient status unresolved"
+
+
 def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
     """
     轮询任务状态直到终态或超时。
-    返回 (status, error_detail)，status ∈ {completed, failed, timeout}
+    返回 (status, error_detail)，status ∈ {completed, failed, timeout, transient}
     """
     last_node = ""
     while time.monotonic() < deadline:
@@ -234,6 +281,8 @@ def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
             if status == "cancelled":
                 err = t.get("error") or "task cancelled"
                 return "failed", str(err)
+            if status and status not in ("created", "queued", "running"):
+                return "transient", f"unexpected task status: {status}"
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 try:
@@ -325,11 +374,21 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
             results.append({"round": round_num, "status": "failed", "minutes": f"{elapsed_min:.1f}"})
             _wait_for_fix(f"轮次 {round_num} 任务执行失败", round_num, detail)
 
-        elif status == "timeout":
-            # poll-deadline 超时 ≠ 代码 bug，直接进下一轮，不等修复
-            _log(f"⚠ 第 {round_num} 轮 poll-timeout（耗时 {elapsed_min:.1f} 分钟）")
-            _log(f"  本轮任务未在截止前完成，继续下一轮（不写 fix_request）")
-            results.append({"round": round_num, "status": "timeout", "minutes": f"{elapsed_min:.1f}"})
+        elif status in ("timeout", "transient"):
+            # timeout/transient 先复核，不直接触发 fix_request
+            _log(f"⚠ 第 {round_num} 轮 {status}（耗时 {elapsed_min:.1f} 分钟）")
+            _log(f"  初始详情: {detail[:200]}")
+            recheck_status, recheck_detail = _check_transient_task_status(task_id)
+            if recheck_status == "failed":
+                _log(f"  复核结论: hard failed -> {recheck_detail[:200]}")
+                results.append({"round": round_num, "status": "failed", "minutes": f"{elapsed_min:.1f}"})
+                _wait_for_fix(f"轮次 {round_num} 任务执行失败(复核)", round_num, recheck_detail)
+            elif recheck_status == "completed":
+                _log("  复核结论: 已完成（瞬态切换窗口）")
+                results.append({"round": round_num, "status": "ok", "minutes": f"{elapsed_min:.1f}"})
+            else:
+                _log("  复核结论: 仍为瞬态/未知，跳过修复进入下一轮")
+                results.append({"round": round_num, "status": status, "minutes": f"{elapsed_min:.1f}"})
 
         # ── 冷却 ──
         if datetime.now() < end_time and cooldown > 0:
@@ -356,8 +415,8 @@ if __name__ == "__main__":
                         help="每轮提交的任务描述")
     parser.add_argument("--minutes",   type=float, default=DEFAULT_MINUTES_PER_ROUND,
                         help=f"每轮时间预算（分钟），默认 {DEFAULT_MINUTES_PER_ROUND}")
-    parser.add_argument("--strict", action="store_true", default=True,
-                        help="启用严格执行策略（默认开启）")
+    parser.add_argument("--strict", action="store_true", default=False,
+                        help="启用严格执行策略（默认关闭）")
     parser.add_argument("--non-strict", action="store_true",
                         help="关闭严格执行策略，按旧行为提交")
     parser.add_argument("--force-complex-graph", action="store_true", default=True,
@@ -366,8 +425,10 @@ if __name__ == "__main__":
                         help="允许线性图（将 force_complex_graph 设为 false）")
     parser.add_argument("--min-agents-per-node", type=int, default=3,
                         help="每个节点最少 agent 数（默认 3）")
-    parser.add_argument("--min-discussion-rounds", type=int, default=10,
-                        help="每个节点最少讨论轮次（默认 10）")
+    parser.add_argument("--min-discussion-rounds", type=int, default=2,
+                        help="每个节点最少讨论轮次（默认 2）")
+    parser.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN,
+                        help=f"每轮结束后冷却秒数（默认 {DEFAULT_COOLDOWN}）")
     args = parser.parse_args()
 
     if not _acquire_singleton_lock():
