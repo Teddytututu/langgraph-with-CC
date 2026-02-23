@@ -730,6 +730,26 @@ def register_routes(app: FastAPI):
     TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
     ACTIVE_STATUSES = {"running", "created", "queued"}
 
+    def _event_meta(
+        *,
+        task_id: str,
+        node_id: str = "",
+        phase: str = "",
+        summary: str = "",
+        verification: str = "",
+        report_path: str = "",
+        timestamp: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return {
+            "task_id": task_id,
+            "node_id": node_id,
+            "phase": phase,
+            "summary": summary,
+            "verification": verification,
+            "report_path": report_path,
+            "timestamp": timestamp or datetime.now().isoformat(),
+        }
+
     def _collect_reports_manifest() -> list[str]:
         if not _REPORTS_DIR.exists() or not _REPORTS_DIR.is_dir():
             return []
@@ -918,13 +938,31 @@ def register_routes(app: FastAPI):
             current = app_state.tasks.get(task_id)
             return not current or current.get("status") == "cancelled"
 
-        async def emit(line: str, level: str = "info"):
+        async def emit(
+            line: str,
+            level: str = "info",
+            *,
+            node_id: str = "",
+            phase: str = "",
+            summary: str = "",
+            verification: str = "",
+            report_path: str = "",
+        ):
             """broadcast 一行终端输出并持久化到 terminal_log"""
+            meta = _event_meta(
+                task_id=task_id,
+                node_id=node_id,
+                phase=phase,
+                summary=summary,
+                verification=verification,
+                report_path=report_path,
+            )
             entry = {
                 "task_id": task_id,
                 "line": line,
                 "level": level,
                 "ts": datetime.now().strftime("%H:%M:%S"),
+                **meta,
             }
             app_state.append_terminal_log(entry)
             await app_state.broadcast("terminal_output", entry)
@@ -983,8 +1021,14 @@ def register_routes(app: FastAPI):
                         "node": final_node,
                         "state_rev": snapshot["state_rev"],
                         "ts": datetime.now().isoformat(),
+                        **_event_meta(task_id=task_id, node_id=final_node, phase=state_update.get("phase", "")),
                     })
-                    await emit(f"\u25b6 [{node_name.upper()}] phase={state_update.get('phase','')}", "node")
+                    await emit(
+                        f"\u25b6 [{node_name.upper()}] phase={state_update.get('phase','')}",
+                        "node",
+                        node_id=final_node,
+                        phase=state_update.get("phase", ""),
+                    )
 
                     # 轻量震荡检测：phase 交替且子任务摘要长期不变（仅告警，不拦截）
                     phase = state_update.get("phase", "")
@@ -1053,6 +1097,12 @@ def register_routes(app: FastAPI):
                             for t in state_update.get("subtasks", [])
                         ],
                         "result": state_update.get("final_output"),
+                        **_event_meta(
+                            task_id=task_id,
+                            node_id=node_name,
+                            phase=state_update.get("phase", ""),
+                            summary=(state_update.get("final_output") or "")[:240],
+                        ),
                     })
 
                     # 子任务状态变化时推送名单
@@ -1135,6 +1185,15 @@ def register_routes(app: FastAPI):
                             "state_rev": snapshot["state_rev"],
                             "finished_at": now_iso,
                             "ts": now_iso,
+                            **_event_meta(
+                                task_id=task_id,
+                                node_id=final_node,
+                                phase=state_update.get("phase", ""),
+                                summary=(state_update.get("final_output") or "")[:240],
+                                verification="completed",
+                                report_path="reports/",
+                                timestamp=now_iso,
+                            ),
                         })
                         await app_state.broadcast("system_status_changed", {
                             **snapshot,
@@ -1224,6 +1283,14 @@ def register_routes(app: FastAPI):
                 "crash_report_saved": str(crash_report_path),
                 "state_rev": fail_snapshot.get("state_rev"),
                 "ts": now_iso,
+                **_event_meta(
+                    task_id=task_id,
+                    node_id=failed_node or "",
+                    summary=(str(e) or "")[:240],
+                    verification="failed",
+                    report_path=str(crash_report_path),
+                    timestamp=now_iso,
+                ),
             })
             await app_state.broadcast("system_status_changed", {
                 **fail_snapshot,

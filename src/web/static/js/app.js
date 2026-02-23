@@ -310,17 +310,6 @@ createApp({
                 case 'node_changed': {
                     if (!shouldApplyStatePayload(payload)) break;
                     currentNode.value = payload.node;
-                    addTimelineItem({
-                        id: `node_changed|${payload.task_id || ''}|${payload.node || ''}|${payload.ts || ''}`,
-                        ts: payload.ts,
-                        taskId: payload.task_id || selectedTask.value?.id || '',
-                        node: payload.node || '',
-                        kind: 'milestone',
-                        level: 'running',
-                        title: `进入节点 ${payload.node || '-'}`,
-                        detail: payload.phase ? `Phase -> ${payload.phase}` : '',
-                        sourceEvent: 'node_changed',
-                    });
                     scheduleGraphRefresh();
                     break;
                 }
@@ -353,6 +342,7 @@ createApp({
                     termLog(`⊕ 任务创建: ${payload.id}`, 'info');
                     break;
                 case 'task_started':
+                    if (!shouldApplyStatePayload(payload)) break;
                     mergeTasks([{ id: payload.id, status: 'running' }]);
                     addTimelineItem({
                         id: `task_started|${payload.id}|${payload.ts || ''}`,
@@ -372,6 +362,7 @@ createApp({
                     handleTaskProgress(payload);
                     break;
                 case 'task_completed':
+                    if (!shouldApplyStatePayload(payload)) break;
                     handleTaskCompleted(payload);
                     addTimelineItem({
                         id: `task_completed|${payload.id}|${payload.finished_at || payload.ts || ''}`,
@@ -387,6 +378,7 @@ createApp({
                     termLog(`✓ 任务完成: ${payload.id}`, 'success');
                     break;
                 case 'task_failed':
+                    if (!shouldApplyStatePayload(payload)) break;
                     mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
                     addTimelineItem({
                         id: `task_failed|${payload.id}|${payload.ts || ''}|${payload.error || ''}`,
@@ -637,20 +629,6 @@ createApp({
                     phase: phase || discussionStatus.value.phase,
                     lastUpdated: payload.updated_at || payload.ts || new Date().toISOString(),
                 };
-
-                addTimelineItem({
-                    id: `task_progress_node|${payload.task_id}|${selectedNode.id}|${selectedNode.status || ''}|${payload.updated_at || payload.ts || ''}`,
-                    ts: payload.updated_at || payload.ts,
-                    taskId: payload.task_id,
-                    node: selectedNode.id,
-                    kind: 'progress',
-                    level: selectedNode.status === 'failed'
-                        ? 'error'
-                        : (selectedNode.status === 'done' || selectedNode.status === 'completed' ? 'success' : 'running'),
-                    title: `进入节点 ${selectedNode.title || selectedNode.id}`,
-                    detail: selectedNode.status ? `状态: ${selectedNode.status}` : '',
-                    sourceEvent: 'task_progress',
-                });
 
                 refreshDiscussionStatusFromSelection();
             }
@@ -1109,17 +1087,6 @@ createApp({
                 }
             }
             refreshDiscussionStatusFromSelection();
-            addTimelineItem({
-                id: `selection|${selectedTask.value?.id || ''}|${subtask.id}|${subtask.status || ''}`,
-                ts: subtask?.updated_at || subtask?.started_at || new Date().toISOString(),
-                taskId: selectedTask.value?.id || '',
-                node: subtask.id,
-                kind: 'milestone',
-                level: 'info',
-                title: `进入节点 ${subtask.title || subtask.id}`,
-                detail: subtask.status ? `状态: ${subtask.status}` : '',
-                sourceEvent: 'selection',
-            });
         };
 
         const sendMessage = async () => {
