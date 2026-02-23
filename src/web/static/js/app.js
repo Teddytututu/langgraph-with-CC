@@ -1344,6 +1344,12 @@ createApp({
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
         const formatTime = (t) => formatTimestampHHMMSS(t);
 
+        const normalizeTaskText = (text) => String(text)
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n')
+            .replace(/\\r\\n/g, '\n')
+            .replace(/\\n/g, '\n');
+
         const escapeHtml = (text) => String(text)
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
@@ -1354,7 +1360,8 @@ createApp({
         const renderTaskMd = (text) => {
             if (!text) return '';
             try {
-                return marked.parse(escapeHtml(text), { breaks: true, gfm: true });
+                const normalized = normalizeTaskText(text);
+                return marked.parse(escapeHtml(normalized), { breaks: true, gfm: true });
             } catch (e) {
                 return escapeHtml(text);
             }
@@ -1363,7 +1370,9 @@ createApp({
         const renderTaskInline = (text) => {
             if (!text) return '';
             try {
-                return marked.parseInline(escapeHtml(text), { breaks: true, gfm: true });
+                const normalized = normalizeTaskText(text);
+                const safe = escapeHtml(normalized);
+                return safe.replace(/\n+/g, '<br>');
             } catch (e) {
                 return escapeHtml(text);
             }

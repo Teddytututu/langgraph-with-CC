@@ -1187,7 +1187,7 @@ def register_routes(app: FastAPI):
                             "status": t.status,
                             "agent_type": t.agent_type,
                             "assigned_agents": getattr(t, "assigned_agents", None),
-                            "dependencies": list(
+                            "dependencies": (
                                 getattr(t, "dependencies", None)
                                 or getattr(t, "depends_on", None)
                                 or (existing_subtasks.get(str(t.id), {}).get("dependencies") or [])
@@ -1221,7 +1221,7 @@ def register_routes(app: FastAPI):
                                 "assigned_agents": getattr(t, "assigned_agents", None),
                                 "status": t.status,
                                 "result": t.result,
-                                "dependencies": list(
+                                "dependencies": (
                                     getattr(t, "dependencies", None)
                                     or getattr(t, "depends_on", None)
                                     or (existing_subtasks.get(str(t.id), {}).get("dependencies") or [])
@@ -1705,35 +1705,7 @@ def register_routes(app: FastAPI):
         await _emit_discussion_message(task_id=task_id, node_id=node_id, message=msg)
 
         async def _auto_reply():
-            executor = get_executor()
-            try:
-                discussion = app_state.discussion_manager.get_discussion(manager_node_id)
-                history = discussion.messages[-6:] if discussion and discussion.messages else []
-                history_lines = "\n".join(
-                    f"{h.from_agent}: {h.content}"
-                    for h in history
-                )
-                prompt = (
-                    "你是任务讨论面板里的assistant。请基于最新用户消息给出简短、可执行的下一步建议。"
-                    f"\n任务ID: {task_id}\n节点ID: {node_id}\n"
-                    f"最近讨论:\n{history_lines}\n"
-                    f"最新消息({req.from_agent}): {req.content}\n"
-                    "要求：1-3句中文，聚焦下一步，不要重复上下文。"
-                )
-                result = await executor.execute(
-                    agent_id="monitor_chat",
-                    system_prompt="",
-                    context={"task": prompt},
-                    tools=[],
-                    max_turns=5,
-                )
-                if not result.success:
-                    reply_text = "已收到消息，正在处理中。"
-                else:
-                    reply_text = (result.result or "已收到消息，正在处理中。").strip()
-            except Exception:
-                reply_text = "已收到消息，正在处理中。"
-
+            reply_text = "已收到消息，建议先确认目标与约束，然后我会继续给出下一步执行建议。"
             reply_msg = await app_state.discussion_manager.post_message(
                 node_id=manager_node_id,
                 from_agent="assistant",
