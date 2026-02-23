@@ -1182,20 +1182,34 @@ def register_routes(app: FastAPI):
             })
             raise
         except Exception as e:
-            task["status"] = "failed"
-            task["error"] = str(e)
-            task["finished_at"] = datetime.now().isoformat()
-            app_state.mark_dirty()
+            now_iso = datetime.now().isoformat()
+            async with app_state.state_lock:
+                current = app_state.tasks.get(task_id)
+                if current:
+                    app_state._set_task_and_system_state_unlocked(
+                        task_id,
+                        task_status="failed",
+                        error=str(e),
+                        finished_at=now_iso,
+                        system_status="failed",
+                        current_node="",
+                        current_task_id=None,
+                    )
+                    failed_node = current.get("current_node") or app_state.current_node
+                    fail_snapshot = app_state._snapshot_state_unlocked()
+                else:
+                    failed_node = app_state.current_node
+                    fail_snapshot = app_state._snapshot_state_unlocked()
             await emit(f"✗ 崩溃: {str(e)[:200]}", "error")
 
             # 生成崩溃报告
             crash_report = {
                 "task_id": task_id,
-                "failed_node": app_state.current_node,
+                "failed_node": failed_node,
                 "error_message": str(e),
                 "traceback": traceback.format_exc(),
-                "task": task["task"],
-                "time": datetime.now().isoformat()
+                "task": task.get("task"),
+                "time": now_iso,
             }
 
             # 保存崩溃报告到 reports/ 目录（规范化）
@@ -1204,34 +1218,43 @@ def register_routes(app: FastAPI):
             with open(crash_report_path, "w", encoding="utf-8") as f:
                 json.dump(crash_report, f, indent=2, ensure_ascii=False)
 
-            app_state.system_status = "failed"
-            app_state.current_node = ""
-            app_state.current_task_id = None
             await app_state.broadcast("task_failed", {
                 "id": task_id,
                 "error": str(e),
                 "crash_report_saved": str(crash_report_path),
+                "state_rev": fail_snapshot.get("state_rev"),
+                "ts": now_iso,
             })
             await app_state.broadcast("system_status_changed", {
-                "status": "failed",
+                **fail_snapshot,
                 "task_id": task_id,
                 "error": str(e),
+                "ts": now_iso,
             })
         finally:
             app_state.running_task_handles.pop(task_id, None)
-            current = app_state.tasks.get(task_id)
-            if app_state.current_task_id == task_id and current and current.get("status") != "running":
-                app_state.current_task_id = None
-                if current.get("status") == "cancelled":
-                    app_state.system_status = "idle"
-                    app_state.current_node = ""
-                    await app_state.broadcast("system_status_changed", {
-                        "status": "idle",
-                        "task_id": task_id,
-                    })
 
-            current = app_state.tasks.get(task_id)
+            now_iso = datetime.now().isoformat()
+            async with app_state.state_lock:
+                current = app_state.tasks.get(task_id)
+                if current:
+                    status = current.get("status")
+                    if status in TERMINAL_STATUSES:
+                        app_state._set_task_and_system_state_unlocked(
+                            task_id,
+                            system_status="idle" if status in {"cancelled", "completed", "failed"} else app_state.system_status,
+                            current_node="",
+                            current_task_id=None,
+                        )
+                final_snapshot = app_state._snapshot_state_unlocked()
+
             if current and current.get("status") in TERMINAL_STATUSES:
+                await app_state.broadcast("system_status_changed", {
+                    **final_snapshot,
+                    "task_id": task_id,
+                    "source": "run_task_finalized",
+                    "ts": now_iso,
+                })
                 app_state.save_to_disk()
                 _fire(_schedule_post_task_init(task_id))
 
@@ -1420,15 +1443,10 @@ def register_routes(app: FastAPI):
     async def get_system_status(request: Request):
         """获取系统状态（含终端日志，供刷新后恢复）"""
         include_terminal = request.query_params.get("include_terminal") == "1"
-        response = {
-            "status": app_state.system_status,
-            "current_node": app_state.current_node,
-            "current_task_id": app_state.current_task_id,
-            "tasks_count": len(app_state.tasks),
-            "running_tasks": len([t for t in app_state.tasks.values() if t["status"] == "running"]),
-        }
-        if include_terminal:
-            response["terminal_log"] = app_state.terminal_log[-200:]
+        async with app_state.state_lock:
+            response = app_state._snapshot_state_unlocked()
+            if include_terminal:
+                response["terminal_log"] = app_state.terminal_log[-200:]
         return response
 
     # ── 讨论 API ──
