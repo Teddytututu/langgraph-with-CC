@@ -308,11 +308,17 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int) -
             _log(f"✓ 第 {round_num} 轮完成（耗时 {elapsed_min:.1f} 分钟）")
             results.append({"round": round_num, "status": "ok", "minutes": f"{elapsed_min:.1f}"})
 
-        elif status in ("failed", "timeout"):
-            _log(f"✗ 第 {round_num} 轮{status}（耗时 {elapsed_min:.1f} 分钟）")
+        elif status == "failed":
+            _log(f"✗ 第 {round_num} 轮 FAILED（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  错误: {detail[:200]}")
-            results.append({"round": round_num, "status": status, "minutes": f"{elapsed_min:.1f}"})
-            _wait_for_fix(f"轮次 {round_num} {status}", round_num, detail)
+            results.append({"round": round_num, "status": "failed", "minutes": f"{elapsed_min:.1f}"})
+            _wait_for_fix(f"轮次 {round_num} 任务执行失败", round_num, detail)
+
+        elif status == "timeout":
+            # poll-deadline 超时 ≠ 代码 bug，直接进下一轮，不等修复
+            _log(f"⚠ 第 {round_num} 轮 poll-timeout（耗时 {elapsed_min:.1f} 分钟）")
+            _log(f"  本轮任务未在截止前完成，继续下一轮（不写 fix_request）")
+            results.append({"round": round_num, "status": "timeout", "minutes": f"{elapsed_min:.1f}"})
 
         # ── 冷却 ──
         if datetime.now() < end_time and cooldown > 0:
