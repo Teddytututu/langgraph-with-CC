@@ -172,6 +172,17 @@ class SubagentCaller:
             await self._fill_specialist_slot(cleared[0], skills, task_description)
             return cleared[0]
 
+        # 5. 兜底：强制创建新编号槽位（不应走到这里，但防止返回 None 后误用系统 agent）
+        new_id = self.pool.create_agent_file(
+            name=f"{'+'.join(skills[:2])}-specialist",
+            description=f"专注于 {', '.join(skills)} 的执行专家",
+            content=f"你是一个专注于 {', '.join(skills)} 领域的执行专家。请严格按照任务描述完成工作，输出完整、具体的结果。",
+            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        )
+        if new_id:
+            self.manager.mark_ready(new_id, name=f"{'+'.join(skills[:2])}-specialist", skills=skills)
+            return new_id
+
         return None
 
     async def _fill_specialist_slot(self, agent_id: str, skills: list[str], task_description: str) -> bool:

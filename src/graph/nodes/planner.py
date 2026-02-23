@@ -106,14 +106,14 @@ async def planner_node(state: GraphState) -> dict:
             ),
             SubTask(
                 id="task-004",
-                title="成果整理与交付输出",
-                description="整理所有阶段成果，撰写说明文档，提供完整清晰的最终交付物。",
-                agent_type="writer",
+                title="结果汇总与报告输出",
+                description="整合所有阶段的分析结果和验证反馈，生成结构化的最终报告，包含执行摘要、发现问题、改进建议和交付物列表。",
+                agent_type="researcher",
                 dependencies=["task-003"],
                 priority=4,
                 estimated_minutes=max(5.0, base_mins * 0.15),
-                knowledge_domains=["documentation", "writing"],
-                completion_criteria=["交付物完整且清晰", "包含使用说明"],
+                knowledge_domains=["reporting", "analysis", "documentation"],
+                completion_criteria=["包含执行摘要和主要发现", "列出所有交付物及其位置", "提供后续行动建议"],
             ),
         ]
 

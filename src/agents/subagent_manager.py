@@ -110,12 +110,15 @@ class SubagentManager:
             skills: 需要的技能列表
 
         Returns:
-            匹配度最高的 agent_id 或 None
+            匹配度最高的 agent_id 或 None（只在编号池中查找）
         """
         best_match = None
         best_score = 0
 
         for agent_id, info in self.states.items():
+            # 只从编号池（agent_XX）中寻找，排除系统 agent
+            if agent_id in self.INDEPENDENT_AGENTS:
+                continue
             if info.state == SubagentState.READY:
                 # 计算技能匹配度
                 match_score = sum(1 for s in skills if s in info.skills)
