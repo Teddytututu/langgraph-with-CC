@@ -62,7 +62,10 @@
                             </svg>
                             Tasks
                         </span>
-                        <div style="display:flex;gap:6px;">
+                        <div class="task-actions">
+                            <button class="btn btn-ghost task-jump-btn" title="跳转到历史输出" @click="jumpToPastOutput">
+                                Past Output
+                            </button>
                             <button class="btn btn-ghost" title="清空所有任务" @click="clearAllTasks" v-if="tasks.length > 0">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <polyline points="3 6 5 6 21 6"/>
@@ -376,7 +379,7 @@
                 <!-- 实时干预 - 已并入终端面板 -->
 
                 <!-- 任务输出 -->
-                <div class="card result-card" v-if="selectedTask?.result">
+                <div class="card result-card" id="output-section" v-if="selectedTask?.result">
                     <div class="card-header">
                         <span class="card-title">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -395,7 +398,7 @@
                 </div>
 
                 <!-- 报告文件 -->
-                <div class="card reports-card" v-if="reports.length > 0">
+                <div class="card reports-card" id="reports-section" v-if="reports.length > 0">
                     <div class="card-header">
                         <span class="card-title">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -726,6 +729,7 @@
                     <div class="field">
                         <label>Description</label>
                         <textarea v-model="newTask.task" placeholder="What do you want to accomplish?" rows="4"></textarea>
+                        <span class="field-hint">提交后会由后端 Agent SDK 自动整理为结构化任务（Goal / Constraints / Acceptance Criteria 等）</span>
                     </div>
                     <div class="field">
                         <label>Time Budget (min)</label>

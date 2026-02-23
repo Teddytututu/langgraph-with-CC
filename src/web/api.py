@@ -430,6 +430,118 @@ def register_routes(app: FastAPI):
 
     # ── 任务 API ──
 
+    def _is_task_normalize_enabled() -> bool:
+        raw = os.getenv("WEB_TASK_NORMALIZE_ENABLED", "1").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _extract_json_object(raw_text: str) -> dict[str, Any]:
+        text = (raw_text or "").strip()
+        if not text:
+            raise ValueError("empty sdk output")
+
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("sdk output is not a JSON object")
+            return parsed
+        except Exception:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("json object not found in sdk output")
+
+        parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("sdk output is not a JSON object")
+        return parsed
+
+    async def _normalize_task_text_via_sdk(raw_task: str) -> dict[str, Any]:
+        original = raw_task or ""
+        compact = original.strip()
+
+        fallback = {
+            "normalized_task": original,
+            "raw_task": original,
+            "format_meta": {
+                "transformed": False,
+                "reason": "fallback_to_raw",
+            },
+        }
+
+        if not compact:
+            fallback["format_meta"]["reason"] = "empty_input"
+            return fallback
+
+        if not _is_task_normalize_enabled():
+            fallback["format_meta"]["reason"] = "disabled_by_config"
+            return fallback
+
+        system_prompt = (
+            "你是任务描述整理器。只做重组与轻度润色，不改变用户意图，不新增不存在的约束。\n"
+            "请将输入任务整理成结构化 Markdown，优先使用这些标题并按需省略空章节：\n"
+            "## Goal\n## Scope\n## Constraints\n## Acceptance Criteria\n## Deliverables\n\n"
+            "输出必须是 JSON 对象且仅包含以下字段：\n"
+            "{\"normalized_task\": string, \"transformed\": boolean, \"reason\": string}\n"
+            "- normalized_task: 整理后的 Markdown\n"
+            "- transformed: 仅当结构明显优化时为 true\n"
+            "- reason: 简短说明（如 structured_sections / already_structured）\n"
+            "不要输出 JSON 之外的任何内容。"
+        )
+
+        prompt = (
+            "请整理以下任务输入，并按要求返回 JSON：\n"
+            "----- RAW TASK START -----\n"
+            f"{original}\n"
+            "----- RAW TASK END -----"
+        )
+
+        try:
+            executor = get_executor()
+            result = await asyncio.wait_for(
+                executor.execute(
+                    agent_id="task_input_normalizer",
+                    system_prompt=system_prompt,
+                    context={"task": prompt},
+                    tools=[],
+                    max_turns=4,
+                ),
+                timeout=25,
+            )
+
+            if not result.success:
+                fallback["format_meta"]["reason"] = f"sdk_failed:{(result.error or 'unknown')[:120]}"
+                return fallback
+
+            parsed = _extract_json_object(str(result.result or ""))
+            normalized_task = str(parsed.get("normalized_task") or "").strip()
+            if not normalized_task:
+                fallback["format_meta"]["reason"] = "empty_normalized_output"
+                return fallback
+
+            transformed = bool(parsed.get("transformed")) and normalized_task != original
+            reason = str(parsed.get("reason") or ("structured_sections" if transformed else "already_structured"))
+
+            return {
+                "normalized_task": normalized_task,
+                "raw_task": original,
+                "format_meta": {
+                    "transformed": transformed,
+                    "reason": reason[:200],
+                },
+            }
+        except asyncio.TimeoutError:
+            fallback["format_meta"]["reason"] = "sdk_timeout"
+            return fallback
+        except Exception as e:
+            fallback["format_meta"]["reason"] = f"sdk_exception:{str(e)[:120]}"
+            return fallback
+
     @app.post("/api/tasks")
     async def create_task(req: TaskCreate):
         """创建新任务"""
@@ -448,10 +560,13 @@ def register_routes(app: FastAPI):
                         pass
 
         policy_data = req.execution_policy.model_dump() if req.execution_policy else None
+        normalized_payload = await _normalize_task_text_via_sdk(req.task)
 
         task_data = {
             "id": task_id,
-            "task": req.task,
+            "task": normalized_payload["normalized_task"],
+            "task_raw": normalized_payload["raw_task"],
+            "task_format_meta": normalized_payload["format_meta"],
             "time_minutes": req.time_minutes,
             "execution_policy": policy_data,
             "status": "created",
@@ -1621,7 +1736,7 @@ def register_routes(app: FastAPI):
         for dep_raw, sid_raw in edge_pairs:
             dep_sid = by_id[dep_raw]["node_id"]
             sid = by_id[sid_raw]["node_id"]
-            lines.append(f"    {dep_sid} -->|depends_on| {sid}")
+            lines.append(f"    {dep_sid} --> {sid}")
 
             dep_status = by_id[dep_raw].get("status")
             if dep_status == "running":

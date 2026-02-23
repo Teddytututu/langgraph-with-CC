@@ -512,6 +512,22 @@ body {
     flex: 1;
 }
 
+.task-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.task-jump-btn {
+    padding: 6px 10px;
+    font-size: 0.72rem;
+    white-space: nowrap;
+}
+
+.task-jump-btn:hover {
+    border-color: var(--border-2);
+}
+
 .task-list {
     flex: 1;
     min-height: 300px;

@@ -233,13 +233,35 @@ async def _execute_multi_agent_discussion(
             "2) Direct response to at least one other perspective from prior round\n"
             "Keep it concrete and concise (<500 words)."
         )
+
+        # 防卡死：为单次 specialist 调用设置硬超时，避免首节点长时间无进展
+        # 规则：优先基于任务估时分摊；若无估时则使用保守默认值
+        est_minutes = float(getattr(task, "estimated_minutes", 0.0) or 0.0)
+        specialist_count = max(1, len(specialists))
+        round_count = max(1, int(min_rounds or 1))
+        if est_minutes > 0:
+            budget_seconds = est_minutes * 60.0
+            per_call_timeout = budget_seconds / (round_count * specialist_count)
+            per_call_timeout = max(30.0, min(180.0, per_call_timeout))
+        else:
+            per_call_timeout = 60.0
+
         try:
-            res = await caller.call_specialist(
-                agent_id=spec["id"],
-                subtask={**subtask_dict, "description": prompt},
-                previous_results=previous_results,
-                time_budget=budget_ctx,
+            res = await asyncio.wait_for(
+                caller.call_specialist(
+                    agent_id=spec["id"],
+                    subtask={**subtask_dict, "description": prompt},
+                    previous_results=previous_results,
+                    time_budget=budget_ctx,
+                ),
+                timeout=per_call_timeout,
             )
+        except asyncio.TimeoutError:
+            res = {
+                "success": False,
+                "error": f"specialist_call_timeout>{per_call_timeout:.0f}s",
+                "result": None,
+            }
         except Exception as e:
             res = {"success": False, "error": str(e), "result": None}
 
@@ -259,6 +281,7 @@ async def _execute_multi_agent_discussion(
             "type": "response",
             "success": bool(res.get("success") and res.get("result")),
         }
+
 
     prior_digest = "No prior round yet."
     for round_idx in range(1, min_rounds + 1):

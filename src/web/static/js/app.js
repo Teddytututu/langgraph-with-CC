@@ -1059,6 +1059,24 @@ createApp({
             }
         };
 
+        const jumpToPastOutput = () => {
+            const hasReports = reports.value.length > 0;
+            const hasOutput = !!selectedTask.value?.result;
+
+            let target = null;
+            if (hasReports) {
+                target = document.getElementById('reports-section');
+            } else if (hasOutput) {
+                target = document.getElementById('output-section');
+            } else {
+                target = document.getElementById('reports-section') || document.getElementById('output-section');
+            }
+
+            if (target) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        };
+
         const sendChat = async () => {
             const msg = chatInput.value.trim();
             if (!msg || chatThinking.value) return;
@@ -1426,6 +1444,7 @@ createApp({
             reports, activeReport, activeReportContent,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd, renderTaskMd, renderTaskInline,
             fetchGraph, fetchReports, loadReport, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
+            jumpToPastOutput,
             zoomGraphIn, zoomGraphOut, resetGraphView, fitGraphView,
         };
     }
