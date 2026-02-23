@@ -728,6 +728,9 @@ createApp({
             try {
                 const url = restoreTerminal ? '/api/system/status?include_terminal=1' : '/api/system/status';
                 const res = await fetch(url);
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
                 const data = await res.json();
                 systemStatus.value = data.status;
                 currentNode.value = data.current_node || '';
@@ -822,14 +825,18 @@ createApp({
 
             // 立即发送，不等待回复（回复通过 WebSocket chat_reply 事件推送）
             try {
-                await fetch('/api/chat', {
+                const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message: msg, history }),
                 });
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
             } catch (e) {
                 chatThinking.value = false;
                 chatMessages.value.push({ role: 'assistant', content: `请求失败: ${e.message}`, time: new Date().toLocaleTimeString() });
+                termLog(`✗ Chat 请求失败: ${e.message}`, 'error');
             }
             // chatThinking 由 WS chat_reply 事件处理器关闭
         };
@@ -921,6 +928,9 @@ createApp({
             if (selectedTask.value) {
                 try {
                     const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${subtask.id}/discussion`);
+                    if (!res.ok) {
+                        throw new Error(`HTTP ${res.status}`);
+                    }
                     const data = await res.json();
                     discussionMessages.value = data.messages || [];
                     discussionParticipants.value = data.participants || [];
@@ -950,29 +960,37 @@ createApp({
 
         const sendMessage = async () => {
             if (!newMessage.value.content.trim() || !selectedSubtask.value) return;
-            const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(newMessage.value)
-            });
-            const saved = await res.json();
-            // Optimistically add to local list (WS event may also arrive)
-            if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
-                discussionMessages.value.push(saved);
+            try {
+                const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newMessage.value)
+                });
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const saved = await res.json();
+                // Optimistically add to local list (WS event may also arrive)
+                if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
+                    discussionMessages.value.push(saved);
+                }
+                refreshDiscussionStatusFromSelection();
+                addTimelineItem({
+                    id: `discussion_local|${selectedTask.value?.id || ''}|${selectedSubtask.value?.id || ''}|${saved?.id || saved?.timestamp || newMessage.value.content}`,
+                    ts: saved?.timestamp || new Date().toISOString(),
+                    taskId: selectedTask.value?.id || '',
+                    node: selectedSubtask.value?.id || '',
+                    kind: 'milestone',
+                    level: 'info',
+                    title: `讨论消息 · ${saved?.from_agent || newMessage.value.from_agent}`,
+                    detail: (saved?.content || newMessage.value.content || '').slice(0, 120),
+                    sourceEvent: 'discussion_message',
+                });
+                newMessage.value.content = '';
+            } catch (e) {
+                termLog(`✗ 发送讨论消息失败: ${e.message}`, 'error');
+                alert(`发送失败: ${e.message}`);
             }
-            refreshDiscussionStatusFromSelection();
-            addTimelineItem({
-                id: `discussion_local|${selectedTask.value?.id || ''}|${selectedSubtask.value?.id || ''}|${saved?.id || saved?.timestamp || newMessage.value.content}`,
-                ts: saved?.timestamp || new Date().toISOString(),
-                taskId: selectedTask.value?.id || '',
-                node: selectedSubtask.value?.id || '',
-                kind: 'milestone',
-                level: 'info',
-                title: `讨论消息 · ${saved?.from_agent || newMessage.value.from_agent}`,
-                detail: (saved?.content || newMessage.value.content || '').slice(0, 120),
-                sourceEvent: 'discussion_message',
-            });
-            newMessage.value.content = '';
         };
 
         const openEditSubtask = (subtask) => {
@@ -1013,11 +1031,14 @@ createApp({
 
         const intervene = async () => {
             if (!interveneText.value.trim() || !selectedTask.value) return;
-            await fetch(`/api/tasks/${selectedTask.value.id}/intervene`, {
+            const res = await fetch(`/api/tasks/${selectedTask.value.id}/intervene`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ instruction: interveneText.value.trim() })
             });
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
             interveneText.value = '';
         };
 
