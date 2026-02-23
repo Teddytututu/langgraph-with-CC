@@ -63,6 +63,7 @@ class SubtaskUpdate(BaseModel):
     agent_type: Optional[str] = None
     priority: Optional[int] = None
     estimated_minutes: Optional[float] = None
+    knowledge_domains: Optional[list[str]] = None
 
 
 class ChatRequest(BaseModel):

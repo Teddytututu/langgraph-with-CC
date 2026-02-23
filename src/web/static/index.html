@@ -349,6 +349,7 @@
                                 <div class="subtask-info">
                                     <h4>{{ s.title }}</h4>
                                     <span class="agent">{{ s.agent_type }}</span>
+                                    <span v-if="s.assigned_agents?.length" class="agent-id">{{ s.assigned_agents[0] }}</span>
                                 </div>
                                 <button
                                     class="subtask-edit-btn"
@@ -591,11 +592,14 @@
                     <div class="field">
                         <label>Agent Type</label>
                         <select v-model="editForm.agent_type">
-                            <option value="coder">coder</option>
-                            <option value="researcher">researcher</option>
-                            <option value="writer">writer</option>
-                            <option value="analyst">analyst</option>
+                            <option value="coder">coder — 编写/修改代码</option>
+                            <option value="researcher">researcher — 调研/搜索/报告</option>
+                            <option value="analyst">analyst — 分析/推理/对比</option>
                         </select>
+                    </div>
+                    <div class="field">
+                        <label>Knowledge Domains <span style="font-weight:400;color:var(--text-3)">（空格分隔）</span></label>
+                        <input v-model="editForm.knowledge_domains_str" placeholder="python async database ...">
                     </div>
                     <div style="display:flex;gap:12px">
                         <div class="field" style="flex:1">

@@ -516,17 +516,25 @@ createApp({
                 agent_type: subtask.agent_type || 'coder',
                 priority: subtask.priority || 1,
                 estimated_minutes: subtask.estimated_minutes || 10,
+                knowledge_domains_str: (subtask.knowledge_domains || []).join(' '),
             };
         };
 
         const saveSubtask = async () => {
             if (!editingSubtask.value || !selectedTask.value) return;
+            const { knowledge_domains_str, ...rest } = editForm.value;
+            const payload = {
+                ...rest,
+                knowledge_domains: knowledge_domains_str
+                    ? knowledge_domains_str.trim().split(/\s+/).filter(Boolean)
+                    : undefined,
+            };
             const res = await fetch(
                 `/api/tasks/${selectedTask.value.id}/subtasks/${editingSubtask.value.id}`,
                 {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(editForm.value),
+                    body: JSON.stringify(payload),
                 }
             );
             if (res.ok) {
