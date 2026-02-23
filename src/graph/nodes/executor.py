@@ -26,6 +26,10 @@ async def executor_node(state: GraphState) -> dict:
 
     通过 SubagentCaller 调用 executor subagent 或专业 subagent 执行任务
     """
+    # 确保 reports/ 目录存在，供 subagent 写入报告文件
+    from pathlib import Path as _Path
+    _Path("reports").mkdir(exist_ok=True)
+
     caller = get_caller()
     subtasks = state.get("subtasks", [])
 
@@ -55,6 +59,23 @@ async def executor_node(state: GraphState) -> dict:
     # 收集前序依赖任务的结果
     previous_results = _build_context(state, next_task)
 
+    # 构建时间预算信息，传递给 subagent
+    budget_ctx: dict | None = None
+    raw_budget = state.get("time_budget")
+    if raw_budget:
+        # 实时计算剩余时间
+        remaining = raw_budget.remaining_minutes
+        if raw_budget.started_at and remaining == 0:
+            from datetime import datetime as _dt
+            elapsed = (_dt.now() - raw_budget.started_at).total_seconds() / 60
+            remaining = max(0.0, raw_budget.total_minutes - elapsed)
+        budget_ctx = {
+            "total_minutes": raw_budget.total_minutes,
+            "remaining_minutes": round(remaining, 1),
+            "task_estimated_minutes": next_task.estimated_minutes,
+            "deadline": raw_budget.deadline.isoformat() if raw_budget.deadline else None,
+        }
+
     # 使用协调者选择协作模式
     mode = _coordinator.choose_collaboration_mode(
         task=next_task.description,
@@ -68,7 +89,7 @@ async def executor_node(state: GraphState) -> dict:
     # 并行协作：为每个知识域分配独立的专家
     if mode == CollaborationMode.PARALLEL and len(next_task.knowledge_domains) >= 2:
         call_result = await _execute_parallel(
-            caller, next_task, previous_results, timeout
+            caller, next_task, previous_results, timeout, budget_ctx
         )
         specialist_id = call_result.get("specialist_id")
     else:
@@ -84,6 +105,8 @@ async def executor_node(state: GraphState) -> dict:
             "description": next_task.description,
             "agent_type": next_task.agent_type,
             "knowledge_domains": next_task.knowledge_domains,
+            "estimated_minutes": next_task.estimated_minutes,
+            "completion_criteria": next_task.completion_criteria,
         }
 
         try:
@@ -93,6 +116,7 @@ async def executor_node(state: GraphState) -> dict:
                         agent_id=specialist_id,
                         subtask=subtask_dict,
                         previous_results=previous_results,
+                        time_budget=budget_ctx,
                     ),
                     timeout=timeout,
                 )
@@ -105,6 +129,7 @@ async def executor_node(state: GraphState) -> dict:
                         agent_id="agent_01",
                         subtask=subtask_dict,
                         previous_results=previous_results,
+                        time_budget=budget_ctx,
                     ),
                     timeout=timeout,
                 )
@@ -141,6 +166,26 @@ async def executor_node(state: GraphState) -> dict:
     # 获取结果
     result_data = call_result.get("result")
     result_text = str(result_data) if result_data else f"任务 {next_task.title} 执行完成"
+
+    # 尝试关联报告文件：检查 reports/{task_id}*.md，如果存在则将内容并入结果
+    from pathlib import Path as _Path
+    _reports_dir = _Path("reports")
+    if _reports_dir.exists():
+        # 按任务 ID 匹配（允许子任务 ID 包含点，如 task-001）
+        _task_slug = next_task.id.replace("-", "").replace(".", "")
+        _candidates = sorted(
+            list(_reports_dir.glob(f"{next_task.id}*.md")) +
+            list(_reports_dir.glob(f"{_task_slug}*.md")),
+            key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        if _candidates:
+            try:
+                _file_content = _candidates[0].read_text(encoding="utf-8", errors="replace")
+                if len(_file_content.strip()) > len(result_text):
+                    result_text = _file_content
+                    logger.info("[executor] 使用报告文件 %s 作为 %s 的结果", _candidates[0].name, next_task.id)
+            except Exception as _fe:
+                logger.warning("[executor] 读取报告文件失败: %s", _fe)
     result = {
         "status": "done",
         "result": result_text,
@@ -233,7 +278,7 @@ def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
     return prev_results
 
 
-async def _execute_parallel(caller, task: SubTask, previous_results: list, timeout: float) -> dict:
+async def _execute_parallel(caller, task: SubTask, previous_results: list, timeout: float, budget_ctx: dict | None = None) -> dict:
     """
     并行协作：为每个知识域创建独立专家，并发执行，合并结果
 
@@ -247,6 +292,8 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
         "description": task.description,
         "agent_type": task.agent_type,
         "knowledge_domains": task.knowledge_domains,
+        "estimated_minutes": task.estimated_minutes,
+        "completion_criteria": task.completion_criteria,
     }
 
     async def run_one(domain: str) -> dict:
@@ -259,6 +306,7 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
                 agent_id=sid,
                 subtask=subtask_dict,
                 previous_results=previous_results,
+                time_budget=budget_ctx,
             )
         return await caller.call_executor(
             subtask=subtask_dict,

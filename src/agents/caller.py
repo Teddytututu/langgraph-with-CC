@@ -130,12 +130,21 @@ class SubagentCaller:
         }
         return await self.call("reflector", context)
 
-    async def call_specialist(self, agent_id: str, subtask: dict, previous_results: list = None) -> dict:
-        """调用专业 subagent 执行任务"""
-        context = {
+    async def call_specialist(self, agent_id: str, subtask: dict, previous_results: list = None, time_budget: dict = None) -> dict:
+        """调用专业 subagent 执行任务
+
+        Args:
+            agent_id: 专业 agent ID
+            subtask: 子任务信息（应包含 estimated_minutes）
+            previous_results: 前序任务结果
+            time_budget: 全局时间预算信息（含 remaining_minutes）
+        """
+        context: dict = {
             "subtask": subtask,
             "previous_results": previous_results or [],
         }
+        if time_budget:
+            context["time_budget"] = time_budget
         return await self.call(agent_id, context)
 
     async def get_or_create_specialist(self, skills: list[str], task_description: str) -> Optional[str]:

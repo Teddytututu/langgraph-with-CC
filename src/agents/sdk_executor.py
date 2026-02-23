@@ -253,14 +253,23 @@ class SDKExecutor:
             parts.append(f"- 描述: {subtask.get('description', '')}")
             if subtask.get("agent_type"):
                 parts.append(f"- 类型: {subtask['agent_type']}")
+            if subtask.get("estimated_minutes"):
+                parts.append(f"- **此子任务限时: {subtask['estimated_minutes']:.1f} 分钟，请在此时间内完成**")
+            if subtask.get("completion_criteria"):
+                parts.append("- 验收标准: " + "; ".join(subtask["completion_criteria"]))
             parts.append("")
 
         # 时间预算
         if "time_budget" in context:
             budget = context["time_budget"]
-            parts.append("## 时间预算")
-            parts.append(f"- 总时间: {budget.get('total_minutes', 'N/A')} 分钟")
-            parts.append(f"- 剩余时间: {budget.get('remaining_minutes', 'N/A')} 分钟")
+            parts.append("## ║ 时间约束")
+            if budget.get("task_estimated_minutes"):
+                parts.append(f"- 本任务分配时间: **{budget['task_estimated_minutes']:.1f} 分钟**")
+            if budget.get("remaining_minutes") is not None:
+                parts.append(f"- 全局剩余时间: {budget['remaining_minutes']:.1f} 分钟")
+            if budget.get("deadline"):
+                parts.append(f"- 所有任务截止时间: {budget['deadline']}")
+            parts.append("⇒ 请在分配时间内高效完成，勿过度深入分支话题")
             parts.append("")
 
         # 前序结果
@@ -289,8 +298,12 @@ class SDKExecutor:
             parts.append("")
 
         # 输出格式要求
-        parts.append("## 输出要求")
-        parts.append("请按照任务要求输出结果。如果是结构化数据，请使用 JSON 格式。")
+        subtask_id = context.get("subtask", {}).get("id", "task")
+        parts.append("## ║ 输出要求")
+        parts.append(f"1. 将详细的工作成果写入文件 `reports/{subtask_id}.md`，使用标准 Markdown 格式")
+        parts.append("2. 文件必须包含：执行摘要、主要发现、建议事项、交付物路径")
+        parts.append("3. 在最终一条回复中输出扩展摘要（100-300字），说明报告路径")
+        parts.append(f"4. 如果主题涉及结构化数据，同时写入 `reports/{subtask_id}.json`")
 
         return "\n".join(parts)
 

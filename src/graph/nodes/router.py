@@ -29,7 +29,7 @@ async def router_node(state: GraphState) -> dict:
     ):
         return {
             "phase": "complete",
-            "final_output": _build_final_output(state),
+            "final_output": _build_final_output(state, budget=budget),
             "time_budget": budget,
         }
 
@@ -37,7 +37,7 @@ async def router_node(state: GraphState) -> dict:
     if budget and budget.is_overtime:
         return {
             "phase": "timeout",
-            "final_output": _build_final_output(state, timeout=True),
+            "final_output": _build_final_output(state, timeout=True, budget=budget),
             "time_budget": budget,
         }
 
@@ -48,7 +48,7 @@ async def router_node(state: GraphState) -> dict:
         _log.getLogger(__name__).error("[router] 迭代已达 %d 次，强制超时交付", current_iteration)
         return {
             "phase": "timeout",
-            "final_output": _build_final_output(state, timeout=True),
+            "final_output": _build_final_output(state, timeout=True, budget=budget),
             "time_budget": budget,
         }
 
@@ -59,8 +59,14 @@ async def router_node(state: GraphState) -> dict:
     }
 
 
-def _build_final_output(state: GraphState, timeout: bool = False) -> str:
-    """汇总所有子任务结果"""
+def _build_final_output(state: GraphState, timeout: bool = False, budget=None) -> str:
+    """汇总所有子任务结果
+
+    Args:
+        state: 当前图状态
+        timeout: 是否超时交付
+        budget: 已更新过 elapsed_minutes 的 TimeBudget 对象（不传则从 state 读取）
+    """
     lines = []
     if timeout:
         lines.append("⚠️ **时间预算已用尽，以下为已完成部分：**\n")
@@ -75,11 +81,17 @@ def _build_final_output(state: GraphState, timeout: bool = False) -> str:
             lines.append(t.result)
         lines.append("")
 
-    budget = state.get("time_budget")
-    if budget:
+    # 使用传入的已更新 budget，如果没有则从 state 读取
+    eff_budget = budget or state.get("time_budget")
+    if eff_budget:
+        elapsed = eff_budget.elapsed_minutes
+        # 如果 elapsed_minutes 仍为 0（budget 没有排过 router）, 尝试实时计算
+        if elapsed == 0 and eff_budget.started_at:
+            from datetime import datetime as _dt
+            elapsed = (_dt.now() - eff_budget.started_at).total_seconds() / 60
         lines.append(
-            f"\n---\n总耗时 {budget.elapsed_minutes:.1f} 分钟 "
-            f"/ 预算 {budget.total_minutes:.0f} 分钟"
+            f"\n---\n总耗时 {elapsed:.1f} 分钟 "
+            f"/ 预算 {eff_budget.total_minutes:.0f} 分钟"
         )
 
     # 扫描 reports/ 目录，将所有 .md 文件追加到输出
