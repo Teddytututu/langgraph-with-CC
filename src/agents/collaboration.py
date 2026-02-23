@@ -8,7 +8,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CollaborationMode(Enum):
@@ -31,7 +31,7 @@ class CollaborationResult(BaseModel):
     """协作执行结果"""
     mode: CollaborationMode
     success: bool
-    results: dict[str, Any] = {}  # agent_id -> result
+    results: dict[str, Any] = Field(default_factory=dict)  # agent_id -> result
     final_output: Any = None
     error: str = ""
 
@@ -99,6 +99,8 @@ class ParallelCollaboration(BaseCollaboration):
     async def execute(self, task: Any, context: dict = None) -> CollaborationResult:
         context = context or {}
         results = {}
+        had_error = False
+        error_messages: list[str] = []
 
         async def run_agent(agent: AgentExecutor):
             try:
@@ -114,9 +116,35 @@ class ParallelCollaboration(BaseCollaboration):
 
         for agent, output in zip(self.agents, outputs):
             results[agent.agent_id] = output
+            if isinstance(output, dict) and output.get("error"):
+                had_error = True
+                error_messages.append(f"{agent.agent_id}: {output.get('error')}")
 
         # 合并结果
         final_output = self._merge_results(outputs)
+
+        success_count = sum(
+            1 for output in outputs
+            if not (isinstance(output, dict) and output.get("error"))
+        )
+
+        if had_error:
+            summary = "; ".join(error_messages)
+            if success_count == 0:
+                return CollaborationResult(
+                    mode=CollaborationMode.PARALLEL,
+                    success=False,
+                    results=results,
+                    final_output=final_output,
+                    error=f"all_failed: {summary}"
+                )
+            return CollaborationResult(
+                mode=CollaborationMode.PARALLEL,
+                success=False,
+                results=results,
+                final_output=final_output,
+                error=f"partial_failure: {summary}"
+            )
 
         return CollaborationResult(
             mode=CollaborationMode.PARALLEL,

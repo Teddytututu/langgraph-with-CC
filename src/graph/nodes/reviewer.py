@@ -94,9 +94,13 @@ async def reviewer_node(state: GraphState) -> dict:
         else:
             updated_subtasks.append(t)
 
+    # PASS / 达到重试上限 → executing（让 router 继续调度剩余任务）
+    # 仍需重试 → reflecting（让 router 路由到 reflector 修正，避免 reviewing 死循环）
+    next_phase = "reflecting" if new_status == "pending" else "executing"
+
     return {
         "subtasks": updated_subtasks,
-        "phase": "reviewing",
+        "phase": next_phase,
         "execution_log": [{
             "event": "review_complete",
             "task_id": current.id,

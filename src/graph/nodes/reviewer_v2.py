@@ -54,8 +54,8 @@ async def reviewer_v2_node(state: GraphState) -> dict:
     reviews = await _parallel_review(caller, current)
 
     if not reviews:
-        # 所有评审都失败，默认通过
-        return _create_pass_result(state, current, "评审器执行失败，默认通过")
+        # 全部评审失败时 fail-closed，禁止默认通过
+        return _create_fail_closed_result(state, current, "评审器全部失败或超时，触发闭锁")
 
     # === 阶段2: 投票决策 ===
     verdict, final_score = _vote_on_reviews(reviews)
@@ -209,7 +209,7 @@ def _vote_on_reviews(reviews: list[dict]) -> tuple[str, float]:
         (verdict, final_score)
     """
     if not reviews:
-        return ("PASS", 7.0)
+        return ("REVISE", 0.0)
 
     # 统计票数
     pass_count = sum(1 for r in reviews if r.get("verdict") == "PASS")
@@ -308,15 +308,22 @@ def _find_current_subtask(subtasks: list[SubTask], cid: Optional[str]) -> Option
     return next((t for t in subtasks if t.id == cid), None)
 
 
-def _create_pass_result(state: GraphState, task: SubTask, reason: str) -> dict:
-    """创建通过结果"""
+def _create_fail_closed_result(state: GraphState, task: SubTask, reason: str) -> dict:
+    """创建 fail-closed 结果（评审不可用时不允许自动通过）"""
     subtasks = state.get("subtasks", [])
+    max_iter = state.get("max_iterations", 3)
+
+    if task.retry_count + 1 >= max_iter:
+        new_status, new_retry = "failed", task.retry_count + 1
+    else:
+        new_status, new_retry = "pending", task.retry_count + 1
 
     updated_subtasks = []
     for t in subtasks:
         if t.id == task.id:
             updated_subtasks.append(t.model_copy(update={
-                "status": "done",
+                "status": new_status,
+                "retry_count": new_retry,
             }))
         else:
             updated_subtasks.append(t)
@@ -325,9 +332,10 @@ def _create_pass_result(state: GraphState, task: SubTask, reason: str) -> dict:
         "subtasks": updated_subtasks,
         "phase": "reviewing",
         "execution_log": [{
-            "event": "review_fallback_pass",
+            "event": "review_fail_closed",
             "task_id": task.id,
             "reason": reason,
+            "retry_count": new_retry,
             "timestamp": datetime.now().isoformat(),
         }],
     }

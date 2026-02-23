@@ -113,8 +113,7 @@ async def reflector_v2_node(state: GraphState) -> dict:
         else:
             updated_subtasks.append(t)
 
-    # 同步更新专家 subagent 的 system_prompt
-    _update_specialist_prompts(current, improvement)
+    # 保持 task/session 作用域，不再写回全局专家模板
 
     return {
         "subtasks": updated_subtasks,
@@ -395,31 +394,3 @@ def _create_simple_improvement(state: GraphState, task: SubTask, issues: list[st
     }
 
 
-def _update_specialist_prompts(task: SubTask, reflection: str) -> None:
-    """
-    将反思结果追加到关联专家的 system_prompt
-    """
-    if not task.assigned_agents:
-        return
-
-    from src.agents.pool_registry import get_pool
-    pool = get_pool()
-
-    note = (
-        f"\n\n## 经验补丁（来源于第 {task.retry_count + 1} 次多角度反思）\n"
-        f"任务: {task.title}\n"
-        f"{reflection}\n"
-        f"---\n"
-    )
-
-    for agent_id in task.assigned_agents:
-        template = pool.get_template(agent_id)
-        if template and template.content:
-            updated_content = template.content + note
-            pool.fill_agent(
-                agent_id=agent_id,
-                name=template.name or agent_id,
-                description=template.description or "",
-                content=updated_content,
-                tools=template.tools or [],
-            )
