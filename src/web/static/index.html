@@ -120,7 +120,7 @@
                         <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
                             <span class="task-status" :class="selectedTask.status">{{ selectedTask.status }}</span>
                             <span style="font-size:0.72rem;color:var(--text-4)">{{ selectedTask.time_minutes ? selectedTask.time_minutes + ' min' : '∞' }}</span>
-                            <span style="font-size:0.72rem;color:var(--text-4);font-family:monospace">{{ selectedTask.id.slice(0,8) }}</span>
+                            <span style="font-size:0.72rem;color:var(--text-4);font-family:monospace">{{ String(selectedTask?.id || '').slice(0,8) }}</span>
                         </div>
                     </div>
                     <div class="task-detail-body">
@@ -444,7 +444,7 @@
                     </div>
                     <div class="terminal-input-row">
                         <span class="term-prompt">
-                            {{ selectedTask ? selectedTask.id.slice(0,8) : 'system' }} $
+                            {{ String(selectedTask?.id || 'system').slice(0,8) }} $
                         </span>
                         <input
                             v-model="terminalInput"
@@ -511,13 +511,18 @@
                     </div>
                 </div>
                 <div class="card" style="display: flex; flex-direction: column;">
-                    <div class="card-header">
+                    <div class="card-header discussion-header">
                         <span class="card-title">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                             </svg>
                             Discussion
                         </span>
+                        <div class="discussion-context-chips" v-if="selectedSubtask">
+                            <span class="status-chip">{{ discussionStatus.nodeId ? discussionStatus.nodeId.slice(0, 8) : 'no-node' }}</span>
+                            <span class="status-chip" :class="discussionStatus.nodeStatus">{{ discussionStatus.nodeStatus || 'idle' }}</span>
+                            <span class="status-chip">p: {{ discussionStatus.participantCount || 0 }}</span>
+                        </div>
                     </div>
 
                     <template v-if="selectedSubtask">
@@ -529,7 +534,7 @@
                                         <span class="message-sender">{{ msg.from_agent }}</span>
                                         <span class="message-time">{{ formatTime(msg.timestamp) }}</span>
                                     </div>
-                                    <div class="message-text">{{ msg.content }}</div>
+                                    <div class="message-text markdown" v-html="renderMd(msg.content)"></div>
                                 </div>
                             </div>
                             <div v-if="discussionMessages.length === 0" class="empty" style="padding: 20px;">
@@ -557,6 +562,78 @@
                         </svg>
                         <p class="empty-title">Select subtask</p>
                         <p class="empty-desc">View discussion here</p>
+                    </div>
+                </div>
+
+                <div class="card status-report-card">
+                    <div class="card-header">
+                        <span class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M3 3h18v4H3z"/>
+                                <path d="M3 11h18v10H3z"/>
+                                <path d="M7 15h4M7 18h8"/>
+                            </svg>
+                            Status Report
+                        </span>
+                    </div>
+                    <div class="card-body status-report-body">
+                        <div class="status-kv-grid">
+                            <div class="status-kv-item">
+                                <span class="k">System</span>
+                                <span class="v status-chip" :class="systemStatus">{{ getStatusText(systemStatus) }}</span>
+                            </div>
+                            <div class="status-kv-item">
+                                <span class="k">WS</span>
+                                <span class="v status-chip" :class="wsConnected ? 'success' : 'warn'">{{ wsConnected ? 'Connected' : 'Offline' }}</span>
+                            </div>
+                            <div class="status-kv-item">
+                                <span class="k">Global Node</span>
+                                <span class="v">{{ currentNode || '-' }}</span>
+                            </div>
+                        </div>
+
+                        <div class="status-section">
+                            <div class="status-section-title">Current Node Execution</div>
+                            <div class="status-kv-grid">
+                                <div class="status-kv-item"><span class="k">Task</span><span class="v">{{ discussionStatus.taskId ? discussionStatus.taskId.slice(0, 8) : '-' }}</span></div>
+                                <div class="status-kv-item"><span class="k">Node</span><span class="v">{{ discussionStatus.nodeTitle || discussionStatus.nodeId || '-' }}</span></div>
+                                <div class="status-kv-item"><span class="k">Status</span><span class="v status-chip" :class="discussionStatus.nodeStatus">{{ discussionStatus.nodeStatus || 'idle' }}</span></div>
+                                <div class="status-kv-item"><span class="k">Phase</span><span class="v">{{ discussionStatus.phase || '-' }}</span></div>
+                                <div class="status-kv-item"><span class="k">Updated</span><span class="v">{{ formatTime(discussionStatus.lastUpdated) || '-' }}</span></div>
+                            </div>
+                        </div>
+
+                        <div class="status-section">
+                            <div class="status-section-title">Participation</div>
+                            <div class="status-kv-grid">
+                                <div class="status-kv-item"><span class="k">Participants</span><span class="v">{{ discussionStatus.participantCount || 0 }}</span></div>
+                                <div class="status-kv-item"><span class="k">Messages</span><span class="v">{{ discussionStatus.messagesCount || 0 }}</span></div>
+                                <div class="status-kv-item"><span class="k">Latest Speaker</span><span class="v">{{ discussionStatus.latestSpeaker || '-' }}</span></div>
+                                <div class="status-kv-item"><span class="k">Queued</span><span class="v">{{ discussionStatus.interventionsQueued || 0 }}</span></div>
+                                <div class="status-kv-item"><span class="k">Applied</span><span class="v">{{ discussionStatus.interventionsApplied || 0 }}</span></div>
+                            </div>
+                        </div>
+
+                        <div class="status-section">
+                            <div class="status-section-title status-section-head">
+                                <span>Timeline</span>
+                                <select class="timeline-filter" v-model="timelineScope">
+                                    <option value="selected">Selected Task</option>
+                                    <option value="all">All</option>
+                                </select>
+                            </div>
+                            <div class="status-timeline">
+                                <div class="status-timeline-item" v-for="evt in filteredTimeline.slice(0, 12)" :key="evt.id">
+                                    <span class="t-time">{{ formatTime(evt.tsMs) }}</span>
+                                    <span class="status-chip t-kind" :class="[evt.kind, evt.level]">{{ evt.kind }}</span>
+                                    <div class="t-main">
+                                        <span class="t-title">{{ evt.title }}</span>
+                                        <span class="t-detail" v-if="evt.detail">{{ evt.detail }}</span>
+                                    </div>
+                                </div>
+                                <div v-if="filteredTimeline.length === 0" class="status-timeline-empty">No recent status events</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </aside>

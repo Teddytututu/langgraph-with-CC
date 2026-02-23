@@ -1505,7 +1505,232 @@ body {
     transform: translateY(-1px);
 }
 
-/* ========== 弹窗 ========== */
+/* ========== Discussion + Status Report ========== */
+.discussion-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.discussion-context-chips {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.status-report-card {
+    min-height: auto !important;
+}
+
+.status-report-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.status-section {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+}
+
+.status-section-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-3);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.status-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.timeline-filter {
+    min-width: 110px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-elevated);
+    color: var(--text-2);
+    font-size: 0.7rem;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+.status-kv-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+}
+
+.status-kv-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.78rem;
+}
+
+.status-kv-item .k {
+    color: var(--text-4);
+    flex-shrink: 0;
+}
+
+.status-kv-item .v {
+    color: var(--text-1);
+    text-align: right;
+    word-break: break-word;
+}
+
+.status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.status-chip.running,
+.status-chip.start,
+.status-chip.node {
+    background: var(--blue-bg);
+    border-color: #BFDBFE;
+    color: #1D4ED8;
+}
+
+.status-chip.success,
+.status-chip.done,
+.status-chip.completed {
+    background: var(--success-bg);
+    border-color: #A7F3D0;
+    color: #065F46;
+}
+
+.status-chip.error,
+.status-chip.failed {
+    background: var(--error-bg);
+    border-color: #FECACA;
+    color: #991B1B;
+}
+
+.status-chip.warn,
+.status-chip.warning {
+    background: var(--warning-bg);
+    border-color: #FDE68A;
+    color: #92400E;
+}
+
+.status-chip.idle,
+.status-chip.info {
+    background: var(--bg-elevated);
+    border-color: var(--border);
+    color: var(--text-3);
+}
+
+.status-chip.milestone {
+    background: var(--bg-elevated);
+    border-color: var(--border-2);
+    color: var(--text-2);
+}
+
+.status-chip.progress {
+    background: var(--blue-bg);
+    border-color: #BFDBFE;
+    color: #1D4ED8;
+}
+
+.status-chip.intervention {
+    background: #f3e8ff;
+    border-color: #d8b4fe;
+    color: #7e22ce;
+}
+
+.status-chip.error.t-kind {
+    background: var(--error-bg);
+    border-color: #fecaca;
+    color: #b91c1c;
+}
+
+.status-timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.status-timeline::-webkit-scrollbar { width: 4px; }
+.status-timeline::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.status-timeline-item {
+    display: grid;
+    grid-template-columns: 64px auto 1fr;
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-elevated);
+}
+
+.status-timeline-item .t-time {
+    font-size: 0.72rem;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap;
+    line-height: 1.3;
+    padding-top: 2px;
+}
+
+.status-timeline-item .t-kind {
+    min-width: 82px;
+    justify-content: center;
+}
+
+.status-timeline-item .t-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.status-timeline-item .t-title {
+    font-size: 0.79rem;
+    color: var(--text-1);
+    line-height: 1.35;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.status-timeline-item .t-detail {
+    font-size: 0.72rem;
+    color: var(--text-3);
+    line-height: 1.35;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.status-timeline-empty {
+    font-size: 0.75rem;
+    color: var(--text-4);
+    padding: 8px 4px;
+}
+
 .modal-backdrop {
     position: fixed;
     inset: 0;

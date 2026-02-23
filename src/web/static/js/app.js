@@ -43,12 +43,31 @@ createApp({
         // State
         const wsConnected = ref(false);
         const systemStatus = ref('idle');
+        const currentTaskId = ref('');
         const currentNode = ref('');
         const tasks = ref([]);
         const selectedTask = ref(null);
         const selectedSubtask = ref(null);
         const discussionMessages = ref([]);
         const discussionParticipants = ref([]);
+        const discussionStatus = ref({
+            taskId: '',
+            nodeId: '',
+            nodeTitle: '',
+            nodeStatus: 'idle',
+            phase: '',
+            lastUpdated: '',
+            messagesCount: 0,
+            participantCount: 0,
+            latestSpeaker: '',
+            interventionsQueued: 0,
+            interventionsApplied: 0,
+        });
+        const statusTimeline = ref([]);
+        const timelineScope = ref('selected');
+        const STATUS_TIMELINE_LIMIT = 300;
+        const timelineIdSet = new Set();
+        const lastSystemStatusForTimeline = ref('');
         const mermaidSvg = ref('');
         const rawMermaid = ref('');  // 缓存后端基础图结构，避免重复请求
         const showNewTask = ref(false);
@@ -57,6 +76,88 @@ createApp({
         const chatMessages = ref([]);
         const chatInput = ref('');
         const chatThinking = ref(false);
+
+        const parseTimestampToMs = (value) => {
+            if (value === null || value === undefined || value === '') return Date.now();
+            if (typeof value === 'number' && Number.isFinite(value)) {
+                return value < 1e12 ? value * 1000 : value;
+            }
+            const text = String(value).trim();
+            if (!text) return Date.now();
+
+            if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(text)) {
+                const [h, m, s = '0'] = text.split(':').map(n => Number(n));
+                if ([h, m, s].every(n => Number.isFinite(n))) {
+                    const now = new Date();
+                    now.setHours(h, m, s, 0);
+                    return now.getTime();
+                }
+            }
+
+            const parsed = Date.parse(text);
+            return Number.isNaN(parsed) ? Date.now() : parsed;
+        };
+
+        const formatTimestampHHMMSS = (value) => {
+            if (value === null || value === undefined || value === '') return '';
+            const tsMs = parseTimestampToMs(value);
+            return new Date(tsMs).toLocaleTimeString('zh-CN', {
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            });
+        };
+
+        const buildTimelineId = ({ sourceEvent, taskId, node, kind, title, detail }) => {
+            return [sourceEvent || '', taskId || '', node || '', kind || '', title || '', detail || ''].join('|');
+        };
+
+        const addTimelineItem = ({
+            id,
+            ts,
+            taskId = '',
+            node = '',
+            kind = 'milestone',
+            level = 'info',
+            title = '',
+            detail = '',
+            sourceEvent = '',
+        }) => {
+            const itemId = id || buildTimelineId({ sourceEvent, taskId, node, kind, title, detail });
+            if (timelineIdSet.has(itemId)) return;
+
+            const tsMs = parseTimestampToMs(ts);
+            const item = {
+                id: itemId,
+                tsMs,
+                taskId,
+                node,
+                kind,
+                level,
+                title,
+                detail,
+                sourceEvent,
+            };
+
+            statusTimeline.value.unshift(item);
+            timelineIdSet.add(itemId);
+
+            if (statusTimeline.value.length > STATUS_TIMELINE_LIMIT) {
+                const removed = statusTimeline.value.splice(STATUS_TIMELINE_LIMIT);
+                removed.forEach(evt => timelineIdSet.delete(evt.id));
+            }
+        };
+
+        const filteredTimeline = computed(() => {
+            const mode = timelineScope.value;
+            const selectedId = selectedTask.value?.id;
+            const list = !selectedId || mode === 'all'
+                ? statusTimeline.value
+                : statusTimeline.value.filter(evt => evt.taskId === selectedId);
+
+            return [...list].sort((a, b) => b.tsMs - a.tsMs);
+        });
 
         const newTask = ref({ task: '', time_minutes: null });
         const newMessage = ref({ from_agent: 'director', content: '' });
@@ -117,7 +218,22 @@ createApp({
             return [{ value: 'user', label: 'User' }, ...agents];
         });
 
-        // WebSocket
+        const refreshDiscussionStatusFromSelection = () => {
+            const sub = selectedSubtask.value;
+            const task = selectedTask.value;
+            const latestMessage = discussionMessages.value[discussionMessages.value.length - 1];
+
+            discussionStatus.value = {
+                ...discussionStatus.value,
+                taskId: task?.id || '',
+                nodeId: sub?.id || '',
+                nodeTitle: sub?.title || '',
+                nodeStatus: sub?.status || 'idle',
+                messagesCount: discussionMessages.value.length,
+                participantCount: discussionParticipants.value.length,
+                latestSpeaker: latestMessage?.from_agent || '',
+            };
+        };
         let ws = null;
         let _wsEverConnected = false;
 
@@ -143,25 +259,69 @@ createApp({
         };
 
         const handleWSMessage = (data) => {
-            const { event, data: payload } = data;
+            const event = data?.event;
+            const payload = data?.data || {};
 
             switch (event) {
-                case 'system_status_changed':
+                case 'system_status_changed': {
                     systemStatus.value = payload.status;
-                    termLog(`▶ System → ${payload.status}${ payload.task ? ': '+payload.task.slice(0,60) : '' }`, 'start');
+                    const prev = lastSystemStatusForTimeline.value;
+                    if (payload.status && payload.status !== prev) {
+                        addTimelineItem({
+                            id: `system|${payload.status}`,
+                            ts: payload.ts,
+                            taskId: payload.task_id || '',
+                            node: payload.node || '',
+                            kind: 'milestone',
+                            level: payload.status === 'failed' ? 'error' : 'info',
+                            title: `系统状态 ${payload.status}`,
+                            detail: payload.task ? `任务: ${payload.task}` : '',
+                            sourceEvent: 'system_status_changed',
+                        });
+                        lastSystemStatusForTimeline.value = payload.status;
+                    }
+                    termLog(`▶ System → ${payload.status}${payload.task ? ': ' + payload.task.slice(0, 60) : ''}`, 'start');
                     fetchGraph();
                     break;
-                case 'node_changed':
+                }
+                case 'node_changed': {
                     currentNode.value = payload.node;
-                    // 后端动态图内容随节点变化，需重新 fetch
+                    addTimelineItem({
+                        id: `node_changed|${payload.task_id || ''}|${payload.node || ''}|${payload.ts || ''}`,
+                        ts: payload.ts,
+                        taskId: payload.task_id || selectedTask.value?.id || '',
+                        node: payload.node || '',
+                        kind: 'milestone',
+                        level: 'running',
+                        title: `进入节点 ${payload.node || '-'}`,
+                        detail: payload.phase ? `Phase -> ${payload.phase}` : '',
+                        sourceEvent: 'node_changed',
+                    });
                     fetchGraph();
                     break;
+                }
                 case 'terminal_output':
                     termLog(payload.line, payload.level || 'info', payload.ts);
+                    if (
+                        (payload.level === 'warn' || payload.level === 'error') &&
+                        selectedTask.value?.id &&
+                        payload.task_id === selectedTask.value.id
+                    ) {
+                        addTimelineItem({
+                            id: `terminal|${payload.task_id}|${payload.level}|${payload.ts}|${payload.line || ''}`,
+                            ts: payload.ts,
+                            taskId: payload.task_id,
+                            node: payload.node || '',
+                            kind: 'error',
+                            level: payload.level,
+                            title: payload.level === 'error' ? '终端错误' : '终端警告',
+                            detail: (payload.line || '').slice(0, 160),
+                            sourceEvent: 'terminal_output',
+                        });
+                    }
                     break;
                 case 'task_created':
                     if (!tasks.value.find(t => t.id === payload.id)) tasks.value.unshift(payload);
-                    // 新任务开始，清空旧报告
                     reports.value = [];
                     activeReport.value = '';
                     activeReportContent.value = '';
@@ -169,18 +329,53 @@ createApp({
                     break;
                 case 'task_started':
                     mergeTasks([{ id: payload.id, status: 'running' }]);
+                    addTimelineItem({
+                        id: `task_started|${payload.id}|${payload.ts || ''}`,
+                        ts: payload.ts,
+                        taskId: payload.id,
+                        node: payload.node || '',
+                        kind: 'milestone',
+                        level: 'start',
+                        title: '任务开始执行',
+                        detail: payload.id,
+                        sourceEvent: 'task_started',
+                    });
                     termLog(`▶ 任务启动: ${payload.id}`, 'start');
+                    refreshDiscussionStatusFromSelection();
                     break;
                 case 'task_progress':
                     handleTaskProgress(payload);
                     break;
                 case 'task_completed':
                     handleTaskCompleted(payload);
+                    addTimelineItem({
+                        id: `task_completed|${payload.id}|${payload.finished_at || payload.ts || ''}`,
+                        ts: payload.finished_at || payload.ts,
+                        taskId: payload.id,
+                        node: payload.node || '',
+                        kind: 'milestone',
+                        level: 'success',
+                        title: '任务已完成',
+                        detail: payload.id,
+                        sourceEvent: 'task_completed',
+                    });
                     termLog(`✓ 任务完成: ${payload.id}`, 'success');
                     break;
                 case 'task_failed':
                     mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
+                    addTimelineItem({
+                        id: `task_failed|${payload.id}|${payload.ts || ''}|${payload.error || ''}`,
+                        ts: payload.ts,
+                        taskId: payload.id,
+                        node: payload.node || '',
+                        kind: 'error',
+                        level: 'error',
+                        title: '任务执行失败',
+                        detail: payload.error || '',
+                        sourceEvent: 'task_failed',
+                    });
                     termLog(`✗ 任务失败: ${payload.error}`, 'error');
+                    refreshDiscussionStatusFromSelection();
                     break;
                 case 'task_intervened': {
                     const t = tasks.value.find(t => t.id === payload.task_id);
@@ -188,10 +383,47 @@ createApp({
                         if (!t.interventions) t.interventions = [];
                         t.interventions.push({ content: payload.instruction, timestamp: payload.timestamp });
                     }
+                    if (selectedTask.value?.id === payload.task_id) {
+                        discussionStatus.value = {
+                            ...discussionStatus.value,
+                            interventionsQueued: (discussionStatus.value.interventionsQueued || 0) + 1,
+                            lastUpdated: payload.timestamp || new Date().toISOString(),
+                        };
+                    }
+                    addTimelineItem({
+                        id: `task_intervened|${payload.task_id}|${payload.timestamp || ''}|${payload.instruction || ''}`,
+                        ts: payload.timestamp,
+                        taskId: payload.task_id || '',
+                        node: payload.node_id || '',
+                        kind: 'intervention',
+                        level: 'warn',
+                        title: '干预已排队',
+                        detail: (payload.instruction || '').slice(0, 120),
+                        sourceEvent: 'task_intervened',
+                    });
                     termLog(`⚡ [USER] $ ${payload.instruction}`, 'input');
                     break;
                 }
                 case 'task_intervention_applied':
+                    if (selectedTask.value?.id === payload.task_id || !payload.task_id) {
+                        const applied = payload.instructions?.length || 1;
+                        discussionStatus.value = {
+                            ...discussionStatus.value,
+                            interventionsApplied: (discussionStatus.value.interventionsApplied || 0) + applied,
+                            lastUpdated: payload.ts || new Date().toISOString(),
+                        };
+                    }
+                    addTimelineItem({
+                        id: `task_intervention_applied|${payload.task_id || ''}|${payload.ts || ''}|${(payload.instructions || []).join('|')}`,
+                        ts: payload.ts,
+                        taskId: payload.task_id || selectedTask.value?.id || '',
+                        node: payload.node_id || '',
+                        kind: 'intervention',
+                        level: 'success',
+                        title: '干预已应用',
+                        detail: `已注入 ${payload.instructions?.length || 1} 条`,
+                        sourceEvent: 'task_intervention_applied',
+                    });
                     termLog(`⚡ 已注入 ${payload.instructions?.length || 1} 条指令`, 'input');
                     break;
                 case 'discussion_message': {
@@ -201,8 +433,23 @@ createApp({
                     ) {
                         const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
                         if (!exists) discussionMessages.value.push(payload.message);
+                        if (payload.message?.from_agent && !discussionParticipants.value.includes(payload.message.from_agent)) {
+                            discussionParticipants.value.push(payload.message.from_agent);
+                        }
+                        refreshDiscussionStatusFromSelection();
                     }
-                    termLog(`💬 [${payload.node_id}] ${payload.message?.content?.slice(0,60)}`, 'info');
+                    addTimelineItem({
+                        id: `discussion_message|${payload.task_id || ''}|${payload.node_id || ''}|${payload.message?.id || ''}`,
+                        ts: payload.message?.timestamp,
+                        taskId: payload.task_id || '',
+                        node: payload.node_id || '',
+                        kind: 'milestone',
+                        level: 'info',
+                        title: `讨论消息 · ${payload.message?.from_agent || 'unknown'}`,
+                        detail: (payload.message?.content || '').slice(0, 120),
+                        sourceEvent: 'discussion_message',
+                    });
+                    termLog(`💬 [${payload.node_id}] ${payload.message?.content?.slice(0, 60)}`, 'info');
                     break;
                 }
                 case 'chat_reply': {
@@ -218,6 +465,25 @@ createApp({
                 case 'tasks_cleared':
                     tasks.value = [];
                     selectedTask.value = null;
+                    selectedSubtask.value = null;
+                    discussionMessages.value = [];
+                    discussionParticipants.value = [];
+                    discussionStatus.value = {
+                        taskId: '',
+                        nodeId: '',
+                        nodeTitle: '',
+                        nodeStatus: 'idle',
+                        phase: '',
+                        lastUpdated: '',
+                        messagesCount: 0,
+                        participantCount: 0,
+                        latestSpeaker: '',
+                        interventionsQueued: 0,
+                        interventionsApplied: 0,
+                    };
+                    statusTimeline.value = [];
+                    timelineIdSet.clear();
+                    lastSystemStatusForTimeline.value = '';
                     terminalLines.value = [];
                     reports.value = [];
                     activeReport.value = '';
@@ -241,6 +507,10 @@ createApp({
         const handleTaskProgress = (payload) => {
             const task = tasks.value.find(t => t.id === payload.task_id);
             if (!task) return;
+
+            let totalSubtasks = task.subtasks?.length || 0;
+            let completedSubtasks = task.subtasks?.filter(s => s.status === 'done' || s.status === 'completed').length || 0;
+
             if (payload.subtasks) {
                 // 合并子任务数据而不是直接覆盖，保留 description/result 等完整字段
                 const incomingMap = new Map(payload.subtasks.map(s => [s.id, s]));
@@ -270,16 +540,83 @@ createApp({
                     }
                 });
 
+                totalSubtasks = task.subtasks.length;
+                completedSubtasks = task.subtasks.filter(s => s.status === 'done' || s.status === 'completed').length;
+
                 // 只在状态变化时才重绘图（防抖 500ms，避免频繁刷新导致页面跳动）
                 if (hasRealChange) {
                     if (_graphDebounceTimer) clearTimeout(_graphDebounceTimer);
                     _graphDebounceTimer = setTimeout(() => fetchGraph(), 500);
                 }
             }
-            if (payload.result) task.result = payload.result;
+
+            if (Object.prototype.hasOwnProperty.call(payload, 'result')) {
+                task.result = payload.result;
+            }
             // Force selectedTask reactivity refresh when subtasks change
             if (payload.subtasks && selectedTask.value?.id === payload.task_id) {
                 selectedTask.value = task;
+            }
+
+            const phase = payload.phase || payload.current_phase || payload.stage || '';
+            if (phase) {
+                addTimelineItem({
+                    id: `task_progress_phase|${payload.task_id}|${phase}|${payload.updated_at || payload.ts || ''}`,
+                    ts: payload.updated_at || payload.ts,
+                    taskId: payload.task_id,
+                    node: payload.node_id || selectedSubtask.value?.id || '',
+                    kind: 'progress',
+                    level: 'running',
+                    title: `Phase -> ${phase}`,
+                    detail: totalSubtasks ? `子任务完成 ${completedSubtasks}/${totalSubtasks}` : '',
+                    sourceEvent: 'task_progress',
+                });
+            }
+
+            if (totalSubtasks > 0) {
+                addTimelineItem({
+                    id: `task_progress_ratio|${payload.task_id}|${completedSubtasks}|${totalSubtasks}`,
+                    ts: payload.updated_at || payload.ts,
+                    taskId: payload.task_id,
+                    node: payload.node_id || selectedSubtask.value?.id || '',
+                    kind: 'progress',
+                    level: 'info',
+                    title: `子任务完成 ${completedSubtasks}/${totalSubtasks}`,
+                    detail: phase ? `Phase -> ${phase}` : '',
+                    sourceEvent: 'task_progress',
+                });
+            }
+
+            const selectedNode = selectedSubtask.value
+                ? task.subtasks?.find(s => s.id === selectedSubtask.value.id)
+                : null;
+            if (selectedNode) {
+                selectedSubtask.value = selectedNode;
+                discussionStatus.value = {
+                    ...discussionStatus.value,
+                    taskId: task.id,
+                    nodeId: selectedNode.id,
+                    nodeTitle: selectedNode.title || discussionStatus.value.nodeTitle,
+                    nodeStatus: selectedNode.status || discussionStatus.value.nodeStatus,
+                    phase: phase || discussionStatus.value.phase,
+                    lastUpdated: payload.updated_at || payload.ts || new Date().toISOString(),
+                };
+
+                addTimelineItem({
+                    id: `task_progress_node|${payload.task_id}|${selectedNode.id}|${selectedNode.status || ''}|${payload.updated_at || payload.ts || ''}`,
+                    ts: payload.updated_at || payload.ts,
+                    taskId: payload.task_id,
+                    node: selectedNode.id,
+                    kind: 'progress',
+                    level: selectedNode.status === 'failed'
+                        ? 'error'
+                        : (selectedNode.status === 'done' || selectedNode.status === 'completed' ? 'success' : 'running'),
+                    title: `进入节点 ${selectedNode.title || selectedNode.id}`,
+                    detail: selectedNode.status ? `状态: ${selectedNode.status}` : '',
+                    sourceEvent: 'task_progress',
+                });
+
+                refreshDiscussionStatusFromSelection();
             }
         };
 
@@ -293,6 +630,19 @@ createApp({
             if (selectedTask.value?.id === payload.id) {
                 selectedTask.value = task;
             }
+            if (selectedTask.value?.id === payload.id && selectedSubtask.value) {
+                const selectedNode = task.subtasks?.find(s => s.id === selectedSubtask.value.id);
+                if (selectedNode) {
+                    selectedSubtask.value = selectedNode;
+                    discussionStatus.value = {
+                        ...discussionStatus.value,
+                        nodeStatus: selectedNode.status || 'completed',
+                        phase: 'completed',
+                        lastUpdated: payload.finished_at || payload.ts || new Date().toISOString(),
+                    };
+                    refreshDiscussionStatusFromSelection();
+                }
+            }
             fetchGraph();
             fetchReports();
         };
@@ -301,6 +651,9 @@ createApp({
         const fetchTasks = async () => {
             try {
                 const res = await fetch('/api/tasks');
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
                 const data = await res.json();
                 const incoming = data.tasks || [];
 
@@ -373,10 +726,12 @@ createApp({
         let _terminalRestored = false;
         const fetchSystemStatus = async (restoreTerminal = false) => {
             try {
-                const res = await fetch('/api/system/status');
+                const url = restoreTerminal ? '/api/system/status?include_terminal=1' : '/api/system/status';
+                const res = await fetch(url);
                 const data = await res.json();
                 systemStatus.value = data.status;
                 currentNode.value = data.current_node || '';
+                currentTaskId.value = data.current_task_id || '';
                 // 刷新后一次性恢复终端日志
                 if (restoreTerminal && !_terminalRestored && data.terminal_log?.length) {
                     _terminalRestored = true;
@@ -395,6 +750,12 @@ createApp({
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(newTask.value)
             });
+            if (!res.ok) {
+                const msg = `创建任务失败: HTTP ${res.status}`;
+                termLog(`✗ ${msg}`, 'error');
+                alert(msg);
+                return;
+            }
             const data = await res.json();
             showNewTask.value = false;
             newTask.value = { task: '', time_minutes: null };
@@ -406,13 +767,19 @@ createApp({
 
         const sendTerminalCmd = () => {
             if (!terminalInput.value.trim()) return;
-            const task_id = selectedTask.value?.id || app_state_task_id;
+            const task_id = selectedTask.value?.id || currentTaskId.value || '';
+            if (!task_id) {
+                termLog('⚠ 无可用任务上下文，请先选择任务或等待任务启动', 'warn');
+                return;
+            }
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     type: 'terminal_input',
-                    task_id: task_id || '',
+                    task_id,
                     command: terminalInput.value.trim(),
                 }));
+            } else {
+                termLog('✗ WebSocket 未连接，无法发送指令', 'error');
             }
             terminalInput.value = '';
         };
@@ -506,6 +873,20 @@ createApp({
             selectedTask.value = task;
             selectedSubtask.value = null;
             discussionMessages.value = [];
+            discussionParticipants.value = [];
+            discussionStatus.value = {
+                taskId: task?.id || '',
+                nodeId: '',
+                nodeTitle: '',
+                nodeStatus: 'idle',
+                phase: '',
+                lastUpdated: '',
+                messagesCount: 0,
+                participantCount: 0,
+                latestSpeaker: '',
+                interventionsQueued: 0,
+                interventionsApplied: 0,
+            };
             // Refresh from API to ensure result/subtasks are up to date
             try {
                 const res = await fetch(`/api/tasks/${task.id}`);
@@ -517,6 +898,7 @@ createApp({
             } catch (e) {
                 console.error('selectTask: failed to refresh task', task.id, e);
             }
+            refreshDiscussionStatusFromSelection();
             // 加载报告
             await fetchReports();
         };
@@ -527,6 +909,15 @@ createApp({
             newMessage.value.from_agent =
                 subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
             discussionParticipants.value = [];
+            discussionStatus.value = {
+                ...discussionStatus.value,
+                taskId: selectedTask.value?.id || '',
+                nodeId: subtask?.id || '',
+                nodeTitle: subtask?.title || '',
+                nodeStatus: subtask?.status || 'idle',
+                phase: subtask?.phase || subtask?.current_phase || discussionStatus.value.phase || '',
+                lastUpdated: subtask?.updated_at || subtask?.finished_at || subtask?.started_at || '',
+            };
             if (selectedTask.value) {
                 try {
                     const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${subtask.id}/discussion`);
@@ -543,6 +934,18 @@ createApp({
                     discussionMessages.value = [];
                 }
             }
+            refreshDiscussionStatusFromSelection();
+            addTimelineItem({
+                id: `selection|${selectedTask.value?.id || ''}|${subtask.id}|${subtask.status || ''}`,
+                ts: subtask?.updated_at || subtask?.started_at || new Date().toISOString(),
+                taskId: selectedTask.value?.id || '',
+                node: subtask.id,
+                kind: 'milestone',
+                level: 'info',
+                title: `进入节点 ${subtask.title || subtask.id}`,
+                detail: subtask.status ? `状态: ${subtask.status}` : '',
+                sourceEvent: 'selection',
+            });
         };
 
         const sendMessage = async () => {
@@ -557,6 +960,18 @@ createApp({
             if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
                 discussionMessages.value.push(saved);
             }
+            refreshDiscussionStatusFromSelection();
+            addTimelineItem({
+                id: `discussion_local|${selectedTask.value?.id || ''}|${selectedSubtask.value?.id || ''}|${saved?.id || saved?.timestamp || newMessage.value.content}`,
+                ts: saved?.timestamp || new Date().toISOString(),
+                taskId: selectedTask.value?.id || '',
+                node: selectedSubtask.value?.id || '',
+                kind: 'milestone',
+                level: 'info',
+                title: `讨论消息 · ${saved?.from_agent || newMessage.value.from_agent}`,
+                detail: (saved?.content || newMessage.value.content || '').slice(0, 120),
+                sourceEvent: 'discussion_message',
+            });
             newMessage.value.content = '';
         };
 
@@ -608,7 +1023,7 @@ createApp({
 
         // Utils
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
-        const formatTime = (t) => t ? new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '';
+        const formatTime = (t) => formatTimestampHHMMSS(t);
         const renderMd = (text) => {
             if (!text) return '';
             try { return marked.parse(text, { breaks: true, gfm: true }); }
@@ -626,6 +1041,10 @@ createApp({
             if (!selectedTask.value && tasks.value.length) {
                 const running = tasks.value.find(t => t.status === 'running');
                 selectedTask.value = running || tasks.value[0];
+                discussionStatus.value = {
+                    ...discussionStatus.value,
+                    taskId: selectedTask.value?.id || '',
+                };
             }
 
             if (!_terminalRestored) termLog('System ready. Waiting for tasks…', 'info');
@@ -638,12 +1057,13 @@ createApp({
                 await fetchSystemStatus();
                 await fetchTasks();
                 await fetchGraph();
+                refreshDiscussionStatusFromSelection();
             }, 5000);
         });
 
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
-            discussionMessages, discussionParticipants, mermaidSvg, isDynamicGraph, showNewTask, newTask, newMessage,
+            discussionMessages, discussionParticipants, discussionStatus, statusTimeline, filteredTimeline, timelineScope, mermaidSvg, isDynamicGraph, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             stats, getCompletedSubtasks, discussionAgents,
