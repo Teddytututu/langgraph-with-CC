@@ -683,6 +683,46 @@ def register_routes(app: FastAPI):
         normalized["subtasks"] = _normalize_subtasks_for_api(normalized.get("subtasks") or [])
         return normalized
 
+    def _iter_subtask_discussion_mappings(task: dict[str, Any]) -> list[tuple[str, str]]:
+        """返回 (subtask_id, canonical_node_id) 列表。"""
+        mappings: list[tuple[str, str]] = []
+        for st in _normalize_subtasks_for_api((task or {}).get("subtasks") or []):
+            subtask_id = str(st.get("id") or "").strip()
+            if not subtask_id:
+                continue
+            canonical_node_id = ""
+            for key in ("discussion_node_id", "canonical_node_id", "node_id", "graph_node_id"):
+                val = str(st.get(key) or "").strip()
+                if val:
+                    canonical_node_id = val
+                    break
+            mappings.append((subtask_id, canonical_node_id or subtask_id))
+        return mappings
+
+    def _resolve_discussion_node_id(task: dict[str, Any], requested_node_id: str) -> tuple[str, str]:
+        """将 UI subtask.id / canonical node_id 解析为 canonical node_id，并返回对应 subtask_id。"""
+        requested = str(requested_node_id or "").strip()
+        if not requested:
+            return "", ""
+
+        mappings = _iter_subtask_discussion_mappings(task)
+
+        # 1) 用户传入 UI subtask.id：优先映射到 canonical node_id
+        for subtask_id, canonical_node_id in mappings:
+            if requested == subtask_id:
+                return canonical_node_id, subtask_id
+
+        # 2) 用户已传入 canonical node_id：保留 canonical，并回填 subtask_id
+        for subtask_id, canonical_node_id in mappings:
+            if requested == canonical_node_id:
+                return canonical_node_id, subtask_id
+
+        # 3) 回退：按原值处理（兼容老数据）
+        return requested, requested
+
+    def _discussion_manager_key(task_id: str, node_id: str) -> str:
+        return f"{task_id}_{node_id}"
+
     @app.get("/api/tasks")
     async def list_tasks():
         """获取任务列表"""
@@ -922,11 +962,17 @@ def register_routes(app: FastAPI):
         node_id: str,
         message: Any,
         emit_terminal: bool = True,
+        subtask_id: str = "",
     ):
         msg_dict = message.to_dict() if hasattr(message, "to_dict") else dict(message or {})
+        resolved_subtask_id = str(subtask_id or "").strip()
+        if not resolved_subtask_id:
+            task = app_state.tasks.get(task_id) or {}
+            _, resolved_subtask_id = _resolve_discussion_node_id(task, node_id)
         await app_state.broadcast("discussion_message", {
             "task_id": task_id,
             "node_id": node_id,
+            "subtask_id": resolved_subtask_id,
             "message": msg_dict,
         })
 
@@ -1390,9 +1436,11 @@ def register_routes(app: FastAPI):
                             existing.consensus_topic = getattr(node_disc, "consensus_topic", None)
 
                             for synced in new_messages:
+                                _, mapped_subtask_id = _resolve_discussion_node_id(task, node_id)
                                 await _emit_discussion_message(
                                     task_id=task_id,
                                     node_id=node_id,
+                                    subtask_id=mapped_subtask_id,
                                     message=synced,
                                 )
 
@@ -1796,11 +1844,23 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
 
-        discussion_key = f"{task_id}_{node_id}"
+        task = app_state.tasks.get(task_id) or {}
+        resolved_node_id, resolved_subtask_id = _resolve_discussion_node_id(task, node_id)
+        discussion_key = _discussion_manager_key(task_id, resolved_node_id)
         discussion = app_state.discussion_manager.get_discussion(discussion_key)
         if discussion:
-            return discussion.to_dict()
-        return {"node_id": node_id, "messages": [], "participants": []}
+            data = discussion.to_dict()
+            data["node_id"] = resolved_node_id
+            data["resolved_node_id"] = resolved_node_id
+            data["subtask_id"] = resolved_subtask_id
+            return data
+        return {
+            "node_id": resolved_node_id,
+            "subtask_id": resolved_subtask_id,
+            "resolved_node_id": resolved_node_id,
+            "messages": [],
+            "participants": [],
+        }
 
     @app.post("/api/tasks/{task_id}/nodes/{node_id}/discussion")
     async def post_message(task_id: str, node_id: str, req: MessagePost):
@@ -1808,7 +1868,9 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
 
-        manager_node_id = f"{task_id}_{node_id}"
+        task = app_state.tasks.get(task_id) or {}
+        resolved_node_id, resolved_subtask_id = _resolve_discussion_node_id(task, node_id)
+        manager_node_id = _discussion_manager_key(task_id, resolved_node_id)
         msg = await app_state.discussion_manager.post_message(
             node_id=manager_node_id,
             from_agent=req.from_agent,
@@ -1817,7 +1879,12 @@ def register_routes(app: FastAPI):
             message_type=req.message_type,
         )
 
-        await _emit_discussion_message(task_id=task_id, node_id=node_id, message=msg)
+        await _emit_discussion_message(
+            task_id=task_id,
+            node_id=resolved_node_id,
+            subtask_id=resolved_subtask_id,
+            message=msg,
+        )
 
         async def _auto_reply():
             reply_text = "已收到消息，建议先确认目标与约束，然后我会继续给出下一步执行建议。"
@@ -1828,10 +1895,18 @@ def register_routes(app: FastAPI):
                 to_agents=[req.from_agent] if req.from_agent else [],
                 message_type="response",
             )
-            await _emit_discussion_message(task_id=task_id, node_id=node_id, message=reply_msg)
+            await _emit_discussion_message(
+                task_id=task_id,
+                node_id=resolved_node_id,
+                subtask_id=resolved_subtask_id,
+                message=reply_msg,
+            )
 
         _fire(_auto_reply())
-        return msg.to_dict()
+        payload = msg.to_dict()
+        payload["resolved_node_id"] = resolved_node_id
+        payload["subtask_id"] = resolved_subtask_id
+        return payload
 
     @app.get("/api/discussions/summaries")
     async def get_discussion_summaries():

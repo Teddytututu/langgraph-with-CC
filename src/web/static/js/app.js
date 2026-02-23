@@ -51,6 +51,7 @@ createApp({
         const discussionMessages = ref([]);
         const discussionParticipants = ref([]);
         const discussionCacheByNode = ref({});
+        const discussionNodeIdBySubtask = ref({});
         const discussionStatus = ref({
             taskId: '',
             nodeId: '',
@@ -206,6 +207,24 @@ createApp({
             completedTasks: tasks.value.filter(t => t.status === 'completed').length,
             totalSubtasks: selectedTask.value?.subtasks?.length || 0
         }));
+
+        const pastBigTaskOutputs = computed(() => {
+            const isBigTask = (task) => {
+                const subtaskCount = Array.isArray(task?.subtasks) ? task.subtasks.length : 0;
+                const timeMinutes = Number(task?.time_minutes) || 0;
+                const resultLength = String(task?.result || '').length;
+                return subtaskCount >= 4 || timeMinutes >= 45 || resultLength >= 800;
+            };
+
+            return tasks.value
+                .filter(task => task?.status === 'completed' && !!task?.result && isBigTask(task))
+                .sort((a, b) => {
+                    const aTs = Date.parse(a?.finished_at || a?.created_at || 0) || 0;
+                    const bTs = Date.parse(b?.finished_at || b?.created_at || 0) || 0;
+                    return bTs - aTs;
+                })
+                .slice(0, 5);
+        });
 
         const getCompletedSubtasks = computed(() => {
             if (!selectedTask.value?.subtasks) return 0;
@@ -494,33 +513,46 @@ createApp({
                     termLog(`⚡ 已注入 ${payload.instructions?.length || 1} 条指令`, 'input');
                     break;
                 case 'discussion_message': {
+                    const eventSubtaskId = payload.subtask_id || '';
+                    const eventNodeId = payload.node_id || eventSubtaskId;
                     const cache = upsertDiscussionCache(
                         payload.task_id,
-                        payload.node_id,
+                        eventSubtaskId || eventNodeId,
                         payload.message,
+                    );
+
+                    const selectedId = selectedSubtask.value?.id;
+                    const matchesSelected = (
+                        !!selectedId && (
+                            (eventSubtaskId && selectedId === eventSubtaskId)
+                            || selectedId === eventNodeId
+                        )
                     );
 
                     if (
                         selectedTask.value?.id === payload.task_id &&
-                        selectedSubtask.value?.id === payload.node_id
+                        matchesSelected
                     ) {
                         const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
                         if (!exists) discussionMessages.value.push(payload.message);
                         discussionParticipants.value = cache.participants.slice();
+                        if (eventNodeId && selectedId) {
+                            discussionNodeIdBySubtask.value[selectedId] = eventNodeId;
+                        }
                         refreshDiscussionStatusFromSelection();
                     }
                     addTimelineItem({
-                        id: `discussion_message|${payload.task_id || ''}|${payload.node_id || ''}|${payload.message?.id || ''}`,
+                        id: `discussion_message|${payload.task_id || ''}|${eventSubtaskId || eventNodeId || ''}|${payload.message?.id || ''}`,
                         ts: payload.message?.timestamp,
                         taskId: payload.task_id || '',
-                        node: payload.node_id || '',
+                        node: eventSubtaskId || eventNodeId || '',
                         kind: 'milestone',
                         level: 'info',
                         title: `讨论消息 · ${payload.message?.from_agent || 'unknown'}`,
                         detail: (payload.message?.content || '').slice(0, 120),
                         sourceEvent: 'discussion_message',
                     });
-                    termLog(`💬 [${payload.node_id}] ${payload.message?.content?.slice(0, 60)}`, 'info');
+                    termLog(`💬 [${eventSubtaskId || eventNodeId}] ${payload.message?.content?.slice(0, 60)}`, 'info');
                     break;
                 }
                 case 'chat_reply': {
@@ -541,6 +573,7 @@ createApp({
                     discussionMessages.value = [];
                     discussionParticipants.value = [];
                     discussionCacheByNode.value = {};
+                    discussionNodeIdBySubtask.value = {};
                     discussionStatus.value = {
                         taskId: '',
                         nodeId: '',
@@ -1059,24 +1092,6 @@ createApp({
             }
         };
 
-        const jumpToPastOutput = () => {
-            const hasReports = reports.value.length > 0;
-            const hasOutput = !!selectedTask.value?.result;
-
-            let target = null;
-            if (hasReports) {
-                target = document.getElementById('reports-section');
-            } else if (hasOutput) {
-                target = document.getElementById('output-section');
-            } else {
-                target = document.getElementById('reports-section') || document.getElementById('output-section');
-            }
-
-            if (target) {
-                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }
-        };
-
         const sendChat = async () => {
             const msg = chatInput.value.trim();
             if (!msg || chatThinking.value) return;
@@ -1154,6 +1169,7 @@ createApp({
             discussionMessages.value = [];
             discussionParticipants.value = [];
             discussionCacheByNode.value = {};
+            discussionNodeIdBySubtask.value = {};
             discussionStatus.value = {
                 taskId: task?.id || '',
                 nodeId: '',
@@ -1211,19 +1227,30 @@ createApp({
                         throw new Error(`HTTP ${res.status}`);
                     }
                     const data = await res.json();
+                    const resolvedNodeId = data.resolved_node_id || subtask.id;
+                    discussionNodeIdBySubtask.value[subtask.id] = resolvedNodeId;
+
                     const key = discussionCacheKey(selectedTask.value.id, subtask.id);
+                    const canonicalKey = discussionCacheKey(selectedTask.value.id, resolvedNodeId);
                     const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
-                    const mergedMessages = mergeDiscussionMessages(data.messages || [], cached.messages || []);
+                    const canonicalCached = discussionCacheByNode.value[canonicalKey] || { messages: [], participants: [] };
+                    const mergedMessages = mergeDiscussionMessages(
+                        data.messages || [],
+                        mergeDiscussionMessages(cached.messages || [], canonicalCached.messages || []),
+                    );
                     discussionMessages.value = mergedMessages;
                     const mergedParticipants = Array.from(new Set([
                         ...(data.participants || []),
                         ...(cached.participants || []),
+                        ...(canonicalCached.participants || []),
                     ]));
                     discussionParticipants.value = mergedParticipants;
-                    discussionCacheByNode.value[key] = {
+                    const mergedCache = {
                         messages: mergedMessages,
                         participants: mergedParticipants,
                     };
+                    discussionCacheByNode.value[key] = mergedCache;
+                    discussionCacheByNode.value[canonicalKey] = mergedCache;
                     // 讨论参与者加载后再校验一次默认发言者，避免切换节点时出现无效默认值
                     const updatedAgentValues = discussionAgents.value.map(a => a.value);
                     if (!updatedAgentValues.includes(newMessage.value.from_agent)) {
@@ -1233,9 +1260,15 @@ createApp({
                 } catch (e) {
                     console.error('selectSubtask: failed to load discussion', subtask.id, e);
                     const key = discussionCacheKey(selectedTask.value.id, subtask.id);
+                    const fallbackCanonical = discussionNodeIdBySubtask.value[subtask.id] || subtask.id;
+                    const canonicalKey = discussionCacheKey(selectedTask.value.id, fallbackCanonical);
                     const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
-                    discussionMessages.value = cached.messages || [];
-                    discussionParticipants.value = cached.participants || [];
+                    const canonicalCached = discussionCacheByNode.value[canonicalKey] || { messages: [], participants: [] };
+                    discussionMessages.value = mergeDiscussionMessages(cached.messages || [], canonicalCached.messages || []);
+                    discussionParticipants.value = Array.from(new Set([
+                        ...(cached.participants || []),
+                        ...(canonicalCached.participants || []),
+                    ]));
                 }
             }
             refreshDiscussionStatusFromSelection();
@@ -1251,7 +1284,8 @@ createApp({
                     ...newMessage.value,
                     to_agents: toAgents,
                 };
-                const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
+                const resolvedNodeId = discussionNodeIdBySubtask.value[selectedSubtask.value?.id] || selectedSubtask.value?.id;
+                const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${resolvedNodeId}/discussion`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -1440,11 +1474,10 @@ createApp({
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             graphZoom,
-            stats, getCompletedSubtasks, discussionAgents,
+            stats, pastBigTaskOutputs, getCompletedSubtasks, discussionAgents,
             reports, activeReport, activeReportContent,
             createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd, renderTaskMd, renderTaskInline,
             fetchGraph, fetchReports, loadReport, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
-            jumpToPastOutput,
             zoomGraphIn, zoomGraphOut, resetGraphView, fitGraphView,
         };
     }

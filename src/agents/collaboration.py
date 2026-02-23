@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import inspect
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -42,6 +43,13 @@ class BaseCollaboration(ABC):
     def __init__(self, agents: list[AgentExecutor]):
         self.agents = agents
 
+    async def _call_agent(self, execute_fn: Callable, task: Any, context: dict) -> Any:
+        """兼容同步/异步 execute_fn。"""
+        result = execute_fn(task, context)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     @abstractmethod
     async def execute(self, task: Any, context: dict = None) -> CollaborationResult:
         """执行协作"""
@@ -64,7 +72,7 @@ class ChainCollaboration(BaseCollaboration):
         for agent in self.agents:
             try:
                 if agent.execute_fn:
-                    result = await agent.execute_fn(current_input, context)
+                    result = await self._call_agent(agent.execute_fn, current_input, context)
                 else:
                     # 默认行为：传递输入
                     result = current_input
@@ -105,7 +113,7 @@ class ParallelCollaboration(BaseCollaboration):
         async def run_agent(agent: AgentExecutor):
             try:
                 if agent.execute_fn:
-                    return await agent.execute_fn(task, context)
+                    return await self._call_agent(agent.execute_fn, task, context)
                 return task
             except Exception as e:
                 return {"error": str(e)}
@@ -217,7 +225,7 @@ class DiscussionCollaboration(BaseCollaboration):
         for agent in self.agents:
             if agent.execute_fn:
                 try:
-                    opinion = await agent.execute_fn(task, context)
+                    opinion = await self._call_agent(agent.execute_fn, task, context)
                     await self.discussion_manager.post_message(
                         node_id=discussion_id,
                         from_agent=agent.agent_id,
