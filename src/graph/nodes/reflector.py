@@ -1,10 +1,18 @@
 """src/graph/nodes/reflector.py — 反思重试节点"""
+import logging
 from datetime import datetime
 from typing import Optional
 
 from src.graph.state import GraphState, SubTask
 from src.agents.caller import get_caller
 from src.agents.pool_registry import get_pool
+from src.graph.utils.json_parser import extract_first_json_object
+
+logger = logging.getLogger(__name__)
+
+# 知识注入边界控制
+_MAX_KNOWLEDGE_LENGTH = 10_000   # 单个 agent 模板最大字符数
+_MAX_REFLECTION_ENTRIES = 5      # 最多保留最近 N 条经验补丁
 
 
 async def reflector_node(state: GraphState) -> dict:
@@ -41,9 +49,10 @@ async def reflector_node(state: GraphState) -> dict:
         }
     )
 
-    # 检查执行是否成功
+    # 检查执行是否成功（V1 降级：失败时生成基础反思，避免整图崩溃）
     if not call_result.get("success"):
-        raise RuntimeError(f"Reflector 执行失败: {call_result.get('error')}")
+        logger.warning("[reflector] subagent 调用失败，启用降级反思: %s", call_result.get('error'))
+        call_result = {"success": True, "result": None}
 
     # 解析反思结果
     reflection = _parse_reflection_result(call_result, issues)
@@ -98,24 +107,19 @@ def _get_last_review(state: GraphState, task_id: str) -> Optional[dict]:
 
 
 def _parse_reflection_result(call_result: dict, issues: list) -> str:
-    """解析反思结果"""
-    import json
-    import re
-
+    """解析反思结果（使用括号计数法提取 JSON，避免贪婪匹配问题）"""
     if not call_result.get("success"):
         return f"\n需要改进的问题: {issues if issues else '无特定问题，请重新执行'}"
 
     result = call_result.get("result")
 
-    # SDK 可能返回字符串（含 JSON）
+    # SDK 可能返回字符串（含 JSON）—— 使用非贪婪括号计数法提取
     if isinstance(result, str):
-        match = re.search(r'\{.*\}', result, re.DOTALL)
-        if match:
-            try:
-                result = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                # 无法解析为 JSON，直接作为改进描述返回
-                return f"\n改进建议:\n{result}"
+        parsed = extract_first_json_object(result)
+        if parsed is None:
+            # 无法解析为 JSON，直接作为改进描述返回
+            return f"\n改进建议:\n{result}"
+        result = parsed
 
     if result and isinstance(result, dict):
         improved_description = result.get("improved_description", "")
@@ -158,7 +162,20 @@ def _update_specialist_prompts(task: SubTask, reflection: str) -> None:
     for agent_id in task.assigned_agents:
         template = pool.get_template(agent_id)
         if template and template.content:
-            updated_content = template.content + note
+            # 滑动窗口：超过最大长度时移除最旧的经验补丁
+            existing = template.content
+            _PATCH_SEP = "\n\n## 经验补丁"
+            if existing.count(_PATCH_SEP) >= _MAX_REFLECTION_ENTRIES:
+                # 保留基础提示词（第一个补丁之前的部分）+ 最近 N-1 条补丁
+                parts = existing.split(_PATCH_SEP)
+                base = parts[0]
+                recent_patches = parts[-(  _MAX_REFLECTION_ENTRIES - 1):]
+                existing = base + _PATCH_SEP.join([""] + recent_patches)
+            updated_content = existing + note
+            # 二次截断保险：超过绝对上限时直接截断旧内容
+            if len(updated_content) > _MAX_KNOWLEDGE_LENGTH:
+                updated_content = updated_content[-_MAX_KNOWLEDGE_LENGTH:]
+                logger.warning("[reflector] agent %s 模板已截断至 %d 字符", agent_id, _MAX_KNOWLEDGE_LENGTH)
             pool.fill_agent(
                 agent_id=agent_id,
                 name=template.name or agent_id,

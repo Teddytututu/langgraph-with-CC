@@ -1,5 +1,6 @@
 """src/graph/nodes/executor.py — 子任务执行调度"""
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -10,6 +11,7 @@ from src.agents.collaboration import (
     CollaborationMode, AgentExecutor, execute_collaboration,
 )
 
+logger = logging.getLogger(__name__)
 _coordinator = CoordinatorAgent()
 
 
@@ -95,8 +97,12 @@ async def executor_node(state: GraphState) -> dict:
                     timeout=timeout,
                 )
             else:
+                # specialist 创建失败，强制用 agent_01 兜底（绝不调用系统 executor agent）
+                logger.warning(f"[executor] 无法获取 specialist，使用 agent_01 兜底执行 {next_task.id}")
+                specialist_id = "agent_01"
                 call_result = await asyncio.wait_for(
-                    caller.call_executor(
+                    caller.call_specialist(
+                        agent_id="agent_01",
                         subtask=subtask_dict,
                         previous_results=previous_results,
                     ),
@@ -108,9 +114,29 @@ async def executor_node(state: GraphState) -> dict:
                 f"超过 {timeout:.0f}s 未完成"
             )
 
-    # 检查执行是否成功
+    # 检查执行是否成功（V1 降级：失败时标记任务为 failed，不崩溃整图）
     if not call_result.get("success"):
-        raise RuntimeError(f"Executor 执行失败: {call_result.get('error')}")
+        logger.warning("[executor] 子任务 %s 执行失败，标记为 failed: %s", next_task.id, call_result.get('error'))
+        fail_subtasks = [
+            t.model_copy(update={
+                "status": "failed",
+                "result": f"[AGENT_FAIL] {call_result.get('error', '\u672a知错误')}",
+                "started_at": started_at,
+                "finished_at": datetime.now(),
+            }) if t.id == next_task.id else t
+            for t in subtasks
+        ]
+        return {
+            "subtasks": fail_subtasks,
+            "current_subtask_id": next_task.id,
+            "phase": "reviewing",
+            "execution_log": [{
+                "event": "task_failed",
+                "task_id": next_task.id,
+                "error": call_result.get('error'),
+                "timestamp": datetime.now().isoformat(),
+            }],
+        }
 
     # 获取结果
     result_data = call_result.get("result")
@@ -241,7 +267,7 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
 
     try:
         results = await asyncio.wait_for(
-            asyncio.gather(*[run_one(d) for d in domains], return_exceptions=False),
+            asyncio.gather(*[run_one(d) for d in domains], return_exceptions=True),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -253,7 +279,10 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
     # 合并：取第一个成功的结果，失败的结果拼接到末尾
     merged_parts = []
     first_success = None
-    for r in results:
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning("[executor] 并行子任务 domain=%s 异常: %s", domains[i] if i < len(domains) else '?', r)
+            continue
         if isinstance(r, dict) and r.get("success"):
             if first_success is None:
                 first_success = r

@@ -41,10 +41,21 @@ async def router_node(state: GraphState) -> dict:
             "time_budget": budget,
         }
 
+    # 迭代上限防护：超过 200 次循环强制超时交付
+    current_iteration = state.get("iteration", 0)
+    if current_iteration > 200:
+        import logging as _log
+        _log.getLogger(__name__).error("[router] 迭代已达 %d 次，强制超时交付", current_iteration)
+        return {
+            "phase": "timeout",
+            "final_output": _build_final_output(state, timeout=True),
+            "time_budget": budget,
+        }
+
     return {
         "phase": state.get("phase", "init") if subtasks else "init",
         "time_budget": budget,
-        "iteration": state.get("iteration", 0) + 1,
+        "iteration": current_iteration + 1,
     }
 
 

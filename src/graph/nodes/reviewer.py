@@ -1,9 +1,13 @@
 """src/graph/nodes/reviewer.py — 质量审查节点"""
+import logging
 from datetime import datetime
 from typing import Optional
 
 from src.graph.state import GraphState, SubTask
 from src.agents.caller import get_caller
+from src.graph.utils.json_parser import extract_first_json_object
+
+logger = logging.getLogger(__name__)
 
 # 诨评为伪结果的特征樣式
 _FAKE_PATTERNS = [
@@ -47,9 +51,10 @@ async def reviewer_node(state: GraphState) -> dict:
         }
     )
 
-    # 检查执行是否成功
+    # 检查执行是否成功（V1 降级：失败时返回 PASS 兜底，避免整图崩溃）
     if not call_result.get("success"):
-        raise RuntimeError(f"Reviewer 执行失败: {call_result.get('error')}")
+        logger.warning("[reviewer] subagent 调用失败，启用降级审查: %s", call_result.get('error'))
+        call_result = {"success": True, "result": None}
 
     # 解析审查结果
     review = _parse_review_result(call_result)
@@ -124,9 +129,7 @@ def _validate_result_locally(task: SubTask) -> list[str]:
 
 
 def _parse_review_result(call_result: dict) -> dict:
-    """解析审查结果"""
-    import json
-    import re
+    """解析审查结果（使用括号计数法提取 JSON，避免贪婪匹配问题）"""
     default_review = {
         "verdict": "PASS",
         "score": 7,
@@ -139,14 +142,9 @@ def _parse_review_result(call_result: dict) -> dict:
 
     result = call_result.get("result")
 
-    # SDK 可能返回字符串（含 JSON）
+    # SDK 可能返回字符串（含 JSON）—— 使用非贪婪括号计数法提取
     if isinstance(result, str):
-        match = re.search(r'\{.*\}', result, re.DOTALL)
-        if match:
-            try:
-                result = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                result = None
+        result = extract_first_json_object(result)
 
     if result and isinstance(result, dict):
         return {

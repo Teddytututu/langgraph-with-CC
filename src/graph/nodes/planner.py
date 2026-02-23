@@ -59,9 +59,14 @@ async def planner_node(state: GraphState) -> dict:
         time_budget=time_budget_info
     )
 
-    # 检查执行是否成功
+    # 检查执行是否成功（V1 降级：失败时自动使用默认四阶段子任务，不崩溃整图）
     if not call_result.get("success"):
-        raise RuntimeError(f"Planner 执行失败: {call_result.get('error')}")
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[planner] subagent 调用失败，启用默认四阶段子任务: %s",
+            call_result.get('error')
+        )
+        call_result = {"success": True, "result": None}
 
     # 解析子任务
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)

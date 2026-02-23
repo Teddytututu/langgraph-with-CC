@@ -1,6 +1,9 @@
 """src/graph/edges.py — 条件路由函数"""
+import logging
 from datetime import datetime
 from src.graph.state import GraphState
+
+logger = logging.getLogger(__name__)
 
 
 def route_after_router(state: GraphState) -> str:
@@ -20,10 +23,14 @@ def route_after_router(state: GraphState) -> str:
 def route_after_review(state: GraphState) -> str:
     """Reviewer 之后的路由"""
     current = _get_current(state)
-    if current and current.status == "done":
+    # 空値防护：无当前任务时直接进入下一个执行循环
+    if current is None:
+        logger.debug("route_after_review: current is None → pass")
+        return "pass"
+    if current.status == "done":
         return "pass"
     max_iter = state.get("max_iterations", 3)
-    if current and current.retry_count >= max_iter:
+    if current.retry_count >= max_iter:
         return "pass"      # 强制通过，避免死循环
     return "revise"
 
