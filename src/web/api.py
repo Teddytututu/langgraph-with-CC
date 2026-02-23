@@ -517,12 +517,63 @@ def register_routes(app: FastAPI):
             "state_rev": create_snapshot["state_rev"],
         }
 
+    def _normalize_assigned_agents(value: Any, specialist_id: Any = None) -> list[str]:
+        """标准化 assigned_agents：始终返回 list[str]，并兼容旧 specialist_id。"""
+        raw = value
+        if raw is None and specialist_id:
+            raw = [specialist_id]
+        elif raw is None:
+            raw = []
+
+        if isinstance(raw, (list, tuple, set)):
+            return [str(v).strip() for v in raw if str(v).strip()]
+
+        text = str(raw).strip()
+        return [text] if text else []
+
+    def _normalize_subtask_item_for_api(st: dict[str, Any]) -> dict[str, Any]:
+        """标准化单个 subtask 快照，保证关键字段结构稳定。"""
+        item = dict(st)
+
+        deps = item.get("dependencies", item.get("depends_on", []))
+        if isinstance(deps, (list, tuple, set)):
+            item["dependencies"] = [str(d).strip() for d in deps if str(d).strip()]
+        elif deps:
+            dep_text = str(deps).strip()
+            item["dependencies"] = [dep_text] if dep_text else []
+        else:
+            item["dependencies"] = []
+
+        item["id"] = item.get("id") or ""
+        item["title"] = item.get("title") or ""
+        item["status"] = item.get("status") or "pending"
+        item["agent_type"] = item.get("agent_type") or ""
+        item["assigned_agents"] = _normalize_assigned_agents(
+            item.get("assigned_agents"),
+            specialist_id=item.get("specialist_id"),
+        )
+        return item
+
+    def _normalize_subtasks_for_api(subtasks: Any) -> list[dict[str, Any]]:
+        normalized_subtasks: list[dict[str, Any]] = []
+        for st in subtasks or []:
+            if not isinstance(st, dict):
+                continue
+            normalized_subtasks.append(_normalize_subtask_item_for_api(st))
+        return normalized_subtasks
+
+    def _normalize_task_for_api(task: dict[str, Any]) -> dict[str, Any]:
+        """返回 API 安全快照：标准化 subtasks 结构（含 assigned_agents/dependencies）。"""
+        normalized = dict(task)
+        normalized["subtasks"] = _normalize_subtasks_for_api(normalized.get("subtasks") or [])
+        return normalized
+
     @app.get("/api/tasks")
     async def list_tasks():
         """获取任务列表"""
         async with app_state.state_lock:
             return {
-                "tasks": list(app_state.tasks.values()),
+                "tasks": [_normalize_task_for_api(t) for t in app_state.tasks.values()],
                 "count": len(app_state.tasks),
                 "state_rev": app_state.state_rev,
             }
@@ -557,7 +608,7 @@ def register_routes(app: FastAPI):
         """获取任务详情"""
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
-        return app_state.tasks[task_id]
+        return _normalize_task_for_api(app_state.tasks[task_id])
 
     @app.patch("/api/tasks/{task_id}/subtasks/{subtask_id}")
     async def update_subtask(task_id: str, subtask_id: str, req: SubtaskUpdate):
@@ -576,7 +627,7 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_progress", {
             "task_id": task_id,
-            "subtasks": subtasks,
+            "subtasks": _normalize_subtasks_for_api(subtasks),
         })
         return target
 
@@ -750,6 +801,37 @@ def register_routes(app: FastAPI):
             "timestamp": timestamp or datetime.now().isoformat(),
         }
 
+    async def _emit_discussion_message(
+        *,
+        task_id: str,
+        node_id: str,
+        message: Any,
+        emit_terminal: bool = True,
+    ):
+        msg_dict = message.to_dict() if hasattr(message, "to_dict") else dict(message or {})
+        await app_state.broadcast("discussion_message", {
+            "task_id": task_id,
+            "node_id": node_id,
+            "message": msg_dict,
+        })
+
+        if not emit_terminal:
+            return
+
+        speaker = msg_dict.get("from_agent") or "system"
+        content = (msg_dict.get("content") or "").replace("\n", " ").strip()
+        if len(content) > 80:
+            content = f"{content[:80]}…"
+
+        terminal_entry = {
+            "task_id": task_id,
+            "line": f"[DISCUSSION][{node_id}][{speaker}] {content or '(empty)'}",
+            "level": "info",
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        }
+        app_state.append_terminal_log(terminal_entry)
+        await app_state.broadcast("terminal_output", terminal_entry)
+
     def _collect_reports_manifest() -> list[str]:
         if not _REPORTS_DIR.exists() or not _REPORTS_DIR.is_dir():
             return []
@@ -876,6 +958,15 @@ def register_routes(app: FastAPI):
     async def _schedule_post_task_init(task_id: str):
         async with app_state.post_init_lock:
             if task_id in app_state.post_init_done_task_ids:
+                return
+
+            # marathon 运行期间不执行 post-task init（避免清空正在轮转的任务）
+            if Path("marathon.lock.json").exists():
+                logger.info("post_task_init skipped: marathon.lock.json present")
+                await app_state.broadcast("post_init_skipped", {
+                    "task_id": task_id,
+                    "reason": "marathon_running",
+                })
                 return
 
             task = app_state.tasks.get(task_id)
@@ -1082,20 +1173,34 @@ def register_routes(app: FastAPI):
                                 "warn"
                             )
 
+                    existing_subtasks = {
+                        str(s.get("id")): s
+                        for s in (task.get("subtasks") or [])
+                        if isinstance(s, dict) and s.get("id")
+                    }
+
                     # 广播状态更新
+                    progress_subtasks = _normalize_subtasks_for_api([
+                        {
+                            "id": t.id,
+                            "title": t.title,
+                            "status": t.status,
+                            "agent_type": t.agent_type,
+                            "assigned_agents": getattr(t, "assigned_agents", None),
+                            "dependencies": list(
+                                getattr(t, "dependencies", None)
+                                or getattr(t, "depends_on", None)
+                                or (existing_subtasks.get(str(t.id), {}).get("dependencies") or [])
+                            ),
+                        }
+                        for t in state_update.get("subtasks", [])
+                    ])
+
                     await app_state.broadcast("task_progress", {
                         "task_id": task_id,
                         "node": node_name,
                         "phase": state_update.get("phase", ""),
-                        "subtasks": [
-                            {
-                                "id": t.id,
-                                "title": t.title,
-                                "status": t.status,
-                                "agent_type": t.agent_type,
-                            }
-                            for t in state_update.get("subtasks", [])
-                        ],
+                        "subtasks": progress_subtasks,
                         "result": state_update.get("final_output"),
                         **_event_meta(
                             task_id=task_id,
@@ -1107,17 +1212,23 @@ def register_routes(app: FastAPI):
 
                     # 子任务状态变化时推送名单
                     if "subtasks" in state_update:
-                        task["subtasks"] = [
+                        task["subtasks"] = _normalize_subtasks_for_api([
                             {
                                 "id": t.id,
                                 "title": t.title,
                                 "description": t.description,
                                 "agent_type": t.agent_type,
+                                "assigned_agents": getattr(t, "assigned_agents", None),
                                 "status": t.status,
                                 "result": t.result,
+                                "dependencies": list(
+                                    getattr(t, "dependencies", None)
+                                    or getattr(t, "depends_on", None)
+                                    or (existing_subtasks.get(str(t.id), {}).get("dependencies") or [])
+                                ),
                             }
                             for t in state_update.get("subtasks", [])
-                        ]
+                        ])
                         app_state.mark_dirty()
                         for t in state_update["subtasks"]:
                             if t.status == "running":
@@ -1141,6 +1252,7 @@ def register_routes(app: FastAPI):
                                 existing = app_state.discussion_manager.create_discussion(manager_key)
                             # 合并新消息（避免重复追加）
                             existing_ids = {m.id for m in existing.messages}
+                            new_messages = []
                             for msg in (node_disc.messages if hasattr(node_disc, "messages") else []):
                                 if msg.id not in existing_ids:
                                     # 复制消息并修正 node_id 为 manager key
@@ -1156,9 +1268,18 @@ def register_routes(app: FastAPI):
                                         metadata=msg.metadata,
                                     )
                                     existing.add_message(synced)
+                                    existing_ids.add(msg.id)
+                                    new_messages.append(synced)
                             existing.status = getattr(node_disc, "status", "resolved")
                             existing.consensus_reached = getattr(node_disc, "consensus_reached", False)
                             existing.consensus_topic = getattr(node_disc, "consensus_topic", None)
+
+                            for synced in new_messages:
+                                await _emit_discussion_message(
+                                    task_id=task_id,
+                                    node_id=node_id,
+                                    message=synced,
+                                )
 
                     if state_update.get("final_output"):
                         now_iso = datetime.now().isoformat()
@@ -1209,6 +1330,7 @@ def register_routes(app: FastAPI):
                         config,
                         {"messages": injected},
                     )
+                    await emit(f"↳ 干预已应用（{len(pending)} 条）", "info")
                     await app_state.broadcast("task_intervention_applied", {
                         "task_id": task_id,
                         "instructions": pending,
@@ -1334,7 +1456,6 @@ def register_routes(app: FastAPI):
     def _build_task_mermaid() -> str:
         """根据当前任务的子任务动态生成 Mermaid 字符串。
         有子任务时显示子任务 DAG；无子任务时退回标准骨架图。"""
-        # 优先用 current_task_id；若无子任务则找最近一个有子任务的任务
         task_id = app_state.current_task_id
         task = app_state.tasks.get(task_id) if task_id else None
         subtasks: list[dict] = (task or {}).get("subtasks") or []
@@ -1349,14 +1470,71 @@ def register_routes(app: FastAPI):
         if not subtasks:
             return ""
 
-        # ── 动态子任务 DAG ────────────────────────────────────────────────────
-        def safe_id(raw: str) -> str:
-            """Mermaid 节点 ID 不能含连字符/空格，task-001 → task001"""
-            return raw.replace("-", "").replace("_", "").replace(" ", "")
+        def to_list_of_str(value: Any) -> list[str]:
+            if not value:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                return [str(v).strip() for v in value if str(v).strip()]
+            text = str(value).strip()
+            return [text] if text else []
+
+        def short_label(text: str, max_len: int = 42) -> str:
+            clean = (text or "").replace('"', "'").replace("\n", " ").strip()
+            if len(clean) <= max_len:
+                return clean
+            return clean[: max_len - 1].rstrip() + "…"
+
+        normalized: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+        for idx, st in enumerate(subtasks, start=1):
+            if not isinstance(st, dict):
+                continue
+            raw_id = (st.get("id") or "").strip()
+            if not raw_id:
+                continue
+            deps = to_list_of_str(st.get("dependencies") or st.get("depends_on"))
+            item = {
+                "raw_id": raw_id,
+                "node_id": f"n{idx}",
+                "title": st.get("title") or raw_id,
+                "status": (st.get("status") or "pending").strip().lower(),
+                "dependencies": deps,
+            }
+            normalized.append(item)
+            by_id[raw_id] = item
+
+        if not normalized:
+            return ""
+
+        edge_pairs: list[tuple[str, str]] = []
+        edge_seen: set[tuple[str, str]] = set()
+        indegree = {item["raw_id"]: 0 for item in normalized}
+
+        for item in normalized:
+            sid_raw = item["raw_id"]
+            valid_deps: list[str] = []
+            for dep_raw in item.get("dependencies", []):
+                if dep_raw == sid_raw:
+                    continue
+                if dep_raw not in by_id:
+                    continue
+                pair = (dep_raw, sid_raw)
+                if pair in edge_seen:
+                    continue
+                edge_seen.add(pair)
+                edge_pairs.append(pair)
+                valid_deps.append(dep_raw)
+                indegree[sid_raw] = indegree.get(sid_raw, 0) + 1
+            item["dependencies"] = valid_deps
+
+        node_count = len(normalized)
+        edge_count = len(edge_pairs)
+        graph_direction = "TD" if node_count >= 10 or edge_count >= 12 else "LR"
 
         status_fill = {
             "running": "fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2px",
             "done": "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px",
+            "completed": "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px",
             "failed": "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px",
             "pending": "fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px",
             "skipped": "fill:#1f1f27,color:#71717a,stroke:#3f3f46,stroke-width:1px",
@@ -1372,31 +1550,22 @@ def register_routes(app: FastAPI):
             "blocked": "blocked",
         }
 
-        subtask_ids = {st.get("id") for st in subtasks if st.get("id")}
-        done_ids = {st.get("id") for st in subtasks if st.get("status") in ("done", "skipped")}
-        indegree = {st.get("id"): 0 for st in subtasks if st.get("id")}
+        done_ids = {
+            item["raw_id"]
+            for item in normalized
+            if item.get("status") in ("done", "completed", "skipped")
+        }
 
-        for st in subtasks:
-            deps = st.get("dependencies") or []
-            sid = st.get("id")
-            if not sid:
-                continue
-            for dep_id in deps:
-                if dep_id in subtask_ids:
-                    indegree[sid] = indegree.get(sid, 0) + 1
-
-        lines = ["graph LR"]
-        deferred_styles = []
+        lines = [f"graph {graph_direction}"]
+        deferred_styles: list[str] = []
         class_assignments: dict[str, str] = {}
-        edge_styles: list[str] = []
 
-        # ── 顶部标题节点 ──────────────────────────────────────────────────────
-        task_status = (task or {}).get("status", "")
-        task_title = ((task or {}).get("task") or "任务")[:32].replace('"', "'")
+        task_status = ((task or {}).get("status") or "").strip().lower()
+        task_title = short_label((task or {}).get("task") or "任务", max_len=52)
         hid = "task_header"
 
         if task_status == "running":
-            phase = app_state.current_node or "running"
+            phase = short_label(app_state.current_node or "running", max_len=22)
             lines.append(f'    {hid}(["⚙ {phase.upper()}"])')
             deferred_styles.append(
                 f"    style {hid} fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2.5px"
@@ -1417,19 +1586,13 @@ def register_routes(app: FastAPI):
                 f"    style {hid} fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px"
             )
 
-        # ── 子任务节点 ────────────────────────────────────────────────────────
-        for st in subtasks:
-            raw_id = st.get("id")
-            if not raw_id:
-                continue
-            sid = safe_id(raw_id)
-            title = (st.get("title") or raw_id).replace('"', "'")[:24]
-
-            deps = st.get("dependencies") or []
-            is_blocked = bool(
-                st.get("status") == "pending" and deps and not all(dep in done_ids for dep in deps)
-            )
-            visual_status = "blocked" if is_blocked else (st.get("status") or "pending")
+        for item in normalized:
+            sid = item["node_id"]
+            raw_id = item["raw_id"]
+            deps = item.get("dependencies", [])
+            status = item.get("status") or "pending"
+            is_blocked = bool(status == "pending" and deps and not all(dep in done_ids for dep in deps))
+            visual_status = "blocked" if is_blocked else status
 
             icon = {
                 "running": "⟳",
@@ -1441,39 +1604,34 @@ def register_routes(app: FastAPI):
                 "blocked": "⏸",
             }.get(visual_status, "○")
 
+            title = short_label(item.get("title") or raw_id)
             lines.append(f'    {sid}(["{icon} {title}"])')
-            fill = status_fill.get(visual_status, status_fill["pending"])
-            deferred_styles.append(f"    style {sid} {fill}")
+            deferred_styles.append(f"    style {sid} {status_fill.get(visual_status, status_fill['pending'])}")
             class_assignments[sid] = status_class.get(visual_status, "pending")
 
-        # ── 边：header → 根节点（入度=0），依赖边方向 dependency --> dependent ─────
-        roots = [st for st in subtasks if st.get("id") and indegree.get(st.get("id"), 0) == 0]
-        for st in roots:
-            lines.append(f"    {hid} --> {safe_id(st['id'])}")
+        edge_styles: list[str] = []
+        edge_index = 0
 
-        for st in subtasks:
-            sid_raw = st.get("id")
-            if not sid_raw:
-                continue
-            sid = safe_id(sid_raw)
-            deps = st.get("dependencies") or []
-            for dep_id in deps:
-                if dep_id not in subtask_ids:
-                    continue
+        roots = [item for item in normalized if indegree.get(item["raw_id"], 0) == 0]
+        for item in roots:
+            lines.append(f"    {hid} --> {item['node_id']}")
+            edge_styles.append("stroke:#52525b,stroke-width:1.4px")
+            edge_index += 1
 
-                dep_sid = safe_id(dep_id)
-                lines.append(f"    {dep_sid} -->|depends_on| {sid}")
+        for dep_raw, sid_raw in edge_pairs:
+            dep_sid = by_id[dep_raw]["node_id"]
+            sid = by_id[sid_raw]["node_id"]
+            lines.append(f"    {dep_sid} -->|depends_on| {sid}")
 
-                dep_task = next((x for x in subtasks if x.get("id") == dep_id), None)
-                dep_status = (dep_task or {}).get("status")
-                if dep_status == "running":
-                    edge_styles.append("stroke:#a855f7,stroke-width:2.2px")
-                elif dep_status not in ("done", "skipped"):
-                    edge_styles.append("stroke:#475569,stroke-width:1.6px,stroke-dasharray:4 3")
-                else:
-                    edge_styles.append("stroke:#64748b,stroke-width:1.6px")
+            dep_status = by_id[dep_raw].get("status")
+            if dep_status == "running":
+                edge_styles.append("stroke:#a855f7,stroke-width:2.2px")
+            elif dep_status not in ("done", "completed", "skipped"):
+                edge_styles.append("stroke:#475569,stroke-width:1.6px,stroke-dasharray:4 3")
+            else:
+                edge_styles.append("stroke:#64748b,stroke-width:1.6px")
+            edge_index += 1
 
-        # class 定义（供前端做增量状态渲染）
         lines.extend([
             "    classDef pending fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px;",
             "    classDef running fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2px;",
@@ -1535,20 +1693,57 @@ def register_routes(app: FastAPI):
         if task_id not in app_state.tasks:
             raise HTTPException(status_code=404, detail="Task not found")
 
+        manager_node_id = f"{task_id}_{node_id}"
         msg = await app_state.discussion_manager.post_message(
-            node_id=f"{task_id}_{node_id}",
+            node_id=manager_node_id,
             from_agent=req.from_agent,
             content=req.content,
             to_agents=req.to_agents,
             message_type=req.message_type,
         )
 
-        await app_state.broadcast("discussion_message", {
-            "task_id": task_id,
-            "node_id": node_id,
-            "message": msg.to_dict(),
-        })
+        await _emit_discussion_message(task_id=task_id, node_id=node_id, message=msg)
 
+        async def _auto_reply():
+            executor = get_executor()
+            try:
+                discussion = app_state.discussion_manager.get_discussion(manager_node_id)
+                history = discussion.messages[-6:] if discussion and discussion.messages else []
+                history_lines = "\n".join(
+                    f"{h.from_agent}: {h.content}"
+                    for h in history
+                )
+                prompt = (
+                    "你是任务讨论面板里的assistant。请基于最新用户消息给出简短、可执行的下一步建议。"
+                    f"\n任务ID: {task_id}\n节点ID: {node_id}\n"
+                    f"最近讨论:\n{history_lines}\n"
+                    f"最新消息({req.from_agent}): {req.content}\n"
+                    "要求：1-3句中文，聚焦下一步，不要重复上下文。"
+                )
+                result = await executor.execute(
+                    agent_id="monitor_chat",
+                    system_prompt="",
+                    context={"task": prompt},
+                    tools=[],
+                    max_turns=5,
+                )
+                if not result.success:
+                    reply_text = "已收到消息，正在处理中。"
+                else:
+                    reply_text = (result.result or "已收到消息，正在处理中。").strip()
+            except Exception:
+                reply_text = "已收到消息，正在处理中。"
+
+            reply_msg = await app_state.discussion_manager.post_message(
+                node_id=manager_node_id,
+                from_agent="assistant",
+                content=reply_text,
+                to_agents=[req.from_agent] if req.from_agent else [],
+                message_type="response",
+            )
+            await _emit_discussion_message(task_id=task_id, node_id=node_id, message=reply_msg)
+
+        _fire(_auto_reply())
         return msg.to_dict()
 
     @app.get("/api/discussions/summaries")
