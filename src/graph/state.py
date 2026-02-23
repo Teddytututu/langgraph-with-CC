@@ -20,7 +20,21 @@ class DiscussionMessage(BaseModel):
     to_agents: list[str] = []       # 接收者（空=广播）
     content: str
     timestamp: datetime = Field(default_factory=datetime.now)
-    message_type: Literal["query", "response", "consensus", "conflict", "info"] = "info"
+    message_type: Literal[
+        "query",
+        "response",
+        "consensus",
+        "conflict",
+        "info",
+        "proposal",
+        "reflection",
+        "agreement",
+        "error",
+        "review_opinion",
+        "analysis",
+        "synthesis",
+        "disagreement_alert",
+    ] = "info"
     metadata: dict[str, Any] = {}   # 附加元数据
 
 

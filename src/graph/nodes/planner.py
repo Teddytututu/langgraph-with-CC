@@ -9,22 +9,23 @@ from src.utils.config import get_config
 from src.agents.caller import get_caller
 
 PLANNER_SYSTEM_PROMPT = """
-你是一个任务规划专家。你的职责是将用户的复杂任务分解为具有复杂依赖关系的子任务图（DAG+条件环）。
+你是一个任务规划专家。你的职责是将用户任务分解为用于“系统自检→缺陷修复→修复验证”的复杂子任务图（DAG+条件回环）。
 
 ## 核心规则
-1. 每个子任务必须分配 **3个以上不同领域** 的 knowledge_domains，确保多专家参与讨论
-2. 子任务之间必须构建 **复杂依赖关系**：
+1. 主旨必须严格限定为：自检系统、定位问题、修复 bug、验证修复效果。
+2. 明确禁止：新增功能、需求外扩展、体验优化型改造、与修复无关的重构。
+3. 每个子任务必须分配 **3个以上不同领域** 的 knowledge_domains，确保多专家参与讨论；每个节点的讨论轮次目标为 **至少 10 轮**
+4. 子任务之间必须构建 **复杂依赖关系**：
    - 不能只是线性链（A→B→C），必须包含 **菱形依赖**（A→B,C→D）、**交叉依赖**（A→C, B→C, C→D,E）
    - 至少有 **2组并行任务** 和 **1个汇聚节点**（多依赖合并）
    - 必须包含 **验证→修复→再验证** 的条件回环结构
-3. 为每个子任务指定最合适的 Agent 类型：
+5. 子任务数量必须 **≥12 个**；若任务场景客观上无法满足，必须在 description 与 completion_criteria 中显式写明原因与证据
+6. 为每个子任务指定最合适的 Agent 类型：
    - coder: 编写/修改代码、脚本
    - researcher: 搜索信息、阅读文档、调研
    - writer: 撰写文档、报告、文案
    - analyst: 数据分析、逻辑推理、方案对比
-4. 子任务数量控制在 **6~12 个**
-5. 必须考虑时间预算，但要保证每个任务有足够时间让 3+ 专家进行 10+ 轮讨论
-6. **必须包含修复类子任务**：对诊断发现的问题编写修复，并有后续验证任务依赖修复结果
+7. 必须考虑时间预算，并保证每个任务可执行、可验证，且修复任务后面必须有依赖其结果的验证任务
 
 ## 依赖图结构示例
 ```
@@ -63,6 +64,7 @@ def _policy_prompt(policy: ExecutionPolicy) -> str:
         f"- min_agents_per_node={policy.min_agents_per_node}\n"
         f"- min_discussion_rounds={policy.min_discussion_rounds}\n"
         f"- strict_enforcement={policy.strict_enforcement}\n"
+        "- 每个节点至少 3 个 subagents，且至少 10 轮讨论。\n"
         "- 若 strict_enforcement=true，必须返回满足约束的复杂 DAG，不允许降级为线性链。\n"
     )
 
@@ -144,8 +146,8 @@ def _validate_subtasks(subtasks: list[SubTask], policy: ExecutionPolicy) -> tupl
         return False, "dependency_cycle_detected"
 
     if policy.force_complex_graph or policy.strict_enforcement:
-        if not (6 <= len(subtasks) <= 12):
-            return False, f"subtask_count_out_of_range:{len(subtasks)}"
+        if len(subtasks) < 12:
+            return False, f"subtask_count_below_minimum:{len(subtasks)}"
 
         for t in subtasks:
             if len(set(t.knowledge_domains or [])) < policy.min_agents_per_node:

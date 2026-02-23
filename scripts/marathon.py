@@ -39,19 +39,20 @@ IDLE_STABLE_SAMPLES = 3  # 连续稳定次数才认为 idle
 TRANSIENT_RECHECKS = 3   # 瞬态异常复核次数
 DEFAULT_HOURS = 10
 DEFAULT_TASK  = (
-    "对系统进行全面自检与修复闭环："
-    "（Phase 1-诊断）检查所有节点运行状态、API 接口可用性、subagent 调度流程、讨论机制和输出质量；"
-    "（Phase 2-修复）对 Phase 1 发现的问题逐一编写修复代码并验证，确保每个问题修复后通过回归测试；"
-    "（Phase 3-验证报告）重新运行自检确认修复生效，输出修复前后对比报告并保存到 reports/ 目录。"
-    "每个阶段至少3名不同领域专家参与讨论协商，每个子任务进行2轮专家讨论。"
+    "执行 10h 自我修复闭环：仅允许自检系统、定位缺陷、修复 bug、验证修复，不得新增任何功能或做需求外扩展。"
+    "每轮必须将任务分解为不少于 12 个子任务节点，且依赖图必须包含并行分支与汇合节点，禁止线性清单式拆分。"
+    "每个节点至少 3 个 subagents 参与，且每个节点至少进行 10 轮讨论。"
+    "每个 major task 完成后必须输出终端摘要（修复内容与验证结论）并落盘证据到 reports/*.md 与 reports/*.json。"
+    "发现失败后必须进入 fix_request 修复路径，修复后重新验证再继续下一轮。"
 )
+
 DEFAULT_MINUTES_PER_ROUND = 60   # 每轮时间预算
 DEFAULT_COOLDOWN = 30            # 每轮冷却秒数
 DEFAULT_EXECUTION_POLICY = {
     "force_complex_graph": True,
     "min_agents_per_node": 3,
-    "min_discussion_rounds": 2,
-    "strict_enforcement": False,
+    "min_discussion_rounds": 10,
+    "strict_enforcement": True,
 }
 
 
@@ -305,7 +306,7 @@ def _clear_old_tasks() -> None:
     """清空所有已结束的旧任务（completed/failed/cancelled），避免堆积。"""
     try:
         tasks = _api("GET", "/api/tasks").get("tasks", [])
-        running = [t for t in tasks if t.get("status") in ("running", "created")]
+        running = [t for t in tasks if t.get("status") in ("running", "created", "queued")]
         if running:
             _log(f"  跳过清空：仍有 {len(running)} 个活跃任务")
             return
@@ -332,6 +333,9 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
     while datetime.now() < end_time:
         round_num += 1
         remaining_h = (end_time - datetime.now()).total_seconds() / 3600
+        round_fix_triggers = 0
+        round_failure_reason = ""
+        round_verification = ""
         _log(f"")
         _log(f"═══ 第 {round_num} 轮 | 剩余 {remaining_h:.1f}h ═══")
         if execution_policy:
@@ -343,6 +347,8 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
             retries += 1
             detail = f"第 {round_num} 轮开始时服务器无响应（尝试 {retries} 次）"
             _log(detail)
+            round_failure_reason = detail
+            round_fix_triggers += 1
             _wait_for_fix("服务器无响应", round_num, detail)
 
         # ── 清理旧任务 ──
@@ -353,6 +359,8 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         while task_id is None:
             task_id = _submit_task(task_text, minutes_per_round, execution_policy)
             if task_id is None:
+                round_failure_reason = "POST /api/tasks 返回错误"
+                round_fix_triggers += 1
                 _wait_for_fix("任务提交失败", round_num, "POST /api/tasks 返回错误")
 
         round_start = time.monotonic()
@@ -365,30 +373,91 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         elapsed_min = (time.monotonic() - round_start) / 60
 
         if status == "completed":
+            round_verification = "task completed"
             _log(f"✓ 第 {round_num} 轮完成（耗时 {elapsed_min:.1f} 分钟）")
-            results.append({"round": round_num, "status": "ok", "minutes": f"{elapsed_min:.1f}"})
+            results.append({
+                "round": round_num,
+                "task_id": task_id,
+                "status": "ok",
+                "minutes": f"{elapsed_min:.1f}",
+                "fix_triggers": round_fix_triggers,
+                "failure_reason": round_failure_reason,
+                "verification": round_verification,
+            })
 
         elif status == "failed":
+            round_failure_reason = detail[:500]
+            round_fix_triggers += 1
+            round_verification = "task failed"
             _log(f"✗ 第 {round_num} 轮 FAILED（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  错误: {detail[:200]}")
-            results.append({"round": round_num, "status": "failed", "minutes": f"{elapsed_min:.1f}"})
+            results.append({
+                "round": round_num,
+                "task_id": task_id,
+                "status": "failed",
+                "minutes": f"{elapsed_min:.1f}",
+                "fix_triggers": round_fix_triggers,
+                "failure_reason": round_failure_reason,
+                "verification": round_verification,
+            })
             _wait_for_fix(f"轮次 {round_num} 任务执行失败", round_num, detail)
 
         elif status in ("timeout", "transient"):
             # timeout/transient 先复核，不直接触发 fix_request
+            round_failure_reason = detail[:500]
             _log(f"⚠ 第 {round_num} 轮 {status}（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  初始详情: {detail[:200]}")
             recheck_status, recheck_detail = _check_transient_task_status(task_id)
             if recheck_status == "failed":
+                round_failure_reason = recheck_detail[:500]
+                round_fix_triggers += 1
+                round_verification = "recheck failed"
                 _log(f"  复核结论: hard failed -> {recheck_detail[:200]}")
-                results.append({"round": round_num, "status": "failed", "minutes": f"{elapsed_min:.1f}"})
+                results.append({
+                    "round": round_num,
+                    "task_id": task_id,
+                    "status": "failed",
+                    "minutes": f"{elapsed_min:.1f}",
+                    "fix_triggers": round_fix_triggers,
+                    "failure_reason": round_failure_reason,
+                    "verification": round_verification,
+                })
                 _wait_for_fix(f"轮次 {round_num} 任务执行失败(复核)", round_num, recheck_detail)
             elif recheck_status == "completed":
+                round_verification = "recheck completed"
                 _log("  复核结论: 已完成（瞬态切换窗口）")
-                results.append({"round": round_num, "status": "ok", "minutes": f"{elapsed_min:.1f}"})
+                results.append({
+                    "round": round_num,
+                    "task_id": task_id,
+                    "status": "ok",
+                    "minutes": f"{elapsed_min:.1f}",
+                    "fix_triggers": round_fix_triggers,
+                    "failure_reason": round_failure_reason,
+                    "verification": round_verification,
+                })
             else:
+                round_verification = "recheck unresolved"
                 _log("  复核结论: 仍为瞬态/未知，跳过修复进入下一轮")
-                results.append({"round": round_num, "status": status, "minutes": f"{elapsed_min:.1f}"})
+                results.append({
+                    "round": round_num,
+                    "task_id": task_id,
+                    "status": status,
+                    "minutes": f"{elapsed_min:.1f}",
+                    "fix_triggers": round_fix_triggers,
+                    "failure_reason": round_failure_reason,
+                    "verification": round_verification,
+                })
+
+        round_result = results[-1]
+        _log(
+            "轮次结果 | "
+            f"round={round_result['round']} "
+            f"task_id={round_result['task_id']} "
+            f"status={round_result['status']} "
+            f"fix_triggers={round_result['fix_triggers']} "
+            f"verification={round_result['verification']} "
+            f"failure_reason={round_result['failure_reason'][:120]}"
+        )
 
         # ── 冷却 ──
         if datetime.now() < end_time and cooldown > 0:
@@ -401,10 +470,66 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
     _log(f"马拉松结束，共完成 {round_num} 轮")
     ok = sum(1 for r in results if r["status"] == "ok")
     fail = round_num - ok
+    total_fix_triggers = sum(int(r.get("fix_triggers", 0)) for r in results)
+
+    longest_success_streak = 0
+    current_streak = 0
+    last_failure_reason = ""
+    for r in results:
+        if r.get("status") == "ok":
+            current_streak += 1
+            if current_streak > longest_success_streak:
+                longest_success_streak = current_streak
+        else:
+            current_streak = 0
+            if r.get("failure_reason"):
+                last_failure_reason = r["failure_reason"]
+
     _log(f"成功: {ok}  失败/超时: {fail}")
+    _log(
+        "最终统计 | "
+        f"total_rounds={round_num} "
+        f"success_rounds={ok} "
+        f"fix_triggers={total_fix_triggers} "
+        f"longest_success_streak={longest_success_streak} "
+        f"last_failure_reason={last_failure_reason[:200]}"
+    )
+
     for r in results:
         icon = "✓" if r["status"] == "ok" else "✗"
-        print(f"  {icon} 第 {r['round']:2d} 轮  {r['status']:8s}  {r['minutes']} min", flush=True)
+        print(
+            f"  {icon} 第 {r['round']:2d} 轮  {r['status']:8s}  {r['minutes']} min"
+            f"  task={r.get('task_id', '')}"
+            f"  fix={r.get('fix_triggers', 0)}"
+            f"  verify={r.get('verification', '')}",
+            flush=True,
+        )
+
+
+def _build_execution_policy(
+    *,
+    strict_enabled: bool,
+    force_complex_graph: bool,
+    min_agents_per_node: int,
+    min_discussion_rounds: int,
+) -> dict | None:
+    """构建执行策略；严格模式参数不合法时抛出 ValueError。"""
+    if not strict_enabled:
+        return None
+
+    if not force_complex_graph:
+        raise ValueError("strict 模式要求 force_complex_graph=true")
+    if min_agents_per_node < 3:
+        raise ValueError("strict 模式要求 min_agents_per_node>=3")
+    if min_discussion_rounds < 10:
+        raise ValueError("strict 模式要求 min_discussion_rounds>=10")
+
+    return {
+        "force_complex_graph": force_complex_graph,
+        "min_agents_per_node": min_agents_per_node,
+        "min_discussion_rounds": min_discussion_rounds,
+        "strict_enforcement": True,
+    }
 
 
 if __name__ == "__main__":
@@ -415,8 +540,8 @@ if __name__ == "__main__":
                         help="每轮提交的任务描述")
     parser.add_argument("--minutes",   type=float, default=DEFAULT_MINUTES_PER_ROUND,
                         help=f"每轮时间预算（分钟），默认 {DEFAULT_MINUTES_PER_ROUND}")
-    parser.add_argument("--strict", action="store_true", default=False,
-                        help="启用严格执行策略（默认关闭）")
+    parser.add_argument("--strict", action="store_true", default=True,
+                        help="启用严格执行策略（默认开启）")
     parser.add_argument("--non-strict", action="store_true",
                         help="关闭严格执行策略，按旧行为提交")
     parser.add_argument("--force-complex-graph", action="store_true", default=True,
@@ -425,8 +550,8 @@ if __name__ == "__main__":
                         help="允许线性图（将 force_complex_graph 设为 false）")
     parser.add_argument("--min-agents-per-node", type=int, default=3,
                         help="每个节点最少 agent 数（默认 3）")
-    parser.add_argument("--min-discussion-rounds", type=int, default=2,
-                        help="每个节点最少讨论轮次（默认 2）")
+    parser.add_argument("--min-discussion-rounds", type=int, default=10,
+                        help="每个节点最少讨论轮次（默认 10）")
     parser.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN,
                         help=f"每轮结束后冷却秒数（默认 {DEFAULT_COOLDOWN}）")
     args = parser.parse_args()
@@ -436,12 +561,16 @@ if __name__ == "__main__":
 
     strict_enabled = args.strict and not args.non_strict
     force_complex_graph = args.force_complex_graph and not args.allow_linear_graph
-    execution_policy = {
-        "force_complex_graph": force_complex_graph,
-        "min_agents_per_node": args.min_agents_per_node,
-        "min_discussion_rounds": args.min_discussion_rounds,
-        "strict_enforcement": strict_enabled,
-    } if strict_enabled else None
+    try:
+        execution_policy = _build_execution_policy(
+            strict_enabled=strict_enabled,
+            force_complex_graph=force_complex_graph,
+            min_agents_per_node=args.min_agents_per_node,
+            min_discussion_rounds=args.min_discussion_rounds,
+        )
+    except ValueError as e:
+        _log(f"参数错误: {e}")
+        sys.exit(2)
 
     try:
         run(

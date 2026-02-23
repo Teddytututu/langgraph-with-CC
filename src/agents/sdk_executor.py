@@ -278,6 +278,14 @@ class SDKExecutor:
         if "task" in context:
             parts.append(f"## 任务\n{context['task']}\n")
 
+        # 全局执行主旨约束
+        parts.append("## 全局执行约束（必须遵守）")
+        parts.append("- 仅允许：系统自检、缺陷定位、bug 修复、修复验证")
+        parts.append("- 严禁新增功能、需求外扩展、与修复目标无关的改造")
+        parts.append("- 优先使用 Python 生态完成实现、测试、脚本与验证命令")
+        parts.append("- 输出必须可验证：说明修复动作、验证命令、验证结果与证据路径")
+        parts.append("")
+
         # 子任务信息
         if "subtask" in context:
             subtask = context["subtask"]
@@ -335,9 +343,9 @@ class SDKExecutor:
         subtask_id = context.get("subtask", {}).get("id", "task")
         parts.append("## ║ 输出要求")
         parts.append(f"1. 将详细的工作成果写入文件 `reports/{subtask_id}.md`，使用标准 Markdown 格式")
-        parts.append("2. 文件必须包含：执行摘要、主要发现、建议事项、交付物路径")
-        parts.append("3. 在最终一条回复中输出扩展摘要（100-300字），说明报告路径")
-        parts.append(f"4. 如果主题涉及结构化数据，同时写入 `reports/{subtask_id}.json`")
+        parts.append("2. 文件必须包含：执行摘要、修复内容、验证步骤与结果、交付物路径")
+        parts.append("3. 在最终一条回复中输出 major task 摘要（修复内容 + 验证结论 + 报告路径）")
+        parts.append(f"4. 同步写入结构化产物 `reports/{subtask_id}.json`，字段至少包含 summary、verification、artifacts")
 
         return "\n".join(parts)
 

@@ -215,7 +215,9 @@ class SubagentCaller:
         description = f"专注于 {skills_str} 的执行专家"
         system_prompt = (
             f"你是一个专注于 {skills_str} 领域的执行专家。\n"
-            f"请严格按照任务描述完成工作，输出完整、具体、可直接使用的结果。\n"
+            "仅执行系统自检、缺陷定位、bug 修复与修复验证，禁止新增功能或需求外扩展。\n"
+            "优先使用 Python 生态执行实现、测试、脚本与验证。\n"
+            "每个 major task 完成时必须输出终端摘要，并落盘 reports/{subtask_id}.md 与 reports/{subtask_id}.json。\n"
             f"任务上下文：{task_description[:200]}"
         )
 
