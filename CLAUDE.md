@@ -129,7 +129,26 @@ netstat -ano | findstr ":8001" | findstr LISTENING
    ```
 5. 重启服务器（按「三、服务器重启流程」）。
 
-### 2.5 `heartbeat` — 定期心跳（每 30 秒）
+### 2.5 `signal` / `type: fix_request` — autorun 自我修复请求
+
+```json
+{"event": "signal", "type": "fix_request", "path": "fix_request.json", "content": {...}}
+```
+
+> 由 `scripts/autorun.py` 写入。表示「验证命令失败，请修复代码直到它通过」。
+
+**立即执行：**
+
+1. 读 `content.goal`（用户目标）和 `content.failure`（验证命令的失败输出）。
+2. 根据 `failure` 中的错误信息定位文件和行号，用 `read_file` 查看上下文。
+3. 用 `replace_string_in_file` 修复——**只修复导致验证失败的问题，不添加额外功能**。
+4. 删除信号文件（这是「修复完成」的信号，autorun 会重新运行验证）：
+   ```bash
+   del fix_request.json
+   ```
+5. 等待 autorun 下一次验证结果；若再次出现 fix_request，重复以上步骤。
+
+### 2.6 `heartbeat` — 定期心跳（每 30 秒）
 
 ```json
 {"event": "heartbeat", "server": "ok"|"down"}
@@ -137,6 +156,8 @@ netstat -ano | findstr ":8001" | findstr LISTENING
 
 - `server: "ok"` → 无需操作。  
 - `server: "down"` → 等同于 `server_down`，执行 2.1。
+
+> `fix_request` 循环期间如果也收到 `server_down`，优先处理 `fix_request`（修好代码再重启服务器）。
 
 ---
 
@@ -211,6 +232,8 @@ taskkill /PID <PID> /F /T
 | `decision_request.json` | 决策信号（触发 2.3） |
 | `decision_result.json` | 决策结果（由 Claude Code 写入） |
 | `stuck_report.json` | 卡壳信号（触发 2.4） |
+| `fix_request.json` | autorun 修复请求（触发 2.5） |
+| `scripts/autorun.py` | 目标驱动的自我修复执行循环 |
 
 ---
 

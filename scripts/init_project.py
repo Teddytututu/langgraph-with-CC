@@ -34,6 +34,7 @@ RUNTIME_FILES = [
     "decision_request.json",
     "decision_result.json",
     "stuck_report.json",
+    "fix_request.json",
     "checkpoints.db",
 ]
 
