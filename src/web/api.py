@@ -1242,7 +1242,6 @@ def register_routes(app: FastAPI):
                     if status in TERMINAL_STATUSES:
                         app_state._set_task_and_system_state_unlocked(
                             task_id,
-                            system_status="idle" if status in {"cancelled", "completed", "failed"} else app_state.system_status,
                             current_node="",
                             current_task_id=None,
                         )

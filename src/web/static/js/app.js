@@ -76,6 +76,7 @@ createApp({
         const chatMessages = ref([]);
         const chatInput = ref('');
         const chatThinking = ref(false);
+        const lastStateRev = ref(0);
 
         const parseTimestampToMs = (value) => {
             if (value === null || value === undefined || value === '') return Date.now();
@@ -96,6 +97,21 @@ createApp({
 
             const parsed = Date.parse(text);
             return Number.isNaN(parsed) ? Date.now() : parsed;
+        };
+
+        const getPayloadStateRev = (payload) => {
+            const rev = Number(payload?.state_rev);
+            return Number.isFinite(rev) ? rev : null;
+        };
+
+        const shouldApplyStatePayload = (payload) => {
+            const incomingRev = getPayloadStateRev(payload);
+            if (incomingRev === null) return true;
+            if (incomingRev < lastStateRev.value) return false;
+            if (incomingRev > lastStateRev.value) {
+                lastStateRev.value = incomingRev;
+            }
+            return true;
         };
 
         const formatTimestampHHMMSS = (value) => {
@@ -245,9 +261,9 @@ createApp({
                 wsConnected.value = true;
                 // 重连后做一次全量同步，拉平断线期间的状态差异
                 if (_wsEverConnected) {
-                    await fetchTasks();
                     await fetchSystemStatus();
-                    await fetchGraph();
+                    await fetchTasks();
+                    scheduleGraphRefresh(0);
                 }
                 _wsEverConnected = true;
             };
@@ -264,7 +280,14 @@ createApp({
 
             switch (event) {
                 case 'system_status_changed': {
+                    if (!shouldApplyStatePayload(payload)) break;
                     systemStatus.value = payload.status;
+                    if (payload.current_node !== undefined) {
+                        currentNode.value = payload.current_node || '';
+                    }
+                    if (payload.current_task_id !== undefined) {
+                        currentTaskId.value = payload.current_task_id || '';
+                    }
                     const prev = lastSystemStatusForTimeline.value;
                     if (payload.status && payload.status !== prev) {
                         addTimelineItem({
@@ -281,10 +304,11 @@ createApp({
                         lastSystemStatusForTimeline.value = payload.status;
                     }
                     termLog(`▶ System → ${payload.status}${payload.task ? ': ' + payload.task.slice(0, 60) : ''}`, 'start');
-                    fetchGraph();
+                    scheduleGraphRefresh();
                     break;
                 }
                 case 'node_changed': {
+                    if (!shouldApplyStatePayload(payload)) break;
                     currentNode.value = payload.node;
                     addTimelineItem({
                         id: `node_changed|${payload.task_id || ''}|${payload.node || ''}|${payload.ts || ''}`,
@@ -297,7 +321,7 @@ createApp({
                         detail: payload.phase ? `Phase -> ${payload.phase}` : '',
                         sourceEvent: 'node_changed',
                     });
-                    fetchGraph();
+                    scheduleGraphRefresh();
                     break;
                 }
                 case 'terminal_output':
@@ -321,6 +345,7 @@ createApp({
                     }
                     break;
                 case 'task_created':
+                    if (!shouldApplyStatePayload(payload)) break;
                     if (!tasks.value.find(t => t.id === payload.id)) tasks.value.unshift(payload);
                     reports.value = [];
                     activeReport.value = '';
@@ -465,6 +490,7 @@ createApp({
                     break;
                 }
                 case 'tasks_cleared':
+                    if (!shouldApplyStatePayload(payload)) break;
                     tasks.value = [];
                     selectedTask.value = null;
                     selectedSubtask.value = null;
@@ -490,7 +516,7 @@ createApp({
                     reports.value = [];
                     activeReport.value = '';
                     activeReportContent.value = '';
-                    fetchGraph();
+                    scheduleGraphRefresh();
                     break;
             }
         };
@@ -505,6 +531,14 @@ createApp({
 
         // 防抖定时器（用于减少频繁重绘）
         let _graphDebounceTimer = null;
+        let _graphRefreshTimer = null;
+        const scheduleGraphRefresh = (delay = 180) => {
+            if (_graphRefreshTimer) clearTimeout(_graphRefreshTimer);
+            _graphRefreshTimer = setTimeout(() => {
+                _graphRefreshTimer = null;
+                fetchGraph();
+            }, delay);
+        };
 
         const handleTaskProgress = (payload) => {
             const task = tasks.value.find(t => t.id === payload.task_id);
@@ -548,7 +582,7 @@ createApp({
                 // 只在状态变化时才重绘图（防抖 500ms，避免频繁刷新导致页面跳动）
                 if (hasRealChange) {
                     if (_graphDebounceTimer) clearTimeout(_graphDebounceTimer);
-                    _graphDebounceTimer = setTimeout(() => fetchGraph(), 500);
+                    _graphDebounceTimer = setTimeout(() => scheduleGraphRefresh(0), 500);
                 }
             }
 
@@ -645,7 +679,7 @@ createApp({
                     refreshDiscussionStatusFromSelection();
                 }
             }
-            fetchGraph();
+            scheduleGraphRefresh();
             fetchReports();
         };
 
@@ -658,6 +692,13 @@ createApp({
                 }
                 const data = await res.json();
                 const incoming = data.tasks || [];
+                const incomingRev = Number(data.state_rev);
+                if (Number.isFinite(incomingRev) && incomingRev < lastStateRev.value) {
+                    return;
+                }
+                if (Number.isFinite(incomingRev) && incomingRev > lastStateRev.value) {
+                    lastStateRev.value = incomingRev;
+                }
 
                 // Add new tasks, update existing ones in-place
                 incoming.forEach(newT => {
@@ -848,6 +889,13 @@ createApp({
                     throw new Error(`HTTP ${res.status}`);
                 }
                 const data = await res.json();
+                const incomingRev = Number(data.state_rev);
+                if (Number.isFinite(incomingRev) && incomingRev < lastStateRev.value) {
+                    return;
+                }
+                if (Number.isFinite(incomingRev) && incomingRev > lastStateRev.value) {
+                    lastStateRev.value = incomingRev;
+                }
                 systemStatus.value = data.status;
                 currentNode.value = data.current_node || '';
                 currentTaskId.value = data.current_task_id || '';
@@ -917,7 +965,7 @@ createApp({
                 tasks.value = [];
                 selectedTask.value = null;
                 terminalLines.value = [];
-                fetchGraph();
+                scheduleGraphRefresh();
             } catch (e) {
                 alert('请求失败: ' + e.message);
             }
@@ -1192,7 +1240,7 @@ createApp({
             connectWebSocket();
             await fetchTasks();
             await fetchSystemStatus(true);  // true = 恢复终端日志
-            fetchGraph();
+            scheduleGraphRefresh(0);
             fetchReports();
 
             // 刷新后自动选中正在运行的任务，否则选最新任务
@@ -1214,7 +1262,7 @@ createApp({
                 console.warn('[Polling] WS disconnected, falling back to HTTP poll');
                 await fetchSystemStatus();
                 await fetchTasks();
-                await fetchGraph();
+                scheduleGraphRefresh(0);
                 refreshDiscussionStatusFromSelection();
             }, 5000);
         });
