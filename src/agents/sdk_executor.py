@@ -16,6 +16,13 @@ from datetime import datetime
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
+# 加载 .env，确保 DEFAULT_MODEL 等配置可用
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,9 +147,10 @@ class SDKExecutor:
             if system_prompt:
                 options_kwargs["system_prompt"] = system_prompt
 
-            # 模型配置（不指定则使用用户已配置的默认）
-            if model and model not in ("inherit", ""):
-                options_kwargs["model"] = model
+            # 模型配置：inherit/空 时读取 DEFAULT_MODEL 环境变量作为显式默认
+            resolved_model = model if (model and model not in ("inherit", "")) else os.getenv("DEFAULT_MODEL", "")
+            if resolved_model:
+                options_kwargs["model"] = resolved_model
 
             # 工作目录
             if cwd:
