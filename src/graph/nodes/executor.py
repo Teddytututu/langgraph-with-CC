@@ -13,11 +13,6 @@ from src.agents.caller import get_caller
 logger = logging.getLogger(__name__)
 
 
-def _compute_timeout(task: SubTask) -> float:
-    """Outer timeout for multi-round discussion + synthesis."""
-    return max(900.0, min(task.estimated_minutes * 150.0, 2400.0))
-
-
 def _ensure_domains(task: SubTask, min_count: int = 3) -> list[str]:
     """Guarantee at least min_count knowledge domains per task (non-strict helper)."""
     domains = list(dict.fromkeys(task.knowledge_domains or [task.agent_type]))
@@ -143,6 +138,7 @@ async def _execute_multi_agent_discussion(
                 "error": f"[POLICY_VIOLATION] domains<{min_agents}",
                 "result": None,
                 "specialist_id": None,
+                "assigned_agents": [],
                 "actual_agents_used": 0,
                 "actual_discussion_rounds": 0,
             },
@@ -155,13 +151,16 @@ async def _execute_multi_agent_discussion(
             task_description=f"[{domain}] {task.description}",
         )
 
-    created = await asyncio.gather(*[_create_one(d) for d in unique_domains], return_exceptions=True)
+    created: list[tuple[str, str | None]] = []
+    for d in unique_domains:
+        try:
+            sid = await _create_one(d)
+            created.append(sid)
+        except Exception as item:
+            logger.warning("[discussion] get_or_create_specialist raised: %s", item)
 
     specialists: list[dict] = []
     for item in created:
-        if isinstance(item, Exception):
-            logger.warning("[discussion] get_or_create_specialist raised: %s", item)
-            continue
         domain, sid = item
         if sid:
             specialists.append({"id": sid, "domain": domain})
@@ -187,6 +186,7 @@ async def _execute_multi_agent_discussion(
                 "error": "no specialists created",
                 "result": None,
                 "specialist_id": None,
+                "assigned_agents": [],
                 "actual_agents_used": 0,
                 "actual_discussion_rounds": 0,
             },
@@ -217,6 +217,7 @@ async def _execute_multi_agent_discussion(
 
     round_outputs: dict[int, list[dict]] = {}
     rounds_executed = 0
+    successful_agent_ids: list[str] = []
 
     async def _call_round_specialist(spec: dict, round_idx: int, prior_round_digest: str) -> dict:
         prompt = (
@@ -233,17 +234,12 @@ async def _execute_multi_agent_discussion(
             "Keep it concrete and concise (<500 words)."
         )
         try:
-            res = await asyncio.wait_for(
-                caller.call_specialist(
-                    agent_id=spec["id"],
-                    subtask={**subtask_dict, "description": prompt},
-                    previous_results=previous_results,
-                    time_budget=budget_ctx,
-                ),
-                timeout=360.0,
+            res = await caller.call_specialist(
+                agent_id=spec["id"],
+                subtask={**subtask_dict, "description": prompt},
+                previous_results=previous_results,
+                time_budget=budget_ctx,
             )
-        except asyncio.TimeoutError:
-            res = {"success": False, "error": "timed out after 360s", "result": None}
         except Exception as e:
             res = {"success": False, "error": str(e), "result": None}
 
@@ -286,6 +282,7 @@ async def _execute_multi_agent_discussion(
                     "error": f"discussion_round_{round_idx}_empty",
                     "result": None,
                     "specialist_id": None,
+                    "assigned_agents": [],
                     "actual_agents_used": len(unique_specialist_ids),
                     "actual_discussion_rounds": rounds_executed,
                 },
@@ -300,6 +297,7 @@ async def _execute_multi_agent_discussion(
                     "error": f"[POLICY_VIOLATION] round_{round_idx}_agents<{min_agents}",
                     "result": None,
                     "specialist_id": None,
+                    "assigned_agents": [],
                     "actual_agents_used": success_agents,
                     "actual_discussion_rounds": rounds_executed,
                 },
@@ -308,6 +306,10 @@ async def _execute_multi_agent_discussion(
 
         rounds_executed = round_idx
         round_outputs[round_idx] = entries
+        round_success_agents = list(dict.fromkeys([e["agent"] for e in entries if e.get("success")]))
+        for agent_id in round_success_agents:
+            if agent_id not in successful_agent_ids:
+                successful_agent_ids.append(agent_id)
 
         digest_lines = []
         for e in entries[:8]:
@@ -321,6 +323,7 @@ async def _execute_multi_agent_discussion(
                 "error": f"[POLICY_VIOLATION] rounds<{min_rounds}",
                 "result": None,
                 "specialist_id": None,
+                "assigned_agents": successful_agent_ids,
                 "actual_agents_used": len(unique_specialist_ids),
                 "actual_discussion_rounds": rounds_executed,
             },
@@ -348,14 +351,11 @@ async def _execute_multi_agent_discussion(
 
     synthesizer_id = specialists[0]["id"]
     try:
-        synth_res = await asyncio.wait_for(
-            caller.call_specialist(
-                agent_id=synthesizer_id,
-                subtask={**subtask_dict, "description": synthesis_prompt},
-                previous_results=[],
-                time_budget=budget_ctx,
-            ),
-            timeout=420.0,
+        synth_res = await caller.call_specialist(
+            agent_id=synthesizer_id,
+            subtask={**subtask_dict, "description": synthesis_prompt},
+            previous_results=[],
+            time_budget=budget_ctx,
         )
     except Exception as e:
         synth_res = {"success": False, "error": str(e), "result": None}
@@ -372,6 +372,7 @@ async def _execute_multi_agent_discussion(
                     "error": "[POLICY_VIOLATION] synthesis_empty",
                     "result": None,
                     "specialist_id": None,
+                    "assigned_agents": [],
                     "actual_agents_used": len(unique_specialist_ids),
                     "actual_discussion_rounds": rounds_executed,
                 },
@@ -392,6 +393,7 @@ async def _execute_multi_agent_discussion(
             "success": True,
             "result": final_result,
             "specialist_id": synthesizer_id,
+            "assigned_agents": successful_agent_ids,
             "error": None,
             "actual_agents_used": len(unique_specialist_ids),
             "actual_discussion_rounds": rounds_executed,
@@ -463,11 +465,31 @@ async def executor_node(state: GraphState) -> dict:
             return {"phase": "reviewing", "current_subtask_id": None, "artifacts": artifacts}
 
         started_at = datetime.now()
+        required_agents = max(1, policy.min_agents_per_node)
+        declared_domains = list(dict.fromkeys(next_task.knowledge_domains or [next_task.agent_type]))
+        seed_domains = declared_domains if policy.strict_enforcement else _ensure_domains(next_task, min_count=max(3, required_agents))
+
+        prefetched_agents: list[str] = []
+        for domain in seed_domains:
+            try:
+                sid = await caller.get_or_create_specialist(
+                    skills=[domain],
+                    task_description=f"[{domain}] {next_task.description}",
+                )
+                if sid and sid not in prefetched_agents:
+                    prefetched_agents.append(sid)
+            except Exception as exc:
+                logger.warning("[executor] prefetch specialist failed for %s: %s", domain, exc)
+
         updated_subtasks = [
-            t.model_copy(update={"status": "running", "started_at": started_at}) if t.id == next_task.id else t
+            t.model_copy(update={
+                "status": "running",
+                "started_at": started_at,
+                "assigned_agents": prefetched_agents,
+            }) if t.id == next_task.id else t
             for t in subtasks
         ]
-        logger.info("[executor] task %s moved to running", next_task.id)
+        logger.info("[executor] task %s moved to running with agents=%s", next_task.id, prefetched_agents)
         return {
             "subtasks": updated_subtasks,
             "current_subtask_id": next_task.id,
@@ -477,6 +499,7 @@ async def executor_node(state: GraphState) -> dict:
                 "event": "task_started",
                 "task_id": next_task.id,
                 "agent": next_task.agent_type,
+                "assigned_agents": prefetched_agents,
                 "timestamp": started_at.isoformat(),
             }],
         }
@@ -531,7 +554,6 @@ async def executor_node(state: GraphState) -> dict:
         }
 
     domains = declared_domains if policy.strict_enforcement else _ensure_domains(next_task, min_count=max(3, required_agents))
-    timeout = _compute_timeout(next_task)
 
     logger.info(
         "[executor] Starting discussion | task=%s | domains=%s | required_agents=%d | required_rounds=%d | strict=%s",
@@ -539,29 +561,16 @@ async def executor_node(state: GraphState) -> dict:
     )
 
     try:
-        call_result, discussion_log = await asyncio.wait_for(
-            _execute_multi_agent_discussion(
-                caller,
-                next_task,
-                domains,
-                previous_results,
-                budget_ctx,
-                min_rounds=required_rounds,
-                min_agents=required_agents,
-                strict=policy.strict_enforcement,
-            ),
-            timeout=timeout,
+        call_result, discussion_log = await _execute_multi_agent_discussion(
+            caller,
+            next_task,
+            domains,
+            previous_results,
+            budget_ctx,
+            min_rounds=required_rounds,
+            min_agents=required_agents,
+            strict=policy.strict_enforcement,
         )
-    except asyncio.TimeoutError:
-        call_result = {
-            "success": False,
-            "error": f"discussion timeout ({timeout:.0f}s)",
-            "result": None,
-            "specialist_id": None,
-            "actual_agents_used": 0,
-            "actual_discussion_rounds": 0,
-        }
-        discussion_log = []
     except Exception as exc:
         logger.exception("[executor] discussion crashed for task %s", next_task.id)
         call_result = {
@@ -569,12 +578,14 @@ async def executor_node(state: GraphState) -> dict:
             "error": f"discussion crashed: {exc}",
             "result": None,
             "specialist_id": None,
+            "assigned_agents": [],
             "actual_agents_used": 0,
             "actual_discussion_rounds": 0,
         }
         discussion_log = []
 
     specialist_id = call_result.get("specialist_id")
+    assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
     actual_agents_used = int(call_result.get("actual_agents_used") or 0)
     actual_rounds = int(call_result.get("actual_discussion_rounds") or 0)
 
@@ -592,6 +603,7 @@ async def executor_node(state: GraphState) -> dict:
             ),
             "result": None,
             "specialist_id": specialist_id,
+            "assigned_agents": assigned_agents,
             "actual_agents_used": actual_agents_used,
             "actual_discussion_rounds": actual_rounds,
         }
@@ -657,6 +669,7 @@ async def executor_node(state: GraphState) -> dict:
         "status": "done",
         "result": result_text,
         "specialist_id": specialist_id,
+        "assigned_agents": assigned_agents,
         "finished_at": datetime.now(),
     }
 
@@ -687,16 +700,17 @@ async def executor_node(state: GraphState) -> dict:
     if specialist_id:
         caller.complete_subtask(specialist_id)
 
-    all_agents = list({e["agent"] for e in discussion_log})
     updated_subtasks = []
     for t in subtasks:
         if t.id == next_task.id:
+            fallback_agents = list(dict.fromkeys([e["agent"] for e in discussion_log]))
+            final_assigned_agents = assigned_agents or fallback_agents
             updated_subtasks.append(t.model_copy(update={
                 "status": result["status"],
                 "result": result["result"],
                 "started_at": started_at,
                 "finished_at": result["finished_at"],
-                "assigned_agents": all_agents,
+                "assigned_agents": final_assigned_agents,
             }))
         else:
             updated_subtasks.append(t)
@@ -713,6 +727,7 @@ async def executor_node(state: GraphState) -> dict:
             "task_id": next_task.id,
             "agent": next_task.agent_type,
             "specialist_id": specialist_id,
+            "assigned_agents": assigned_agents,
             "status": result["status"],
             "discussion_rounds": actual_rounds,
             "discussion_agents": actual_agents_used,
