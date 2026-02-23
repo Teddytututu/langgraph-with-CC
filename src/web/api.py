@@ -224,7 +224,18 @@ def register_routes(app: FastAPI):
     async def create_task(req: TaskCreate):
         """创建新任务"""
         import uuid
+        from pathlib import Path as _Path
         task_id = str(uuid.uuid4())[:8]
+
+        # 清空上一次任务的 reports/ 文件，避免旧报告污染新任务视图
+        _reports_dir = _Path("reports")
+        if _reports_dir.exists():
+            for _f in _reports_dir.iterdir():
+                if _f.is_file() and _f.suffix in (".md", ".json", ".txt"):
+                    try:
+                        _f.unlink()
+                    except Exception:
+                        pass
 
         task_data = {
             "id": task_id,
@@ -241,9 +252,13 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_created", task_data)
 
-        # 自动启动：创建后立即触发执行
+        # 自动启动：创建后立即触发执行（如有其他任务在跑则等待）
         async def _auto_start():
-            await asyncio.sleep(0.1)
+            # 等待系统空闲，最多 60 分钟
+            waited = 0
+            while app_state.system_status == "running" and waited < 3600:
+                await asyncio.sleep(5)
+                waited += 5
             task_data["status"] = "running"
             app_state.system_status = "running"
             app_state.current_task_id = task_id
@@ -309,6 +324,37 @@ def register_routes(app: FastAPI):
             "subtasks": subtasks,
         })
         return target
+
+    @app.delete("/api/tasks/{task_id}")
+    async def cancel_task(task_id: str):
+        """取消/停止指定任务"""
+        if task_id not in app_state.tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = app_state.tasks[task_id]
+        old_status = task.get("status")
+
+        if old_status == "running":
+            task["status"] = "cancelled"
+            task["error"] = "用户取消"
+            app_state.mark_dirty()
+
+            # 如果这是当前任务，重置系统状态
+            if app_state.current_task_id == task_id:
+                app_state.system_status = "idle"
+                app_state.current_node = ""
+
+            await app_state.broadcast("task_cancelled", {
+                "id": task_id,
+                "previous_status": old_status,
+            })
+
+            # 检查是否还有其他运行中的任务
+            still_running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
+            if not still_running:
+                app_state.system_status = "idle"
+
+        return {"status": "cancelled", "task_id": task_id}
 
     @app.post("/api/tasks/{task_id}/intervene")
     async def intervene_task(task_id: str, req: TaskIntervene):
@@ -523,6 +569,35 @@ def register_routes(app: FastAPI):
                                     "error"
                                 )
 
+                    # 将 GraphState.discussions 同步到 discussion_manager
+                    # GraphState key: node_id; manager key: {task_id}_{node_id}
+                    if "discussions" in state_update:
+                        for node_id, node_disc in (state_update["discussions"] or {}).items():
+                            manager_key = f"{task_id}_{node_id}"
+                            existing = app_state.discussion_manager.get_discussion(manager_key)
+                            if existing is None:
+                                existing = app_state.discussion_manager.create_discussion(manager_key)
+                            # 合并新消息（避免重复追加）
+                            existing_ids = {m.id for m in existing.messages}
+                            for msg in (node_disc.messages if hasattr(node_disc, "messages") else []):
+                                if msg.id not in existing_ids:
+                                    # 复制消息并修正 node_id 为 manager key
+                                    from src.discussion.types import DiscussionMessage as _DM
+                                    synced = _DM(
+                                        id=msg.id,
+                                        node_id=node_id,
+                                        from_agent=msg.from_agent,
+                                        to_agents=msg.to_agents,
+                                        content=msg.content,
+                                        timestamp=msg.timestamp,
+                                        message_type=msg.message_type,
+                                        metadata=msg.metadata,
+                                    )
+                                    existing.add_message(synced)
+                            existing.status = getattr(node_disc, "status", "resolved")
+                            existing.consensus_reached = getattr(node_disc, "consensus_reached", False)
+                            existing.consensus_topic = getattr(node_disc, "consensus_topic", None)
+
                     if state_update.get("final_output"):
                         task["result"] = state_update["final_output"]
                         task["status"] = "completed"
@@ -569,8 +644,9 @@ def register_routes(app: FastAPI):
                 "time": datetime.now().isoformat()
             }
 
-            # 保存崩溃报告到文件
-            crash_report_path = Path("crash_report.json")
+            # 保存崩溃报告到 reports/ 目录（规范化）
+            Path("reports").mkdir(exist_ok=True)
+            crash_report_path = Path("reports/crash_report.json")
             with open(crash_report_path, "w", encoding="utf-8") as f:
                 json.dump(crash_report, f, indent=2, ensure_ascii=False)
 

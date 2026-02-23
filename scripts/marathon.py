@@ -104,8 +104,31 @@ def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
     _log("修复完成（fix_request.json 已删除）")
 
 
+def _wait_for_idle(timeout: int = 600) -> bool:
+    """等待系统变为 idle，最多等待 timeout 秒。返回是否成功空闲。"""
+    deadline = time.monotonic() + timeout
+    ticks = 0
+    while time.monotonic() < deadline:
+        try:
+            s = _api("GET", "/api/system/status").get("status", "idle")
+            if s not in ("running",):
+                return True
+            if ticks % 4 == 0:
+                elapsed = int(time.monotonic() - (deadline - timeout))
+                _log(f"  系统仍在运行中，等待空闲... ({elapsed}s)")
+        except Exception:
+            pass
+        ticks += 1
+        time.sleep(WAIT_POLL)
+    return False
+
+
 def _submit_task(task_text: str, time_minutes: float) -> str | None:
     """提交任务，返回 task_id。失败返回 None。"""
+    # 确保系统空闲再提交，避免多任务并发
+    if not _wait_for_idle(timeout=600):
+        _log("等待系统空闲超时，跳过本次提交")
+        return None
     try:
         resp = _api("POST", "/api/tasks", {"task": task_text, "time_minutes": time_minutes})
         return resp.get("id")
