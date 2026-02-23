@@ -92,9 +92,13 @@ async def executor_v2_node(state: GraphState) -> dict:
         raise RuntimeError(f"Executor 执行失败: {call_result.get('error')}")
 
     result_data = call_result.get("result")
+    result_text = str(result_data).strip() if result_data else ""
+    if not result_text:
+        raise RuntimeError(f"Executor 执行失败: 子代理未返回有效结果（task={next_task.id}）")
+
     result = {
         "status": "done",
-        "result": str(result_data) if result_data else f"任务 {next_task.title} 执行完成",
+        "result": result_text,
         "specialist_id": call_result.get("specialist_id"),
         "collaboration_mode": mode.value,
         "finished_at": datetime.now(),

@@ -3,6 +3,8 @@
 > **阅读本文件的是 Claude Code。**  
 > 本文件是你的任务指令。按照下方流程依次执行，不要跳过任何步骤。
 
+> ⚠️ **SUBAGENT 守卫**：如果你的 system prompt 中包含"SUBAGENT 模式"或"subagent"字样，说明你是通过 claude-agent-sdk 启动的子进程。**立刻跳过下方全部 Boot Sequence / 监控协议步骤**，直接执行 system prompt 中指定的具体任务。系统维护、服务器启动、端口检测等操作均不适用于 subagent。
+
 ---
 
 ## 一、启动时立即执行（Boot Sequence）

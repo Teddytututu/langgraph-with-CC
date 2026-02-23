@@ -143,9 +143,20 @@ class SDKExecutor:
                 "setting_sources": ["user", "project"],
             }
 
-            # 系统提示：直接作为字符串传入，追加到 CLAUDE.md 之后
-            if system_prompt:
-                options_kwargs["system_prompt"] = system_prompt
+            # 系统提示：注入 subagent 守卫前缀，防止模型执行 CLAUDE.md Boot Sequence
+            # gpt-5.3-codex 等高遵从性模型会读取 CLAUDE.md 并执行启动步骤，导致进程退出码 1
+            _SUBAGENT_GUARD = (
+                "# ⚠️ SUBAGENT 模式（忽略所有启动序列）\n"
+                "你是通过 claude-agent-sdk 启动的子进程 subagent。\n"
+                "**严禁执行以下操作**：\n"
+                "- 检查/启动 uvicorn 服务器（端口 8001 或其他端口）\n"
+                "- 运行 scripts/watch.py、scripts/autorun.py 等监控脚本\n"
+                "- 检查 Python venv、安装依赖\n"
+                "- 任何服务器启动、端口检查、进程管理等系统运维操作\n"
+                "**直接执行下方指定的具体任务，不要做任何启动/维护操作。**\n\n"
+            )
+            combined_prompt = _SUBAGENT_GUARD + (system_prompt or "")
+            options_kwargs["system_prompt"] = combined_prompt
 
             # 模型配置：inherit/空 时读取 DEFAULT_MODEL 环境变量作为显式默认
             resolved_model = model if (model and model not in ("inherit", "")) else os.getenv("DEFAULT_MODEL", "")
@@ -157,6 +168,11 @@ class SDKExecutor:
                 options_kwargs["cwd"] = cwd
 
             options = ClaudeAgentOptions(**options_kwargs)
+
+            # 执行前确保无 auth 冲突：ANTHROPIC_API_KEY 优先，临时移除 AUTH_TOKEN
+            _auth_token_backup = None
+            if os.getenv("ANTHROPIC_API_KEY") and os.getenv("ANTHROPIC_AUTH_TOKEN"):
+                _auth_token_backup = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
             # 执行，迭代完所有消息
             result_data: list[str] = []
@@ -229,6 +245,16 @@ class SDKExecutor:
                             final_result = str(v).strip()
                             break
                 _log.warning("All result sources empty for agent=%s turns=%d", agent_id, turns)
+
+            if _auth_token_backup:
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = _auth_token_backup
+
+            # 若没有任何可用结果，视为执行失败（避免上层误判为“秒完成”）
+            if not final_result or not str(final_result).strip():
+                return SubagentResult(
+                    success=False,
+                    error=f"子代理未返回有效结果（agent={agent_id}, turns={turns}）"
+                )
 
             return SubagentResult(
                 success=True,
