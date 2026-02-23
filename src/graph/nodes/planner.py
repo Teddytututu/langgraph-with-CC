@@ -1,4 +1,5 @@
 """src/graph/nodes/planner.py — 任务分解节点"""
+import asyncio
 import json
 from datetime import datetime
 from src.graph.state import GraphState, SubTask
@@ -6,20 +7,29 @@ from src.utils.config import get_config
 from src.agents.caller import get_caller
 
 PLANNER_SYSTEM_PROMPT = """
-你是一个任务规划专家。你的职责是将用户的复杂任务分解为可执行的子任务。
+你是一个任务规划专家。你的职责是将用户的复杂任务分解为具有复杂依赖关系的子任务图（DAG+条件环）。
 
-## 规则
-1. 每个子任务必须是一个 Agent 可以独立完成的原子操作
-2. 明确标注子任务之间的依赖关系（哪些必须先完成）
+## 核心规则
+1. 每个子任务必须分配 **3个以上不同领域** 的 knowledge_domains，确保多专家参与讨论
+2. 子任务之间必须构建 **复杂依赖关系**：
+   - 不能只是线性链（A→B→C），必须包含 **菱形依赖**（A→B,C→D）、**交叉依赖**（A→C, B→C, C→D,E）
+   - 至少有 **2组并行任务** 和 **1个汇聚节点**（多依赖合并）
+   - 必须包含 **验证→修复→再验证** 的条件回环结构
 3. 为每个子任务指定最合适的 Agent 类型：
    - coder: 编写/修改代码、脚本
    - researcher: 搜索信息、阅读文档、调研
    - writer: 撰写文档、报告、文案
    - analyst: 数据分析、逻辑推理、方案对比
-4. 估算每个子任务的耗时（分钟）
-5. 子任务数量控制在 3~10 个，不要过度拆分
-6. 必须考虑用户给定的时间预算，合理分配
-7. 为每个子任务列出所需知识领域（knowledge_domains），如 ["python", "async", "database"]
+4. 子任务数量控制在 **6~12 个**
+5. 必须考虑时间预算，但要保证每个任务有足够时间让 3+ 专家进行 10+ 轮讨论
+6. **必须包含修复类子任务**：对诊断发现的问题编写修复，并有后续验证任务依赖修复结果
+
+## 依赖图结构示例
+```
+task-001,002 并行诊断 → task-003 汇聚分析 → task-004,005 并行修复 → task-006 回归验证
+                                                                    ↑____________↓ (验证失败则重修)
+task-007 总结报告 ← task-006
+```
 
 ## 输出格式
 返回严格的 JSON 数组，每个元素包含：
@@ -28,7 +38,7 @@ PLANNER_SYSTEM_PROMPT = """
  "agent_type": "coder",
  "dependencies": [], "priority": 1,
  "estimated_minutes": 10,
- "knowledge_domains": ["domain1", "domain2"],
+ "knowledge_domains": ["domain1", "domain2", "domain3"],
  "completion_criteria": ["标准1", "标准2"]}
 """
 
@@ -53,11 +63,20 @@ async def planner_node(state: GraphState) -> dict:
             "remaining_minutes": budget.remaining_minutes,
         }
 
-    # 直接调用 planner subagent
-    call_result = await caller.call_planner(
-        task=user_task,
-        time_budget=time_budget_info
-    )
+    # 直接调用 planner subagent（最多等 120s，超时则使用降级子任务）
+    try:
+        call_result = await asyncio.wait_for(
+            caller.call_planner(task=user_task, time_budget=time_budget_info),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("[planner] SDK call timed out (120s), using fallback subtasks")
+        call_result = {"success": False, "error": "planner SDK timeout"}
+    except Exception as _pe:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("[planner] SDK call failed: %s, using fallback subtasks", _pe)
+        call_result = {"success": False, "error": str(_pe)}
 
     # 检查执行是否成功（V1 降级：失败时自动使用默认四阶段子任务，不崩溃整图）
     if not call_result.get("success"):
@@ -71,54 +90,103 @@ async def planner_node(state: GraphState) -> dict:
     # 解析子任务
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
 
-    # 如果 subagent 未返回有效结果，生成标准四阶段子任务
+    # 如果 subagent 未返回有效结果，生成复杂依赖结构的子任务（菱形+回环）
     if not subtasks:
         base_mins = budget.total_minutes if budget else 60
         task_preview = user_task[:200]
         subtasks = [
+            # ── Phase 1: 并行诊断 ──
             SubTask(
                 id="task-001",
-                title="需求分析与方案规划",
-                description=f"深入理解任务目标，分析关键约束与风险，制定可行的实施方案。\n原始任务：{task_preview}",
+                title="代码与架构诊断",
+                description=f"深入检查系统代码质量、架构设计、模块耦合度，识别技术债务和设计缺陷。\n原始任务：{task_preview}",
                 agent_type="analyst",
                 dependencies=[],
                 priority=1,
-                estimated_minutes=max(5.0, base_mins * 0.15),
-                knowledge_domains=["analysis", "planning"],
-                completion_criteria=["明确了任务目标与范围", "制定了分步实施方案", "识别了主要风险"],
+                estimated_minutes=max(8.0, base_mins * 0.12),
+                knowledge_domains=["python", "architecture", "code_quality", "testing"],
+                completion_criteria=["列出所有代码缺陷", "评估架构健康度", "识别高风险模块"],
             ),
             SubTask(
                 id="task-002",
-                title="核心内容实现",
-                description=f"按照方案完成核心功能/内容的实现，确保满足主要需求。\n原始任务：{task_preview}",
-                agent_type="coder",
-                dependencies=["task-001"],
-                priority=2,
-                estimated_minutes=max(10.0, base_mins * 0.50),
-                knowledge_domains=["implementation"],
-                completion_criteria=["完成了所有核心功能", "代码/内容质量达标"],
+                title="运行时与API诊断",
+                description="检查所有API接口可用性、WebSocket连接稳定性、subagent调度流程、端到端响应时间。",
+                agent_type="researcher",
+                dependencies=[],
+                priority=1,
+                estimated_minutes=max(8.0, base_mins * 0.12),
+                knowledge_domains=["api_testing", "networking", "performance", "monitoring"],
+                completion_criteria=["所有API接口测试通过率统计", "识别响应超时问题", "subagent调度瓶颈"],
             ),
             SubTask(
                 id="task-003",
-                title="质量验证与问题修复",
-                description="对实现成果进行全面质量验证，识别并修复存在的问题，确保满足验收标准。",
+                title="讨论机制与协作诊断",
+                description="检查多agent讨论机制、协作模式切换、共识达成效率、结果合并质量。",
                 agent_type="analyst",
-                dependencies=["task-002"],
-                priority=3,
-                estimated_minutes=max(5.0, base_mins * 0.20),
-                knowledge_domains=["testing", "review"],
-                completion_criteria=["通过了功能验证", "关键缺陷已修复", "满足验收标准"],
+                dependencies=[],
+                priority=1,
+                estimated_minutes=max(8.0, base_mins * 0.12),
+                knowledge_domains=["collaboration", "discussion", "consensus", "workflow"],
+                completion_criteria=["讨论机制可用性验证", "协作模式切换测试", "共识效率评估"],
             ),
+            # ── Phase 2: 汇聚分析（菱形聚合） ──
             SubTask(
                 id="task-004",
-                title="结果汇总与报告输出",
-                description="整合所有阶段的分析结果和验证反馈，生成结构化的最终报告，包含执行摘要、发现问题、改进建议和交付物列表。",
-                agent_type="researcher",
-                dependencies=["task-003"],
+                title="综合问题汇聚与修复方案",
+                description="汇总task-001/002/003的诊断结果，交叉分析问题根因，制定优先级排序的修复方案，评估修复影响范围。",
+                agent_type="analyst",
+                dependencies=["task-001", "task-002", "task-003"],
+                priority=2,
+                estimated_minutes=max(8.0, base_mins * 0.12),
+                knowledge_domains=["root_cause_analysis", "planning", "risk_assessment", "architecture"],
+                completion_criteria=["问题按严重度排序", "每个问题有修复方案", "评估修复风险"],
+            ),
+            # ── Phase 3: 并行修复（菱形展开） ──
+            SubTask(
+                id="task-005",
+                title="核心缺陷修复",
+                description="根据task-004的修复方案，修复最高优先级的代码缺陷和架构问题，编写修复代码并确保每个改动有单元测试覆盖。",
+                agent_type="coder",
+                dependencies=["task-004"],
+                priority=3,
+                estimated_minutes=max(10.0, base_mins * 0.15),
+                knowledge_domains=["python", "debugging", "testing", "refactoring"],
+                completion_criteria=["高优先级缺陷已修复", "修复代码有测试", "无新引入回归"],
+            ),
+            SubTask(
+                id="task-006",
+                title="配置与流程修复",
+                description="根据task-004的修复方案，修复运行时配置问题、API接口缺陷、调度流程异常。",
+                agent_type="coder",
+                dependencies=["task-004"],
+                priority=3,
+                estimated_minutes=max(10.0, base_mins * 0.15),
+                knowledge_domains=["api_design", "configuration", "workflow", "error_handling"],
+                completion_criteria=["配置问题已消除", "API接口行为正确", "调度流程顺畅"],
+            ),
+            # ── Phase 4: 回归验证（聚合+条件回环） ──
+            SubTask(
+                id="task-007",
+                title="回归验证与集成测试",
+                description="对task-005/006的修复进行全面回归验证：重跑Phase1的诊断项，确保所有问题已修复且无新回归。若发现未修复问题，记录到结果中供后续迭代。",
+                agent_type="analyst",
+                dependencies=["task-005", "task-006"],
                 priority=4,
-                estimated_minutes=max(5.0, base_mins * 0.15),
-                knowledge_domains=["reporting", "analysis", "documentation"],
-                completion_criteria=["包含执行摘要和主要发现", "列出所有交付物及其位置", "提供后续行动建议"],
+                estimated_minutes=max(8.0, base_mins * 0.12),
+                knowledge_domains=["testing", "regression", "validation", "quality_assurance"],
+                completion_criteria=["所有已知问题修复验证通过", "无新回归问题", "集成测试全部通过"],
+            ),
+            # ── Phase 5: 最终报告 ──
+            SubTask(
+                id="task-008",
+                title="修复前后对比报告",
+                description="整合全流程结果，生成修复前后对比报告：诊断发现→修复方案→验证结果。输出结构化报告到 reports/ 目录。",
+                agent_type="writer",
+                dependencies=["task-007"],
+                priority=5,
+                estimated_minutes=max(5.0, base_mins * 0.10),
+                knowledge_domains=["documentation", "reporting", "analysis", "visualization"],
+                completion_criteria=["包含修复前后对比数据", "报告已保存到reports/", "包含后续建议"],
             ),
         ]
 

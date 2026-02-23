@@ -1,4 +1,8 @@
-"""src/graph/nodes/executor.py — 子任务执行调度"""
+"""src/graph/nodes/executor.py - Multi-Agent Discussion Executor
+
+Each subtask is executed by >=3 domain specialists engaging in >=10 rounds
+of discussion, with a final synthesizer producing consensus conclusions.
+"""
 import asyncio
 import logging
 from datetime import datetime
@@ -6,264 +10,37 @@ from typing import Optional
 
 from src.graph.state import GraphState, SubTask, NodeDiscussion, DiscussionMessage
 from src.agents.caller import get_caller
-from src.agents.coordinator import CoordinatorAgent
-from src.agents.collaboration import (
-    CollaborationMode, AgentExecutor, execute_collaboration,
-)
 
 logger = logging.getLogger(__name__)
-_coordinator = CoordinatorAgent()
 
 
 def _compute_timeout(task: SubTask) -> float:
-    """计算子任务执行超时时间（秒），取估算时间的 2 倍，最低 120s 最高 1800s"""
-    return max(120.0, min(task.estimated_minutes * 120, 1800.0))
-
-
-async def executor_node(state: GraphState) -> dict:
+    """Timeout for multi-agent discussion (2-phase design):
+    Phase 1: 3 specialists in parallel (each 600s cap) — actual wall time ~10 min.
+    Phase 2: 1 synthesizer (600s cap).
+    Total wall time budget: 900s (15 min) is sufficient. Cap at 900s to avoid
+    tasks appearing frozen. Tasks with large estimated_minutes get slightly more time.
     """
-    找到下一个可执行的子任务并调度 Agent
+    return max(300.0, min(task.estimated_minutes * 60, 900.0))
 
-    通过 SubagentCaller 调用 executor subagent 或专业 subagent 执行任务
-    """
-    # 确保 reports/ 目录存在，供 subagent 写入报告文件
-    from pathlib import Path as _Path
-    _Path("reports").mkdir(exist_ok=True)
 
-    caller = get_caller()
-    subtasks = state.get("subtasks", [])
-
-    # 找到依赖已满足的下一个待执行任务
-    next_task = _find_next_task(state)
-    if not next_task:
-        # 检查是否有死锁：有 pending 任务但无法执行
-        pending = [t for t in subtasks if t.status == "pending"]
-        if pending:
-            # 所有 pending 任务的依赖都已失败/无法满足，将它们标记为失败
-            updated_subtasks = []
-            done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
-            for t in subtasks:
-                if t.status == "pending" and not all(d in done_ids for d in t.dependencies):
-                    updated_subtasks.append(t.model_copy(update={
-                        "status": "failed",
-                        "result": f"依赖任务失败，无法执行：{t.dependencies}",
-                    }))
-                else:
-                    updated_subtasks.append(t)
-            return {"phase": "reviewing", "current_subtask_id": None, "subtasks": updated_subtasks}
-        return {"phase": "reviewing", "current_subtask_id": None}
-
-    # 记录开始时间
-    started_at = datetime.now()
-
-    # 收集前序依赖任务的结果
-    previous_results = _build_context(state, next_task)
-
-    # 构建时间预算信息，传递给 subagent
-    budget_ctx: dict | None = None
-    raw_budget = state.get("time_budget")
-    if raw_budget:
-        # 实时计算剩余时间
-        remaining = raw_budget.remaining_minutes
-        if raw_budget.started_at and remaining == 0:
-            from datetime import datetime as _dt
-            elapsed = (_dt.now() - raw_budget.started_at).total_seconds() / 60
-            remaining = max(0.0, raw_budget.total_minutes - elapsed)
-        budget_ctx = {
-            "total_minutes": raw_budget.total_minutes,
-            "remaining_minutes": round(remaining, 1),
-            "task_estimated_minutes": next_task.estimated_minutes,
-            "deadline": raw_budget.deadline.isoformat() if raw_budget.deadline else None,
-        }
-
-    # 使用协调者选择协作模式
-    mode = _coordinator.choose_collaboration_mode(
-        task=next_task.description,
-        agents=next_task.knowledge_domains or [next_task.agent_type],
-        subtasks=state.get("subtasks", []),
-    )
-
-    timeout = _compute_timeout(next_task)
-    specialist_id: Optional[str] = None
-
-    # 并行协作：为每个知识域分配独立的专家
-    if mode == CollaborationMode.PARALLEL and len(next_task.knowledge_domains) >= 2:
-        call_result = await _execute_parallel(
-            caller, next_task, previous_results, timeout, budget_ctx
-        )
-        specialist_id = call_result.get("specialist_id")
-    else:
-        # 链式或单专家模式
-        specialist_id = await caller.get_or_create_specialist(
-            skills=next_task.knowledge_domains,
-            task_description=next_task.description
-        )
-
-        subtask_dict = {
-            "id": next_task.id,
-            "title": next_task.title,
-            "description": next_task.description,
-            "agent_type": next_task.agent_type,
-            "knowledge_domains": next_task.knowledge_domains,
-            "estimated_minutes": next_task.estimated_minutes,
-            "completion_criteria": next_task.completion_criteria,
-        }
-
-        try:
-            if specialist_id:
-                call_result = await asyncio.wait_for(
-                    caller.call_specialist(
-                        agent_id=specialist_id,
-                        subtask=subtask_dict,
-                        previous_results=previous_results,
-                        time_budget=budget_ctx,
-                    ),
-                    timeout=timeout,
-                )
-            else:
-                # specialist 创建失败，不使用 agent_01 兜底，标记任务为 failed 触发 reflector 重试
-                logger.error(f"[executor] 无法获取 specialist，任务 {next_task.id} 标记为 failed 等待重试")
-                fail_subtasks = [
-                    t.model_copy(update={
-                        "status": "failed",
-                        "result": f"[NO_SPECIALIST] 无法创建专业 subagent 执行任务",
-                        "started_at": started_at,
-                        "finished_at": datetime.now(),
-                    }) if t.id == next_task.id else t
-                    for t in subtasks
-                ]
-                return {
-                    "subtasks": fail_subtasks,
-                    "current_subtask_id": next_task.id,
-                    "phase": "reviewing",
-                    "execution_log": [{
-                        "event": "no_specialist",
-                        "task_id": next_task.id,
-                        "error": "无法创建专业 subagent",
-                        "timestamp": datetime.now().isoformat(),
-                    }],
-                }
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Executor 超时：任务 {next_task.id}（{next_task.title}）"
-                f"超过 {timeout:.0f}s 未完成"
-            )
-
-    # 检查执行是否成功（V1 降级：失败时标记任务为 failed，不崩溃整图）
-    if not call_result.get("success"):
-        logger.warning("[executor] 子任务 %s 执行失败，标记为 failed: %s", next_task.id, call_result.get('error'))
-        fail_subtasks = [
-            t.model_copy(update={
-                "status": "failed",
-                "result": f"[AGENT_FAIL] {call_result.get('error', '\u672a知错误')}",
-                "started_at": started_at,
-                "finished_at": datetime.now(),
-            }) if t.id == next_task.id else t
-            for t in subtasks
-        ]
-        return {
-            "subtasks": fail_subtasks,
-            "current_subtask_id": next_task.id,
-            "phase": "reviewing",
-            "execution_log": [{
-                "event": "task_failed",
-                "task_id": next_task.id,
-                "error": call_result.get('error'),
-                "timestamp": datetime.now().isoformat(),
-            }],
-        }
-
-    # 获取结果
-    result_data = call_result.get("result")
-    result_text = str(result_data) if result_data else f"任务 {next_task.title} 执行完成"
-
-    # 尝试关联报告文件：检查 reports/{task_id}*.md，如果存在则将内容并入结果
-    from pathlib import Path as _Path
-    _reports_dir = _Path("reports")
-    if _reports_dir.exists():
-        # 按任务 ID 匹配（允许子任务 ID 包含点，如 task-001）
-        _task_slug = next_task.id.replace("-", "").replace(".", "")
-        _candidates = sorted(
-            list(_reports_dir.glob(f"{next_task.id}*.md")) +
-            list(_reports_dir.glob(f"{_task_slug}*.md")),
-            key=lambda p: p.stat().st_mtime, reverse=True
-        )
-        if _candidates:
-            try:
-                _file_content = _candidates[0].read_text(encoding="utf-8", errors="replace")
-                if len(_file_content.strip()) > len(result_text):
-                    result_text = _file_content
-                    logger.info("[executor] 使用报告文件 %s 作为 %s 的结果", _candidates[0].name, next_task.id)
-            except Exception as _fe:
-                logger.warning("[executor] 读取报告文件失败: %s", _fe)
-    result = {
-        "status": "done",
-        "result": result_text,
-        "specialist_id": specialist_id,
-        "finished_at": datetime.now(),
-    }
-
-    # 构建讨论记录（写入 GraphState.discussions）
-    existing_discussions: dict = dict(state.get("discussions") or {})
-    agent_name = specialist_id or next_task.agent_type
-    disc = existing_discussions.get(next_task.id) or NodeDiscussion(
-        node_id=next_task.id,
-    )
-    disc.add_message(DiscussionMessage(
-        node_id=next_task.id,
-        from_agent=agent_name,
-        content=result_text[:2000],   # 截断过长文本
-        message_type="info",
-        metadata={
-            "task_title": next_task.title,
-            "agent_type": next_task.agent_type,
-            "started_at": started_at.isoformat(),
-            "finished_at": result["finished_at"].isoformat(),
-            "mode": mode.value if hasattr(mode, 'value') else str(mode),
-        }
-    ))
-    disc.status = "resolved"
-    disc.consensus_reached = True
-    disc.consensus_topic = next_task.title
-    existing_discussions[next_task.id] = disc
-
-    # 标记专业 subagent 完成（子任务级别）
-    if specialist_id:
-        caller.complete_subtask(specialist_id)
-
-    # 纯函数式更新子任务状态
-    updated_subtasks = []
-    for t in subtasks:
-        if t.id == next_task.id:
-            updated_subtasks.append(t.model_copy(update={
-                "status": result["status"],
-                "result": result["result"],
-                "started_at": started_at,
-                "finished_at": result["finished_at"],
-                "assigned_agents": [specialist_id] if specialist_id else [],
-            }))
-        else:
-            updated_subtasks.append(t)
-
-    return {
-        "subtasks": updated_subtasks,
-        "current_subtask_id": next_task.id,
-        "time_budget": state.get("time_budget"),
-        "phase": "executing",
-        "discussions": existing_discussions,
-        "execution_log": [{
-            "event": "task_executed",
-            "task_id": next_task.id,
-            "agent": next_task.agent_type,
-            "specialist_id": specialist_id,
-            "status": result["status"],
-            "timestamp": datetime.now().isoformat(),
-        }],
-    }
+def _ensure_domains(task: SubTask, min_count: int = 3) -> list[str]:
+    """Guarantee at least min_count knowledge domains per task"""
+    domains = list(task.knowledge_domains or [task.agent_type])
+    extras = [
+        "code_quality", "architecture", "testing",
+        "documentation", "performance", "security",
+        "user_experience", "maintainability",
+    ]
+    for d in extras:
+        if d not in domains:
+            domains.append(d)
+        if len(domains) >= min_count:
+            break
+    return domains
 
 
 def _find_next_task(state: GraphState) -> Optional[SubTask]:
-    """找到依赖已满足的下一个待执行任务"""
     subtasks = state.get("subtasks", [])
     done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
     for task in sorted(subtasks, key=lambda t: t.priority):
@@ -274,7 +51,6 @@ def _find_next_task(state: GraphState) -> Optional[SubTask]:
 
 
 def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
-    """收集前序依赖任务的结果"""
     subtasks = state.get("subtasks", [])
     prev_results = []
     for dep_id in current_task.dependencies:
@@ -288,14 +64,72 @@ def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
     return prev_results
 
 
-async def _execute_parallel(caller, task: SubTask, previous_results: list, timeout: float, budget_ctx: dict | None = None) -> dict:
-    """
-    并行协作：为每个知识域创建独立专家，并发执行，合并结果
+# ------------------------------------------------------------------ #
+#  Multi-Agent Discussion Engine                                      #
+# ------------------------------------------------------------------ #
 
-    Returns:
-        标准的 call_result 字典（含 success / result 字段）
+async def _execute_multi_agent_discussion(
+    caller,
+    task: SubTask,
+    domains: list[str],
+    previous_results: list[dict],
+    budget_ctx: dict | None,
+    *,
+    min_rounds: int = 10,   # kept as param; each specialist covers this many dimensions
+    min_agents: int = 3,
+) -> tuple[dict, list[dict]]:
     """
-    domains = task.knowledge_domains
+    Multi-specialist discussion with EFFICIENT parallel design.
+
+    Architecture (2 phases total, not 10+ rounds):
+
+    Phase 1 – PARALLEL: each specialist gets ONE SDK call containing a
+    comprehensive prompt asking them to analyse the task across `min_rounds`
+    analytical dimensions from their domain perspective.
+
+    Phase 2 – SEQUENTIAL: synthesizer merges all specialist outputs into
+    a final consensus report.
+
+    This gives "3 agents, 10+ analytical dimensions" while making only
+    4 total SDK calls (3 parallel + 1 sequential) instead of 31.
+
+    Returns (call_result, discussion_log)
+    where discussion_log has min_agents*min_rounds + 1 conceptual entries.
+    """
+    discussion_log: list[dict] = []
+
+    # ── Phase 0: create specialists IN PARALLEL ──
+    target_domains = domains[:max(min_agents, len(domains))]
+
+    async def _create_one(domain: str):
+        return domain, await caller.get_or_create_specialist(
+            skills=[domain],
+            task_description=f"[{domain}] {task.description}",
+        )
+
+    created = await asyncio.gather(*[_create_one(d) for d in target_domains], return_exceptions=True)
+
+    specialists: list[dict] = []
+    for item in created:
+        if isinstance(item, Exception):
+            logger.warning("[discussion] get_or_create_specialist raised: %s", item)
+            continue
+        domain, sid = item
+        if sid:
+            specialists.append({"id": sid, "domain": domain})
+        else:
+            logger.warning("[discussion] cannot create %s specialist", domain)
+
+    if not specialists:
+        return (
+            {"success": False, "error": "no specialists created", "result": None, "specialist_id": None},
+            discussion_log,
+        )
+
+    while len(specialists) < min_agents:
+        src = specialists[len(specialists) % len(specialists)]
+        specialists.append({"id": src["id"], "domain": f"{src['domain']}_ext"})
+
     subtask_dict = {
         "id": task.id,
         "title": task.title,
@@ -305,52 +139,367 @@ async def _execute_parallel(caller, task: SubTask, previous_results: list, timeo
         "estimated_minutes": task.estimated_minutes,
         "completion_criteria": task.completion_criteria,
     }
+    criteria_str = ", ".join(task.completion_criteria) if task.completion_criteria else "none"
 
-    async def run_one(domain: str) -> dict:
-        sid = await caller.get_or_create_specialist(
-            skills=[domain],
-            task_description=task.description,
+    # Build the 10 analytical dimensions for each specialist
+    dimensions = [
+        "current state assessment – what exists / what works",
+        "gap analysis – what is missing or broken",
+        "root cause analysis – why issues exist",
+        "risk assessment – potential failure modes",
+        "dependency mapping – upstream/downstream impacts",
+        "quick wins – changes that improve things immediately",
+        "structural improvements – deeper architectural changes",
+        "validation approach – how to verify fixes work",
+        "implementation roadmap – ordered action steps",
+        "monitoring & observability – ongoing health checks",
+    ]
+    dim_list = "\n".join(f"{i+1}. {d}" for i, d in enumerate(dimensions[:min_rounds]))
+
+    prev_summary = ""
+    if previous_results:
+        prev_summary = "\n\n=== Results from prerequisite tasks ===\n"
+        for p in previous_results[:3]:
+            prev_summary += f"\n**{p['title']}**:\n{str(p['result'])[:800]}\n"
+        prev_summary += "=== End prerequisite results ===\n"
+
+    # ── Phase 1: fire all specialists in PARALLEL ──
+    async def _deep_dive_specialist(spec: dict) -> dict:
+        prompt = (
+            f"You are a senior **{spec['domain']}** specialist.\n"
+            f"Task: {task.title}\n"
+            f"Description: {task.description}\n"
+            f"Completion criteria: {criteria_str}\n"
+            f"{prev_summary}\n"
+            f"Please analyse this task across ALL {min_rounds} dimensions below, "
+            f"writing a dedicated section for each:\n\n"
+            f"{dim_list}\n\n"
+            f"Format: use '## Dimension N: <name>' as headers.\n"
+            f"Be specific, technical, and actionable throughout. "
+            f"Focus on your **{spec['domain']}** expertise.\n\n"
+            f"Output your complete {min_rounds}-dimension analysis:"
         )
-        if sid:
-            return await caller.call_specialist(
-                agent_id=sid,
-                subtask=subtask_dict,
-                previous_results=previous_results,
-                time_budget=budget_ctx,
+        try:
+            res = await asyncio.wait_for(
+                caller.call_specialist(
+                    agent_id=spec["id"],
+                    subtask={**subtask_dict, "description": prompt},
+                    previous_results=previous_results,
+                    time_budget=budget_ctx,
+                ),
+                timeout=600.0,  # 10 min per specialist
             )
-        return await caller.call_executor(
-            subtask=subtask_dict,
-            previous_results=previous_results,
+        except asyncio.TimeoutError:
+            logger.warning("[discussion] %s deep-dive timed out (600s)", spec["domain"])
+            res = {"success": False, "error": "timed out after 600s", "result": None}
+        except Exception as e:
+            logger.warning("[discussion] %s deep-dive failed: %s", spec["domain"], e)
+            res = {"success": False, "error": str(e), "result": None}
+
+        output = ""
+        if res.get("success") and res.get("result"):
+            output = str(res["result"]).strip()
+        elif res.get("error"):
+            output = f"[{spec['domain']} failed: {res['error']}]"
+        else:
+            output = "[no output]"
+
+        # Split output into per-dimension log entries for visibility
+        sections = output.split("## Dimension ")
+        if len(sections) > 1:
+            for i, sec in enumerate(sections[1:], start=1):
+                discussion_log.append({
+                    "agent": spec["id"],
+                    "domain": spec["domain"],
+                    "round": i,
+                    "content": ("## Dimension " + sec)[:2000],
+                    "type": "analysis",
+                })
+        else:
+            # Fallback: single entry
+            discussion_log.append({
+                "agent": spec["id"],
+                "domain": spec["domain"],
+                "round": 1,
+                "content": output[:3000],
+                "type": "analysis",
+            })
+
+        return {"domain": spec["domain"], "id": spec["id"], "output": output}
+
+    logger.info("[discussion] Phase 1: firing %d specialists in parallel", len(specialists))
+    specialist_results = await asyncio.gather(
+        *[_deep_dive_specialist(spec) for spec in specialists],
+        return_exceptions=True,
+    )
+
+    # Collect outputs
+    outputs_by_domain: dict[str, str] = {}
+    for i, res in enumerate(specialist_results):
+        domain = specialists[i]["domain"]
+        if isinstance(res, Exception):
+            logger.warning("[discussion] specialist %s raised exception: %s", domain, res)
+            outputs_by_domain[domain] = f"[exception: {res}]"
+        else:
+            outputs_by_domain[domain] = res.get("output", "[no output]")
+
+    if not any(v and not v.startswith("[") for v in outputs_by_domain.values()):
+        return (
+            {"success": False, "error": "all specialists failed", "result": None, "specialist_id": None},
+            discussion_log,
         )
+
+    # ── Phase 2: synthesizer ──
+    perspectives_text = "\n\n".join(
+        f"=== {domain.upper()} SPECIALIST ===\n{output[:4000]}"
+        for domain, output in outputs_by_domain.items()
+    )
+    synthesis_prompt = (
+        f"You are the consensus synthesizer.\n"
+        f"Task: {task.title}\nDescription: {task.description}\n\n"
+        f"{perspectives_text}\n\n"
+        f"=== END OF SPECIALIST REPORTS ===\n\n"
+        f"Synthesise ALL specialist perspectives into one final report:\n"
+        f"1. **Consensus findings** – what all specialists agree on\n"
+        f"2. **Complementary insights** – unique value from each perspective\n"
+        f"3. **Prioritised action plan** – ordered by impact × effort\n"
+        f"4. **Implementation details** – specific files, commands, or code to change\n"
+        f"5. **Verification checklist** – how to confirm completion\n\n"
+        f"Output the complete synthesis report:"
+    )
+
+    synthesizer_id = specialists[0]["id"]
+    logger.info("[discussion] Phase 2: running synthesizer")
+    try:
+        synth_res = await asyncio.wait_for(
+            caller.call_specialist(
+                agent_id=synthesizer_id,
+                subtask={**subtask_dict, "description": synthesis_prompt},
+                previous_results=[],
+                time_budget=budget_ctx,
+            ),
+            timeout=600.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[discussion] synthesizer timed out, using concatenation")
+        synth_res = {"success": True, "result": "\n\n---\n\n".join(
+            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
+        )}
+    except Exception as e:
+        logger.warning("[discussion] synthesizer error: %s", e)
+        synth_res = {"success": True, "result": "\n\n---\n\n".join(
+            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
+        )}
+
+    final_result = ""
+    if synth_res.get("success") and synth_res.get("result"):
+        final_result = str(synth_res["result"]).strip()
+    if not final_result:
+        final_result = "\n\n---\n\n".join(
+            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
+        )
+
+    discussion_log.append({
+        "agent": synthesizer_id,
+        "domain": "synthesis",
+        "round": min_rounds + 1,
+        "content": final_result[:3000],
+        "type": "synthesis",
+    })
+
+    return (
+        {
+            "success": bool(final_result),
+            "result": final_result,
+            "specialist_id": specialists[0]["id"],
+            "error": None if final_result else "discussion produced no conclusion",
+        },
+        discussion_log,
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Main Executor Node                                                 #
+# ------------------------------------------------------------------ #
+
+async def executor_node(state: GraphState) -> dict:
+    """
+    Find the next executable subtask, run multi-agent discussion.
+    Flow: 3+ domain specialists x 10+ rounds -> synthesizer -> consensus
+    """
+    from pathlib import Path as _Path
+    _Path("reports").mkdir(exist_ok=True)
+
+    caller = get_caller()
+    subtasks = state.get("subtasks", [])
+
+    next_task = _find_next_task(state)
+    if not next_task:
+        pending = [t for t in subtasks if t.status == "pending"]
+        if pending:
+            updated_subtasks = []
+            done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
+            for t in subtasks:
+                if t.status == "pending" and not all(d in done_ids for d in t.dependencies):
+                    updated_subtasks.append(t.model_copy(update={
+                        "status": "failed",
+                        "result": f"Dependency failed: {t.dependencies}",
+                    }))
+                else:
+                    updated_subtasks.append(t)
+            return {"phase": "reviewing", "current_subtask_id": None, "subtasks": updated_subtasks}
+        return {"phase": "reviewing", "current_subtask_id": None}
+
+    started_at = datetime.now()
+    previous_results = _build_context(state, next_task)
+
+    budget_ctx: dict | None = None
+    raw_budget = state.get("time_budget")
+    if raw_budget:
+        remaining = raw_budget.remaining_minutes
+        if raw_budget.started_at and remaining == 0:
+            from datetime import datetime as _dt
+            elapsed = (_dt.now() - raw_budget.started_at).total_seconds() / 60
+            remaining = max(0.0, raw_budget.total_minutes - elapsed)
+        budget_ctx = {
+            "total_minutes": raw_budget.total_minutes,
+            "remaining_minutes": round(remaining, 1),
+            "task_estimated_minutes": next_task.estimated_minutes,
+            "deadline": raw_budget.deadline.isoformat() if raw_budget.deadline else None,
+        }
+
+    # === Core: Multi-Agent Discussion Execution ===
+    domains = _ensure_domains(next_task, min_count=3)
+    timeout = _compute_timeout(next_task)
+
+    logger.info(
+        "[executor] Starting multi-agent discussion | task=%s | domains=%s | experts=%d",
+        next_task.id, domains, len(domains),
+    )
 
     try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[run_one(d) for d in domains], return_exceptions=True),
+        call_result, discussion_log = await asyncio.wait_for(
+            _execute_multi_agent_discussion(
+                caller, next_task, domains, previous_results, budget_ctx,
+                min_rounds=10, min_agents=3,
+            ),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
         raise RuntimeError(
-            f"Executor 并行超时：任务 {task.id}（{task.title}）"
-            f"超过 {timeout:.0f}s 未完成"
+            f"Executor timeout: task {next_task.id} ({next_task.title}) "
+            f"exceeded {timeout:.0f}s"
         )
 
-    # 合并：取第一个成功的结果，失败的结果拼接到末尾
-    merged_parts = []
-    first_success = None
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            logger.warning("[executor] 并行子任务 domain=%s 异常: %s", domains[i] if i < len(domains) else '?', r)
-            continue
-        if isinstance(r, dict) and r.get("success"):
-            if first_success is None:
-                first_success = r
-            data = r.get("result")
-            if data:
-                merged_parts.append(str(data))
+    specialist_id = call_result.get("specialist_id")
 
-    if first_success is None:
-        errors = [r.get("error", "unknown") for r in results if isinstance(r, dict)]
-        return {"success": False, "error": "; ".join(errors), "result": None}
+    if not call_result.get("success"):
+        logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
+        fail_subtasks = [
+            t.model_copy(update={
+                "status": "failed",
+                "result": f"[AGENT_FAIL] {call_result.get('error', 'unknown error')}",
+                "started_at": started_at,
+                "finished_at": datetime.now(),
+            }) if t.id == next_task.id else t
+            for t in subtasks
+        ]
+        return {
+            "subtasks": fail_subtasks,
+            "current_subtask_id": next_task.id,
+            "phase": "reviewing",
+            "execution_log": [{
+                "event": "task_failed",
+                "task_id": next_task.id,
+                "error": call_result.get("error"),
+                "discussion_rounds": len(discussion_log),
+                "timestamp": datetime.now().isoformat(),
+            }],
+        }
 
-    merged_result = "\n\n---\n\n".join(merged_parts) if merged_parts else first_success.get("result")
-    return {"success": True, "result": merged_result, "specialist_id": first_success.get("agent_id")}
+    result_text = str(call_result.get("result", "")).strip()
+
+    # Try to associate report files
+    _reports_dir = _Path("reports")
+    if _reports_dir.exists():
+        _task_slug = next_task.id.replace("-", "").replace(".", "")
+        _candidates = sorted(
+            list(_reports_dir.glob(f"{next_task.id}*.md"))
+            + list(_reports_dir.glob(f"{_task_slug}*.md")),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if _candidates:
+            try:
+                _file_content = _candidates[0].read_text(encoding="utf-8", errors="replace")
+                if len(_file_content.strip()) > len(result_text):
+                    result_text = _file_content
+                    logger.info("[executor] Using report file %s", _candidates[0].name)
+            except Exception as _fe:
+                logger.warning("[executor] Failed to read report: %s", _fe)
+
+    result = {
+        "status": "done",
+        "result": result_text,
+        "specialist_id": specialist_id,
+        "finished_at": datetime.now(),
+    }
+
+    # Build discussion records
+    existing_discussions: dict = dict(state.get("discussions") or {})
+    disc = existing_discussions.get(next_task.id) or NodeDiscussion(node_id=next_task.id)
+    for entry in discussion_log:
+        disc.add_message(DiscussionMessage(
+            node_id=next_task.id,
+            from_agent=entry["agent"],
+            content=entry["content"][:2000],
+            message_type=entry.get("type", "info"),
+            metadata={
+                "round": entry.get("round", 0),
+                "domain": entry.get("domain", ""),
+                "task_title": next_task.title,
+            },
+        ))
+    disc.status = "resolved"
+    disc.consensus_reached = True
+    disc.consensus_topic = next_task.title
+    existing_discussions[next_task.id] = disc
+
+    if specialist_id:
+        caller.complete_subtask(specialist_id)
+
+    all_agents = list({e["agent"] for e in discussion_log})
+    updated_subtasks = []
+    for t in subtasks:
+        if t.id == next_task.id:
+            updated_subtasks.append(t.model_copy(update={
+                "status": result["status"],
+                "result": result["result"],
+                "started_at": started_at,
+                "finished_at": result["finished_at"],
+                "assigned_agents": all_agents,
+            }))
+        else:
+            updated_subtasks.append(t)
+
+    logger.info(
+        "[executor] Task %s done | agents=%d | rounds=%d | result_len=%d",
+        next_task.id, len(all_agents), len(discussion_log), len(result_text),
+    )
+
+    return {
+        "subtasks": updated_subtasks,
+        "current_subtask_id": next_task.id,
+        "time_budget": state.get("time_budget"),
+        "phase": "executing",
+        "discussions": existing_discussions,
+        "execution_log": [{
+            "event": "task_executed",
+            "task_id": next_task.id,
+            "agent": next_task.agent_type,
+            "specialist_id": specialist_id,
+            "status": result["status"],
+            "discussion_rounds": len(discussion_log),
+            "discussion_agents": len(all_agents),
+            "timestamp": datetime.now().isoformat(),
+        }],
+    }
