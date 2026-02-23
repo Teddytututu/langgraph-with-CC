@@ -28,3 +28,9 @@ improved_task_*.json
 reports/*.md
 reports/*.json
 !reports/.gitkeep
+
+# 系统诊断检查报告（开发/调试时临时生成）
+# 位置: reports/inspections/ — 包含节点检查、内省输出等
+reports/inspections/*.md
+reports/inspections/*.json
+!reports/inspections/.gitkeep
