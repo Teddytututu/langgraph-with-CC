@@ -1031,13 +1031,34 @@ createApp({
 
         const intervene = async () => {
             if (!interveneText.value.trim() || !selectedTask.value) return;
-            const res = await fetch(`/api/tasks/${selectedTask.value.id}/intervene`, {
+            const instruction = interveneText.value.trim();
+            const taskId = selectedTask.value.id;
+            const res = await fetch(`/api/tasks/${taskId}/intervene`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ instruction: interveneText.value.trim() })
+                body: JSON.stringify({ instruction })
             });
             if (!res.ok) {
-                throw new Error(`HTTP ${res.status}`);
+                let msg = `Intervene failed (${res.status})`;
+                try {
+                    const err = await res.json();
+                    msg = err.detail || msg;
+                } catch (_) {}
+
+                addTimelineItem({
+                    id: `intervene_rejected|${taskId}|${res.status}|${msg}`,
+                    ts: new Date().toISOString(),
+                    taskId,
+                    node: selectedSubtask.value?.id || '',
+                    kind: 'intervention',
+                    level: 'error',
+                    title: '干预被拒绝',
+                    detail: msg,
+                    sourceEvent: 'intervene_rejected',
+                });
+
+                alert(msg);
+                return;
             }
             interveneText.value = '';
         };

@@ -443,6 +443,11 @@ def register_routes(app: FastAPI):
             raise HTTPException(status_code=404, detail="Task not found")
 
         task = app_state.tasks[task_id]
+        if task.get("status") != "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task {task_id} is not running (current status: {task.get('status')})",
+            )
 
         # 追加到干预队列（run_task 在下一个节点间隙消费）
         if task_id not in app_state.intervention_queues:
@@ -883,6 +888,7 @@ def register_routes(app: FastAPI):
                     await app_state.broadcast("task_intervention_applied", {
                         "task_id": task_id,
                         "instructions": pending,
+                        "ts": datetime.now().isoformat(),
                     })
 
         except asyncio.CancelledError:
