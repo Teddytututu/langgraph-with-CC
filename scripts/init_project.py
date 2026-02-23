@@ -49,6 +49,14 @@ REPORTS_DIRS = [
     "reports/inspections",
 ]
 
+# reports 目录下保留前缀（自动导出/历史不清理）
+REPORTS_KEEP_PREFIXES = (
+    "history",
+)
+
+# 自动导出目录（永不清理）
+EXPORTS_DIR = ROOT / "exports"
+
 # 根目录白名单：这些文件永远不删
 ROOT_KEEP = {
     ".env", ".gitignore", "CLAUDE.md", "README.md",
@@ -158,6 +166,7 @@ def clear_reports(dry: bool = False) -> int:
 
     1. 删除 REPORTS_FILES 中指定的文件
     2. 清空 REPORTS_DIRS 中的所有文件（保留 .gitkeep）
+    3. 清理 reports 根目录中的 md/json/txt 文件（保留自动导出目录前缀）
     """
     count = 0
 
@@ -194,7 +203,44 @@ def clear_reports(dry: bool = False) -> int:
         else:
             log(f"  SKIP   {dir_name}/  (not found)", dry)
 
+    reports_root = ROOT / "reports"
+    if reports_root.exists() and reports_root.is_dir():
+        for f in sorted(reports_root.iterdir()):
+            if not f.is_file():
+                continue
+            if f.suffix not in (".md", ".json", ".txt"):
+                continue
+            rel_name = f.name
+            if any(rel_name.startswith(prefix) for prefix in REPORTS_KEEP_PREFIXES):
+                log(f"  KEEP   reports/{rel_name} (prefix protected)", dry)
+                continue
+            rel_path = f.relative_to(ROOT)
+            log(f"  DELETE {rel_path}", dry)
+            if not dry:
+                try:
+                    f.unlink()
+                except PermissionError as e:
+                    log(f"  WARN   {f.name}: {e} (跳过)", dry)
+                    continue
+            count += 1
+
     return count
+
+
+def run_full_init(*, dry: bool = False) -> dict:
+    """供 API 复用的完整初始化入口（与 CLI 行为一致）。"""
+    n_agents = reset_agent_slots(dry)
+    n_files = delete_runtime_files(dry)
+    n_outputs = delete_task_outputs(dry)
+    n_reports = clear_reports(dry)
+    return {
+        "agents_reset": n_agents,
+        "runtime_deleted": n_files,
+        "outputs_deleted": n_outputs,
+        "reports_deleted": n_reports,
+        "total": n_agents + n_files + n_outputs + n_reports,
+        "dry_run": dry,
+    }
 
 
 
@@ -212,18 +258,17 @@ def main():
     print("=" * 60)
 
     print("\n[1] 重置动态 Agent 槽位:")
-    n_agents = reset_agent_slots(dry)
-
     print("\n[2] 清理运行时产物:")
-    n_files = delete_runtime_files(dry)
-
     print("\n[3] 清理任务产出文件（根目录散落):")
-    n_outputs = delete_task_outputs(dry)
-
     print("\n[4] 清理 reports 目录:")
-    n_reports = clear_reports(dry)
 
-    total = n_agents + n_files + n_outputs + n_reports
+    result = run_full_init(dry=dry)
+    n_agents = result["agents_reset"]
+    n_files = result["runtime_deleted"]
+    n_outputs = result["outputs_deleted"]
+    n_reports = result["reports_deleted"]
+
+    total = result["total"]
     print("\n" + "=" * 60)
     print(f"  完成：重置 {n_agents} 个 agent 槽位，删除 {n_files + n_outputs + n_reports} 个文件")
     if dry:

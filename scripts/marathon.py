@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -30,13 +31,17 @@ from pathlib import Path
 # ── 常量 ──────────────────────────────────────────────────────────────
 BASE_URL      = "http://127.0.0.1:8001"
 FIX_REQUEST   = Path("fix_request.json")
+MARATHON_LOCK = Path("marathon.lock.json")
 POLL_INTERVAL = 15      # 秒：轮询任务状态间隔
 WAIT_POLL     = 5       # 秒：等待修复时轮询间隔
 WAIT_TIMEOUT  = 900     # 秒：等 Claude Code 修复的最长时间（15 分钟）
 DEFAULT_HOURS = 10
 DEFAULT_TASK  = (
-    "对系统进行全面自检：检查所有节点运行状态、API 接口可用性、"
-    "subagent 调度流程、讨论机制和输出质量，发现问题请记录并提出改进建议"
+    "对系统进行全面自检与修复闭环："
+    "（Phase 1-诊断）检查所有节点运行状态、API 接口可用性、subagent 调度流程、讨论机制和输出质量；"
+    "（Phase 2-修复）对 Phase 1 发现的问题逐一编写修复代码并验证，确保每个问题修复后通过回归测试；"
+    "（Phase 3-验证报告）重新运行自检确认修复生效，输出修复前后对比报告并保存到 reports/ 目录。"
+    "每个阶段至少3名不同领域专家参与讨论协商，讨论轮次不少于10轮。"
 )
 DEFAULT_MINUTES_PER_ROUND = 60   # 每轮时间预算
 
@@ -68,6 +73,60 @@ def _server_ok() -> bool:
         return True
     except Exception:
         return False
+
+
+def _acquire_singleton_lock() -> bool:
+    """确保仅一个 marathon 实例运行。
+
+    若已存在存活实例：立即退出当前新实例（不影响已有任务）。
+    采用原子创建锁文件，避免并发启动竞态。
+    """
+    current_pid = os.getpid()
+    payload = json.dumps({
+        "pid": current_pid,
+        "created_at": datetime.now().isoformat(),
+    }, ensure_ascii=False)
+
+    while True:
+        try:
+            fd = os.open(str(MARATHON_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            # 已有锁：判断是否为存活进程
+            try:
+                lock_data = json.loads(MARATHON_LOCK.read_text(encoding="utf-8"))
+                old_pid = int(lock_data.get("pid", 0))
+            except Exception:
+                old_pid = 0
+
+            if old_pid and old_pid != current_pid:
+                try:
+                    os.kill(old_pid, 0)  # 存活检测
+                    _log(f"检测到已有 marathon 实例在运行 (pid={old_pid})，当前实例退出")
+                    return False
+                except OSError:
+                    # 僵尸锁，删除后重试获取
+                    MARATHON_LOCK.unlink(missing_ok=True)
+                    continue
+
+            # 锁损坏或无效 PID，尝试清理并重试
+            MARATHON_LOCK.unlink(missing_ok=True)
+
+
+def _release_singleton_lock() -> None:
+    """释放 marathon 单实例锁（仅释放自己创建的锁）。"""
+    try:
+        if not MARATHON_LOCK.exists():
+            return
+        data = json.loads(MARATHON_LOCK.read_text(encoding="utf-8"))
+        if int(data.get("pid", -1)) == os.getpid():
+            MARATHON_LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
@@ -163,6 +222,21 @@ def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
             if status == "failed":
                 err = t.get("error") or t.get("final_output") or str(t)
                 return "failed", str(err)
+            if status == "cancelled":
+                err = t.get("error") or "task cancelled"
+                return "failed", str(err)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                try:
+                    sys_status = _api("GET", "/api/system/status").get("status", "idle")
+                    tasks = _api("GET", "/api/tasks").get("tasks", [])
+                    active = [x for x in tasks if x.get("status") in ("running", "created", "queued")]
+                    if sys_status != "running" and not active:
+                        _log(f"  任务 {task_id} 不可见，但系统空闲，按已终态处理")
+                        return "completed", "task record cleaned by auto init"
+                except Exception as inner_e:
+                    _log(f"  404 兜底判定异常: {inner_e}")
+            _log(f"  轮询 HTTP 异常: {e}")
         except Exception as e:
             _log(f"  轮询异常: {e}")
         time.sleep(POLL_INTERVAL)
@@ -269,6 +343,9 @@ if __name__ == "__main__":
                         help="每轮结束后的冷却秒数，默认 30")
     args = parser.parse_args()
 
+    if not _acquire_singleton_lock():
+        sys.exit(0)
+
     try:
         run(task_text=args.task, hours=args.hours,
             minutes_per_round=args.minutes, cooldown=args.cooldown)
@@ -276,3 +353,5 @@ if __name__ == "__main__":
         _log("用户中断")
         FIX_REQUEST.unlink(missing_ok=True)
         sys.exit(0)
+    finally:
+        _release_singleton_lock()

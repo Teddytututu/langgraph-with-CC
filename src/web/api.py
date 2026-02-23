@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import traceback
 
 logger = logging.getLogger(__name__)
@@ -18,21 +20,22 @@ def _fire(coro):
     t.add_done_callback(_background_tasks.discard)
     return t
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.graph.state import GraphState, SubTask, TimeBudget
 from src.graph.builder import build_graph
 from src.graph.dynamic_builder import DynamicGraphBuilder
 from src.discussion.manager import DiscussionManager, discussion_manager
 from src.agents.sdk_executor import get_executor
+from scripts import init_project
 
 
 # ── 请求体模型（必须在模块层定义，FastAPI 才能正确解析 body） ──
@@ -47,7 +50,7 @@ class MessagePost(BaseModel):
     """发送消息请求"""
     from_agent: str
     content: str
-    to_agents: list[str] = []
+    to_agents: list[str] = Field(default_factory=list)
     message_type: str = "info"
 
 
@@ -69,11 +72,24 @@ class SubtaskUpdate(BaseModel):
 class ChatRequest(BaseModel):
     """与监控AI对话请求"""
     message: str
-    history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]
+    history: list[dict] = Field(default_factory=list)  # [{"role": "user"|"assistant", "content": str}]
 
 
 # 持久化文件路径
 _STATE_FILE = Path("app_state.json")
+_REPORTS_DIR = Path("reports")
+_EXPORTS_DIR = Path("exports") / "tasks"
+_SAFE_REPORT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _build_cors_origins() -> list[str]:
+    raw = os.getenv("WEB_ALLOWED_ORIGINS", "")
+    if raw.strip():
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+    ]
 
 
 # 全局状态
@@ -85,9 +101,13 @@ class AppState:
         self.active_websockets: list[WebSocket] = []
         self.system_status: str = "idle"
         self.current_node: str = ""
-        self.current_task_id: str = ""
+        self.current_task_id: Optional[str] = None
         self.intervention_queues: dict[str, list[str]] = {}
         self.terminal_log: list[dict] = []
+        self.running_task_handles: dict[str, asyncio.Task] = {}
+        self.start_lock = asyncio.Lock()
+        self.post_init_lock = asyncio.Lock()
+        self.post_init_done_task_ids: set[str] = set()
         self._dirty: bool = False  # 标记是否有未保存的变更
 
     def append_terminal_log(self, entry: dict):
@@ -133,7 +153,7 @@ class AppState:
             if self.system_status == "running":
                 self.system_status = "idle"
             self.current_node = ""
-            self.current_task_id = data.get("current_task_id", "")
+            self.current_task_id = data.get("current_task_id") or None
             self.terminal_log = data.get("terminal_log", [])
             # 注入一条重启提示日志
             self.terminal_log.append({
@@ -193,7 +213,7 @@ def create_app() -> FastAPI:
     # CORS 配置
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_build_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -210,6 +230,46 @@ def create_app() -> FastAPI:
 
 def register_routes(app: FastAPI):
     """注册 API 路由"""
+
+    async def _start_task_internal(task_id: str, *, force: bool = False, source: str = "manual") -> dict:
+        """统一任务启动入口（带互斥）。"""
+        if task_id not in app_state.tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        async with app_state.start_lock:
+            task = app_state.tasks[task_id]
+            if task.get("status") == "running":
+                if task_id not in app_state.running_task_handles:
+                    handle = _fire(run_task(task_id))
+                    app_state.running_task_handles[task_id] = handle
+                return {"status": "running", "task_id": task_id, "source": source}
+
+            active_task_id = app_state.current_task_id
+            active_task = app_state.tasks.get(active_task_id) if active_task_id else None
+            if app_state.system_status == "running" and active_task and active_task.get("status") == "running":
+                if not force:
+                    raise HTTPException(status_code=409, detail=f"Task already running: {active_task_id}")
+                if active_task_id != task_id:
+                    raise HTTPException(status_code=409, detail=f"Task already running: {active_task_id}")
+
+            task["status"] = "running"
+            task.pop("error", None)
+            app_state.system_status = "running"
+            app_state.current_task_id = task_id
+            app_state.current_node = ""
+            app_state.mark_dirty()
+
+            await app_state.broadcast("system_status_changed", {
+                "status": "running",
+                "task_id": task_id,
+                "task": task.get("task", ""),
+                "source": source,
+            })
+            await app_state.broadcast("task_started", {"id": task_id, "source": source})
+
+            handle = _fire(run_task(task_id))
+            app_state.running_task_handles[task_id] = handle
+            return {"status": "running", "task_id": task_id, "source": source}
 
     # ── 页面路由 ──
 
@@ -252,23 +312,35 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_created", task_data)
 
-        # 自动启动：创建后立即触发执行（如有其他任务在跑则等待）
+        # 自动启动：创建后立即触发执行（若系统忙则保持 queued，避免并发双启动）
         async def _auto_start():
-            # 等待系统空闲，最多 60 分钟
+            # 最多等待 30 秒；超时后保持 created，等待手动/后续触发
             waited = 0
-            while app_state.system_status == "running" and waited < 3600:
-                await asyncio.sleep(5)
-                waited += 5
-            task_data["status"] = "running"
-            app_state.system_status = "running"
-            app_state.current_task_id = task_id
-            await app_state.broadcast("system_status_changed", {
-                "status": "running",
-                "task_id": task_id,
-                "task": task_data["task"],
-            })
-            await app_state.broadcast("task_started", {"id": task_id})
-            await run_task(task_id)
+            while app_state.system_status == "running" and waited < 30:
+                await asyncio.sleep(1)
+                waited += 1
+
+            if app_state.system_status == "running":
+                task_data["status"] = "queued"
+                await app_state.broadcast("task_start_deferred", {
+                    "id": task_id,
+                    "reason": "system_busy",
+                    "waited_seconds": waited,
+                })
+                app_state.mark_dirty()
+                return
+
+            try:
+                await _start_task_internal(task_id, source="auto")
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    await app_state.broadcast("task_start_deferred", {
+                        "id": task_id,
+                        "reason": "start_conflict",
+                    })
+                    app_state.mark_dirty()
+                    return
+                raise
 
         _fire(_auto_start())
 
@@ -318,6 +390,7 @@ def register_routes(app: FastAPI):
 
         updates = req.model_dump(exclude_none=True)
         target.update(updates)
+        app_state.mark_dirty()
 
         await app_state.broadcast("task_progress", {
             "task_id": task_id,
@@ -337,12 +410,19 @@ def register_routes(app: FastAPI):
         if old_status == "running":
             task["status"] = "cancelled"
             task["error"] = "用户取消"
+            task["finished_at"] = datetime.now().isoformat()
             app_state.mark_dirty()
+
+            # 主动 cancel 后台执行 task，形成真正中断
+            running_handle = app_state.running_task_handles.pop(task_id, None)
+            if running_handle and not running_handle.done():
+                running_handle.cancel()
 
             # 如果这是当前任务，重置系统状态
             if app_state.current_task_id == task_id:
                 app_state.system_status = "idle"
                 app_state.current_node = ""
+                app_state.current_task_id = None
 
             await app_state.broadcast("task_cancelled", {
                 "id": task_id,
@@ -438,32 +518,192 @@ def register_routes(app: FastAPI):
     @app.post("/api/tasks/{task_id}/start")
     async def start_task(task_id: str):
         """启动任务执行"""
-        if task_id not in app_state.tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
+        result = await _start_task_internal(task_id, source="manual")
+        return {"status": result["status"], "task_id": result["task_id"]}
 
-        task = app_state.tasks[task_id]
-        task["status"] = "running"
-        app_state.mark_dirty()
+    TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+    ACTIVE_STATUSES = {"running", "created", "queued"}
 
-        # 更新系统状态
-        app_state.system_status = "running"
-        app_state.current_task_id = task_id
-        await app_state.broadcast("system_status_changed", {
-            "status": "running",
+    def _collect_reports_manifest() -> list[str]:
+        if not _REPORTS_DIR.exists() or not _REPORTS_DIR.is_dir():
+            return []
+        items: list[str] = []
+        for f in sorted(_REPORTS_DIR.iterdir()):
+            if f.is_file() and f.suffix in (".md", ".json", ".txt"):
+                items.append(f.name)
+        return items
+
+    def _build_task_export_payload(task_id: str) -> dict[str, Any]:
+        task = app_state.tasks.get(task_id, {})
+        subtasks_payload = []
+        for st in task.get("subtasks", []):
+            subtasks_payload.append({
+                "id": st.get("id"),
+                "title": st.get("title"),
+                "status": st.get("status"),
+                "agent_type": st.get("agent_type"),
+                "result_summary": (st.get("result") or "")[:300],
+            })
+
+        result = task.get("result")
+        if not result:
+            result = task.get("error") or ""
+
+        return {
             "task_id": task_id,
-            "task": task["task"],
+            "status": task.get("status"),
+            "task": task.get("task"),
+            "created_at": task.get("created_at"),
+            "finished_at": task.get("finished_at"),
+            "result": result,
+            "subtasks": subtasks_payload,
+            "reports_manifest": _collect_reports_manifest(),
+            "exported_at": datetime.now().isoformat(),
+        }
+
+    def _render_task_export_markdown(payload: dict[str, Any]) -> str:
+        lines = [
+            f"# Task Export: {payload.get('task_id', '')}",
+            "",
+            f"- status: {payload.get('status', '')}",
+            f"- created_at: {payload.get('created_at', '')}",
+            f"- finished_at: {payload.get('finished_at', '')}",
+            "",
+            "## Task",
+            payload.get("task", "") or "",
+            "",
+            "## Result",
+            payload.get("result", "") or "",
+            "",
+            "## Subtasks",
+        ]
+
+        subtasks = payload.get("subtasks", []) or []
+        if not subtasks:
+            lines.append("- (none)")
+        else:
+            for st in subtasks:
+                lines.append(
+                    f"- {st.get('id', '')} | {st.get('title', '')} | {st.get('status', '')} | {st.get('agent_type', '')}"
+                )
+                summary = st.get("result_summary", "") or ""
+                if summary:
+                    lines.append(f"  - summary: {summary}")
+
+        lines.append("")
+        lines.append("## Reports Manifest")
+        reports_manifest = payload.get("reports_manifest", []) or []
+        if not reports_manifest:
+            lines.append("- (none)")
+        else:
+            for name in reports_manifest:
+                lines.append(f"- {name}")
+
+        lines.append("")
+        lines.append(f"_exported_at: {payload.get('exported_at', '')}_")
+        return "\n".join(lines).strip() + "\n"
+
+    async def _export_task_result(task_id: str, retries: int = 3) -> bool:
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            try:
+                payload = _build_task_export_payload(task_id)
+                if not payload.get("task_id") or not payload.get("status"):
+                    raise RuntimeError("task payload incomplete")
+
+                _EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+                json_path = _EXPORTS_DIR / f"{task_id}.json"
+                md_path = _EXPORTS_DIR / f"{task_id}.md"
+                json_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                md_path.write_text(_render_task_export_markdown(payload), encoding="utf-8")
+                return True
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    "Task export failed (task=%s, attempt=%s/%s): %s",
+                    task_id,
+                    attempt,
+                    retries,
+                    e,
+                )
+                if attempt < retries:
+                    await asyncio.sleep(0.5)
+
+        await app_state.broadcast("post_init_blocked", {
+            "task_id": task_id,
+            "reason": "export_failed",
+            "error": last_error[:300],
         })
+        return False
 
-        # 在后台执行任务
-        _fire(run_task(task_id))
+    def _has_active_tasks(exclude_task_id: Optional[str] = None) -> bool:
+        for tid, t in app_state.tasks.items():
+            if exclude_task_id and tid == exclude_task_id:
+                continue
+            if t.get("status") in ACTIVE_STATUSES:
+                return True
+        return False
 
-        await app_state.broadcast("task_started", {"id": task_id})
+    async def _schedule_post_task_init(task_id: str):
+        async with app_state.post_init_lock:
+            if task_id in app_state.post_init_done_task_ids:
+                return
 
-        return {"status": "running"}
+            task = app_state.tasks.get(task_id)
+            if not task or task.get("status") not in TERMINAL_STATUSES:
+                return
+
+            exported = await _export_task_result(task_id)
+            if not exported:
+                return
+
+            if _has_active_tasks(exclude_task_id=task_id):
+                await app_state.broadcast("post_init_skipped", {
+                    "task_id": task_id,
+                    "reason": "active_tasks_present",
+                })
+                return
+
+            try:
+                init_summary = await asyncio.to_thread(init_project.run_full_init, dry=False)
+            except Exception as e:
+                logger.exception("Auto init failed for task %s", task_id)
+                await app_state.broadcast("post_init_failed", {
+                    "task_id": task_id,
+                    "error": str(e)[:300],
+                })
+                return
+
+            app_state.post_init_done_task_ids.add(task_id)
+            app_state.tasks.clear()
+            app_state.intervention_queues.clear()
+            app_state.current_task_id = None
+            app_state.current_node = ""
+            app_state.system_status = "idle"
+            app_state.terminal_log.clear()
+            app_state.mark_dirty()
+            app_state.save_to_disk()
+
+            await app_state.broadcast("post_init_completed", {
+                "task_id": task_id,
+                "summary": init_summary,
+            })
+            await app_state.broadcast("system_status_changed", {
+                "status": "idle",
+                "task_id": task_id,
+                "source": "auto_init",
+            })
 
     async def run_task(task_id: str):
         """执行任务（后台）"""
         task = app_state.tasks[task_id]
+
+        def is_cancelled() -> bool:
+            current = app_state.tasks.get(task_id)
+            return not current or current.get("status") == "cancelled"
 
         async def emit(line: str, level: str = "info"):
             """broadcast 一行终端输出并持久化到 terminal_log"""
@@ -479,6 +719,10 @@ def register_routes(app: FastAPI):
         try:
             graph = app_state.graph_builder.compile()
             await emit(f"▶ 任务已启动: {task['task'][:60]}", "start")
+
+            if is_cancelled():
+                await emit("⊘ 任务已取消，停止执行", "warn")
+                return
 
             initial_state: GraphState = {
                 "user_task": task["task"],
@@ -498,15 +742,24 @@ def register_routes(app: FastAPI):
             config = {"configurable": {"thread_id": task_id}}
 
             async for event in graph.astream(initial_state, config):
+                if is_cancelled():
+                    await emit("⊘ 检测到取消信号，提前终止", "warn")
+                    break
+
                 for node_name, state_update in event.items():
+                    if is_cancelled():
+                        await emit("⊘ 节点处理前检测到取消信号", "warn")
+                        break
                     # 更新当前节点
                     app_state.current_node = node_name
                     # budget_manager 完成后，executor 即将开始 —— 提前标记
                     if node_name == "budget_manager":
                         app_state.current_node = "executor"
+                    # 广播时使用最终 node（已经过覆盖），让前端不显示 budget_manager
+                    task["current_node"] = app_state.current_node
                     await app_state.broadcast("node_changed", {
                         "task_id": task_id,
-                        "node": node_name,
+                        "node": app_state.current_node,
                     })
                     await emit(f"\u25b6 [{node_name.upper()}] phase={state_update.get('phase','')}", "node")
 
@@ -604,6 +857,7 @@ def register_routes(app: FastAPI):
                     if state_update.get("final_output"):
                         task["result"] = state_update["final_output"]
                         task["status"] = "completed"
+                        task["finished_at"] = datetime.now().isoformat()
                         app_state.system_status = "completed"
                         app_state.current_node = ""
                         app_state.mark_dirty()
@@ -620,7 +874,7 @@ def register_routes(app: FastAPI):
 
                 # ── 节点间隙：消费干预队列，注入 GraphState messages ──
                 pending = app_state.intervention_queues.pop(task_id, [])
-                if pending:
+                if pending and not is_cancelled():
                     injected = [f"[用户实时指令] {inst}" for inst in pending]
                     await graph.aupdate_state(
                         config,
@@ -631,9 +885,19 @@ def register_routes(app: FastAPI):
                         "instructions": pending,
                     })
 
+        except asyncio.CancelledError:
+            current = app_state.tasks.get(task_id)
+            if current and current.get("status") != "cancelled":
+                current["status"] = "cancelled"
+                current["error"] = "任务被取消"
+                current["finished_at"] = datetime.now().isoformat()
+                app_state.mark_dirty()
+            await emit("⊘ 执行协程已取消", "warn")
+            raise
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            task["finished_at"] = datetime.now().isoformat()
             app_state.mark_dirty()
             await emit(f"✗ 崩溃: {str(e)[:200]}", "error")
 
@@ -648,13 +912,14 @@ def register_routes(app: FastAPI):
             }
 
             # 保存崩溃报告到 reports/ 目录（规范化）
-            Path("reports").mkdir(exist_ok=True)
-            crash_report_path = Path("reports/crash_report.json")
+            _REPORTS_DIR.mkdir(exist_ok=True)
+            crash_report_path = _REPORTS_DIR / "crash_report.json"
             with open(crash_report_path, "w", encoding="utf-8") as f:
                 json.dump(crash_report, f, indent=2, ensure_ascii=False)
 
             app_state.system_status = "failed"
             app_state.current_node = ""
+            app_state.current_task_id = None
             await app_state.broadcast("task_failed", {
                 "id": task_id,
                 "error": str(e),
@@ -665,6 +930,23 @@ def register_routes(app: FastAPI):
                 "task_id": task_id,
                 "error": str(e),
             })
+        finally:
+            app_state.running_task_handles.pop(task_id, None)
+            current = app_state.tasks.get(task_id)
+            if app_state.current_task_id == task_id and current and current.get("status") != "running":
+                app_state.current_task_id = None
+                if current.get("status") == "cancelled":
+                    app_state.system_status = "idle"
+                    app_state.current_node = ""
+                    await app_state.broadcast("system_status_changed", {
+                        "status": "idle",
+                        "task_id": task_id,
+                    })
+
+            current = app_state.tasks.get(task_id)
+            if current and current.get("status") in TERMINAL_STATUSES:
+                app_state.save_to_disk()
+                _fire(_schedule_post_task_init(task_id))
 
     # ── Graph API ──
 
@@ -773,16 +1055,19 @@ def register_routes(app: FastAPI):
     # ── 系统状态 API ──
 
     @app.get("/api/system/status")
-    async def get_system_status():
+    async def get_system_status(request: Request):
         """获取系统状态（含终端日志，供刷新后恢复）"""
-        return {
+        include_terminal = request.query_params.get("include_terminal") == "1"
+        response = {
             "status": app_state.system_status,
             "current_node": app_state.current_node,
             "current_task_id": app_state.current_task_id,
             "tasks_count": len(app_state.tasks),
             "running_tasks": len([t for t in app_state.tasks.values() if t["status"] == "running"]),
-            "terminal_log": app_state.terminal_log[-300:],
         }
+        if include_terminal:
+            response["terminal_log"] = app_state.terminal_log[-200:]
+        return response
 
     # ── 讨论 API ──
 
@@ -835,12 +1120,10 @@ def register_routes(app: FastAPI):
     @app.get("/api/reports")
     async def list_reports():
         """列出 reports/ 目录下所有报告文件"""
-        import os
-        reports_dir = Path("reports")
-        if not reports_dir.exists():
+        if not _REPORTS_DIR.exists():
             return {"files": []}
         files = []
-        for f in sorted(reports_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        for f in sorted(_REPORTS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.suffix in (".md", ".json") and f.is_file():
                 try:
                     stat = f.stat()
@@ -855,17 +1138,38 @@ def register_routes(app: FastAPI):
                     pass
         return {"files": files}
 
-    @app.get("/api/reports/{filename}")
+    @app.get("/api/reports/{filename:path}")
     async def get_report(filename: str):
         """读取 reports/ 下指定文件内容"""
-        # 防目录穿越
-        if "/" in filename or ".." in filename:
+        if any(sep in filename for sep in ("/", "\\", ":")):
             raise HTTPException(status_code=400, detail="Invalid filename")
-        path = Path("reports") / filename
-        if not path.exists() or not path.is_file():
+        if ".." in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        if not _SAFE_REPORT_NAME.fullmatch(filename):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        report_base = _REPORTS_DIR.resolve()
+        report_path = (report_base / filename).resolve()
+
+        try:
+            report_path.relative_to(report_base)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        if not report_path.exists() or not report_path.is_file():
             raise HTTPException(status_code=404, detail="File not found")
-        content = path.read_text(encoding="utf-8", errors="replace")
+
+        content = report_path.read_text(encoding="utf-8", errors="replace")
         return {"name": filename, "content": content}
+
+    @app.exception_handler(404)
+    async def _reports_not_found_override(request: Request, exc):
+        path = request.url.path
+        if path.startswith("/api/reports/"):
+            tail = path[len("/api/reports/"):]
+            if "/" in tail or "\\" in tail or "%2f" in path.lower() or "%5c" in path.lower() or ".." in tail:
+                return JSONResponse(status_code=400, content={"detail": "Invalid filename"})
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     # ── WebSocket ──
 
@@ -887,6 +1191,7 @@ def register_routes(app: FastAPI):
                             app_state.intervention_queues.setdefault(task_id, []).append(cmd)
                             entry = {"content": cmd, "timestamp": datetime.now().isoformat()}
                             app_state.tasks[task_id].setdefault("interventions", []).append(entry)
+                            app_state.mark_dirty()
                             await app_state.broadcast("task_intervened", {
                                 "task_id": task_id,
                                 "instruction": cmd,
