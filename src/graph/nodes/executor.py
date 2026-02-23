@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_timeout(task: SubTask) -> float:
-    """Timeout for multi-agent discussion (2-phase design):
-    Phase 1: 3 specialists in parallel (each 600s cap) — actual wall time ~10 min.
-    Phase 2: 1 synthesizer (600s cap).
-    Total wall time budget: 900s (15 min) is sufficient. Cap at 900s to avoid
-    tasks appearing frozen. Tasks with large estimated_minutes get slightly more time.
+    """Outer timeout for the full 2-phase discussion:
+      Phase 1: 3 parallel specialists, each capped at 300s → 300s wall time
+      Phase 2: 1 synthesizer, capped at 300s → 300s wall time
+      Buffer: +150s
+      Minimum: 750s  |  Maximum: 2400s
     """
-    return max(300.0, min(task.estimated_minutes * 60, 900.0))
+    return max(750.0, min(task.estimated_minutes * 60 * 1.5, 2400.0))
 
 
 def _ensure_domains(task: SubTask, min_count: int = 3) -> list[str]:
@@ -187,10 +187,10 @@ async def _execute_multi_agent_discussion(
                     previous_results=previous_results,
                     time_budget=budget_ctx,
                 ),
-                timeout=600.0,  # 10 min per specialist
+                timeout=300.0,  # 5 min per specialist
             )
         except asyncio.TimeoutError:
-            logger.warning("[discussion] %s deep-dive timed out (600s)", spec["domain"])
+            logger.warning("[discussion] %s deep-dive timed out (300s)", spec["domain"])
             res = {"success": False, "error": "timed out after 600s", "result": None}
         except Exception as e:
             logger.warning("[discussion] %s deep-dive failed: %s", spec["domain"], e)
@@ -278,10 +278,10 @@ async def _execute_multi_agent_discussion(
                 previous_results=[],
                 time_budget=budget_ctx,
             ),
-            timeout=600.0,
+            timeout=300.0,
         )
     except asyncio.TimeoutError:
-        logger.warning("[discussion] synthesizer timed out, using concatenation")
+        logger.warning("[discussion] synthesizer timed out (300s), using concatenation")
         synth_res = {"success": True, "result": "\n\n---\n\n".join(
             f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
         )}
