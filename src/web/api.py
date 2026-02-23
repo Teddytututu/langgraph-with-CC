@@ -1111,21 +1111,35 @@ def register_routes(app: FastAPI):
                             existing.consensus_topic = getattr(node_disc, "consensus_topic", None)
 
                     if state_update.get("final_output"):
-                        task["result"] = state_update["final_output"]
-                        task["status"] = "completed"
-                        task["finished_at"] = datetime.now().isoformat()
-                        app_state.system_status = "completed"
-                        app_state.current_node = ""
-                        app_state.mark_dirty()
+                        now_iso = datetime.now().isoformat()
+                        async with app_state.state_lock:
+                            current = app_state.tasks.get(task_id)
+                            if not current:
+                                break
+                            current["subtasks"] = task.get("subtasks", [])
+                            snapshot = app_state._set_task_and_system_state_unlocked(
+                                task_id,
+                                task_status="completed",
+                                result=state_update["final_output"],
+                                finished_at=now_iso,
+                                system_status="completed",
+                                current_node="",
+                                current_task_id=None,
+                            )
+
                         await emit(f"✓ 任务完成", "success")
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
                             "result": state_update["final_output"],
-                            "subtasks": task["subtasks"],
+                            "subtasks": task.get("subtasks", []),
+                            "state_rev": snapshot["state_rev"],
+                            "finished_at": now_iso,
+                            "ts": now_iso,
                         })
                         await app_state.broadcast("system_status_changed", {
-                            "status": "completed",
+                            **snapshot,
                             "task_id": task_id,
+                            "ts": now_iso,
                         })
 
                 # ── 节点间隙：消费干预队列，注入 GraphState messages ──
@@ -1143,13 +1157,29 @@ def register_routes(app: FastAPI):
                     })
 
         except asyncio.CancelledError:
-            current = app_state.tasks.get(task_id)
-            if current and current.get("status") != "cancelled":
-                current["status"] = "cancelled"
-                current["error"] = "任务被取消"
-                current["finished_at"] = datetime.now().isoformat()
-                app_state.mark_dirty()
+            now_iso = datetime.now().isoformat()
+            async with app_state.state_lock:
+                current = app_state.tasks.get(task_id)
+                if current and current.get("status") != "cancelled":
+                    app_state._set_task_and_system_state_unlocked(
+                        task_id,
+                        task_status="cancelled",
+                        error="任务被取消",
+                        finished_at=now_iso,
+                        system_status="idle",
+                        current_node="",
+                        current_task_id=None,
+                    )
+                    cancel_snapshot = app_state._snapshot_state_unlocked()
+                else:
+                    cancel_snapshot = app_state._snapshot_state_unlocked()
             await emit("⊘ 执行协程已取消", "warn")
+            await app_state.broadcast("system_status_changed", {
+                **cancel_snapshot,
+                "task_id": task_id,
+                "source": "run_task_cancelled",
+                "ts": now_iso,
+            })
             raise
         except Exception as e:
             task["status"] = "failed"

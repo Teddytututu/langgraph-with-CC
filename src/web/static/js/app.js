@@ -401,7 +401,9 @@ createApp({
                         detail: (payload.instruction || '').slice(0, 120),
                         sourceEvent: 'task_intervened',
                     });
-                    termLog(`⚡ [USER] $ ${payload.instruction}`, 'input');
+                    if (payload.echoed_to_terminal !== true) {
+                        termLog(`⚡ [USER] $ ${payload.instruction}`, 'input');
+                    }
                     break;
                 }
                 case 'task_intervention_applied':
@@ -677,19 +679,127 @@ createApp({
 
         // 渲染计数器，每次渲染用唯一 ID 防止 Mermaid 内部缓存污染
         let _renderSeq = 0;
+        const graphFeatureFlags = {
+            incremental: true,
+        };
+        let _graphStructureHash = '';
+        let _graphStatusHash = '';
+
+        const parseMermaidStateSignature = (mermaidText) => {
+            const lines = (mermaidText || '').split('\n');
+            const classes = lines
+                .map(line => line.trim())
+                .filter(line => line.startsWith('class '));
+            const links = lines
+                .map(line => line.trim())
+                .filter(line => line.startsWith('linkStyle '));
+            return {
+                classes,
+                links,
+                statusHash: JSON.stringify({ classes, links }),
+            };
+        };
+
+        const parseMermaidStructureSignature = (mermaidText) => {
+            const lines = (mermaidText || '').split('\n');
+            const structure = lines
+                .map(line => line.trim())
+                .filter(line => !line.startsWith('class ') && !line.startsWith('linkStyle '));
+            return JSON.stringify(structure);
+        };
+
+        const applyGraphStateIncremental = (stateSig) => {
+            const wrap = document.getElementById('graph-wrap');
+            if (!wrap) return false;
+
+            // 1) 清理旧 class 赋值
+            wrap.querySelectorAll('.node').forEach(node => {
+                node.classList.remove('pending', 'running', 'done', 'failed', 'skipped', 'blocked');
+            });
+
+            // 2) 应用节点状态 class（来自 Mermaid `class <id> <state>;`）
+            for (const line of stateSig.classes) {
+                const match = line.match(/^class\s+([^\s]+)\s+([^;\s]+);?$/);
+                if (!match) continue;
+                const nodeId = match[1];
+                const cls = match[2];
+                const nodeEl = wrap.querySelector(`#flowchart-${nodeId}`) || wrap.querySelector(`#${nodeId}`);
+                if (nodeEl) nodeEl.classList.add(cls);
+            }
+
+            // 3) 依次应用 linkStyle（映射到 path 序号）
+            const edgePaths = wrap.querySelectorAll('.edgePath path.path');
+            edgePaths.forEach(path => {
+                path.classList.remove('depedge', 'depedge-running', 'depedge-blocked');
+                path.style.stroke = '';
+                path.style.strokeWidth = '';
+                path.style.strokeDasharray = '';
+            });
+
+            for (const line of stateSig.links) {
+                const m = line.match(/^linkStyle\s+(\d+)\s+(.+);?$/);
+                if (!m) continue;
+                const idx = Number(m[1]);
+                const stylePart = m[2];
+                const path = edgePaths[idx];
+                if (!path) continue;
+
+                if (stylePart.includes('stroke:#a855f7')) path.classList.add('depedge-running');
+                else if (stylePart.includes('stroke:#475569')) path.classList.add('depedge-blocked');
+                else path.classList.add('depedge');
+
+                const stroke = stylePart.match(/stroke:\s*([^,;]+)/)?.[1];
+                const width = stylePart.match(/stroke-width:\s*([^,;]+)/)?.[1];
+                const dash = stylePart.match(/stroke-dasharray:\s*([^,;]+)/)?.[1];
+                if (stroke) path.style.stroke = stroke;
+                if (width) path.style.strokeWidth = width;
+                if (dash) path.style.strokeDasharray = dash;
+            }
+
+            return true;
+        };
 
         // 根据当前活跃节点向原始图注入 classDef 高亮并渲染
-        const updateGraphRender = async () => {
+        const updateGraphRender = async ({ force = false, statusOnly = false } = {}) => {
             // 静态骨架图由前端 SVG 直接渲染，无需 Mermaid
             if (!isDynamicGraph.value || !rawMermaid.value) {
                 mermaidSvg.value = '';
                 return;
             }
-            let mStr = rawMermaid.value;
+
             try {
+                const currentStructureHash = parseMermaidStructureSignature(rawMermaid.value);
+                const stateSig = parseMermaidStateSignature(rawMermaid.value);
+                const structureChanged = currentStructureHash !== _graphStructureHash;
+                const statusChanged = stateSig.statusHash !== _graphStatusHash;
+
+                if (!force && statusOnly && !statusChanged) {
+                    return;
+                }
+
+                if (
+                    graphFeatureFlags.incremental &&
+                    !force &&
+                    !structureChanged &&
+                    statusChanged &&
+                    mermaidSvg.value
+                ) {
+                    const ok = applyGraphStateIncremental(stateSig);
+                    if (ok) {
+                        _graphStatusHash = stateSig.statusHash;
+                        return;
+                    }
+                }
+
                 const id = 'graph-render-' + (++_renderSeq);
-                const { svg } = await mermaid.render(id, mStr);
+                const { svg } = await mermaid.render(id, rawMermaid.value);
                 mermaidSvg.value = svg;
+                _graphStructureHash = currentStructureHash;
+                _graphStatusHash = stateSig.statusHash;
+
+                if (graphFeatureFlags.incremental && statusChanged) {
+                    applyGraphStateIncremental(stateSig);
+                }
             } catch (e) {
                 console.error('Mermaid render error:', e);
             }
@@ -705,14 +815,20 @@ createApp({
                 const res = await fetch('/api/graph/mermaid');
                 if (!res.ok) return;
                 const data = await res.json();
-                // 结构未变则只重渲染高亮，不替换 rawMermaid
-                if (data.mermaid === _lastRawMermaid) {
-                    await updateGraphRender();
-                    return;
+
+                const incoming = data?.mermaid || '';
+                const currentStructure = parseMermaidStructureSignature(incoming);
+                const previousStructure = parseMermaidStructureSignature(_lastRawMermaid);
+                const structureChanged = currentStructure !== previousStructure;
+
+                _lastRawMermaid = incoming;
+                rawMermaid.value = incoming;
+
+                if (structureChanged) {
+                    await updateGraphRender({ force: true });
+                } else {
+                    await updateGraphRender({ statusOnly: true });
                 }
-                _lastRawMermaid = data.mermaid;
-                rawMermaid.value = data.mermaid;
-                await updateGraphRender();
             } catch (e) {
                 console.error('fetchGraph error', e);
             }
@@ -720,7 +836,7 @@ createApp({
 
         // 监听节点变化，实时闪烁高亮
         watch(currentNode, (newNode, oldNode) => {
-            if (newNode !== oldNode) updateGraphRender();
+            if (newNode !== oldNode) updateGraphRender({ statusOnly: true });
         });
 
         let _terminalRestored = false;
