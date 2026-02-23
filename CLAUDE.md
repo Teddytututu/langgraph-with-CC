@@ -29,12 +29,17 @@
 ### Step 2 — 检查服务器是否已在运行
 
 ```bash
-# Windows
-netstat -ano | findstr ":8001" | findstr LISTENING
+# 首选：直接探活 API（最可靠）
+.venv\Scripts\python.exe -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/system/status', timeout=3); print('UP')"
 ```
 
-- **有输出** → 服务器已运行，跳到 Step 4。  
-- **无输出** → 继续 Step 3。
+- **输出 `UP`** → 服务器已运行，跳到 Step 4。
+- **连接失败/超时** → 继续 Step 3。
+
+> 如需查看端口占用（辅助排查）：
+> ```bash
+> netstat -ano | findstr ":8001"
+> ```
 
 ### Step 3 — 启动 Web 服务器
 
@@ -69,8 +74,8 @@ netstat -ano | findstr ":8001" | findstr LISTENING
 
 **立即执行：**
 
-1. `netstat -ano | findstr ":8001"` 再次确认。
-2. 若确实挂了：重新执行 Step 3（启动服务器）。
+1. `.venv\Scripts\python.exe -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/system/status', timeout=3); print('UP')"` 再次确认。
+2. 若探活失败：重新执行 Step 3（启动服务器）。
 3. 等待 `server_up` 事件确认恢复。
 
 ### 2.2 `signal` / `type: crash` — 程序崩溃
