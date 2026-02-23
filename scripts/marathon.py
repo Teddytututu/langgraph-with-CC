@@ -44,6 +44,12 @@ DEFAULT_TASK  = (
     "每个阶段至少3名不同领域专家参与讨论协商，讨论轮次不少于10轮。"
 )
 DEFAULT_MINUTES_PER_ROUND = 60   # 每轮时间预算
+DEFAULT_EXECUTION_POLICY = {
+    "force_complex_graph": True,
+    "min_agents_per_node": 3,
+    "min_discussion_rounds": 10,
+    "strict_enforcement": True,
+}
 
 
 def _ts() -> str:
@@ -189,14 +195,17 @@ def _wait_for_idle(timeout: int = 600) -> bool:
     return False
 
 
-def _submit_task(task_text: str, time_minutes: float) -> str | None:
+def _submit_task(task_text: str, time_minutes: float, execution_policy: dict | None) -> str | None:
     """提交任务，返回 task_id。失败返回 None。"""
     # 确保系统空闲再提交，避免多任务并发
     if not _wait_for_idle(timeout=600):
         _log("等待系统空闲超时，跳过本次提交")
         return None
     try:
-        resp = _api("POST", "/api/tasks", {"task": task_text, "time_minutes": time_minutes})
+        payload = {"task": task_text, "time_minutes": time_minutes}
+        if execution_policy is not None:
+            payload["execution_policy"] = execution_policy
+        resp = _api("POST", "/api/tasks", payload)
         return resp.get("id")
     except Exception as e:
         _log(f"提交任务失败: {e}")
@@ -258,7 +267,7 @@ def _clear_old_tasks() -> None:
         _log(f"  清空旧任务失败: {e}")
 
 
-def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int) -> None:
+def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, execution_policy: dict | None) -> None:
     total_seconds = hours * 3600
     end_time = datetime.now() + timedelta(seconds=total_seconds)
     round_num = 0
@@ -276,6 +285,8 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int) -
         remaining_h = (end_time - datetime.now()).total_seconds() / 3600
         _log(f"")
         _log(f"═══ 第 {round_num} 轮 | 剩余 {remaining_h:.1f}h ═══")
+        if execution_policy:
+            _log(f"执行策略: {json.dumps(execution_policy, ensure_ascii=False)}")
 
         # ── 确保服务器在线 ──
         retries = 0
@@ -291,7 +302,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int) -
         # ── 提交任务 ──
         task_id = None
         while task_id is None:
-            task_id = _submit_task(task_text, minutes_per_round)
+            task_id = _submit_task(task_text, minutes_per_round, execution_policy)
             if task_id is None:
                 _wait_for_fix("任务提交失败", round_num, "POST /api/tasks 返回错误")
 
@@ -345,16 +356,40 @@ if __name__ == "__main__":
                         help="每轮提交的任务描述")
     parser.add_argument("--minutes",   type=float, default=DEFAULT_MINUTES_PER_ROUND,
                         help=f"每轮时间预算（分钟），默认 {DEFAULT_MINUTES_PER_ROUND}")
-    parser.add_argument("--cooldown",  type=int, default=30,
-                        help="每轮结束后的冷却秒数，默认 30")
+    parser.add_argument("--strict", action="store_true", default=True,
+                        help="启用严格执行策略（默认开启）")
+    parser.add_argument("--non-strict", action="store_true",
+                        help="关闭严格执行策略，按旧行为提交")
+    parser.add_argument("--force-complex-graph", action="store_true", default=True,
+                        help="强制复杂依赖图（默认开启）")
+    parser.add_argument("--allow-linear-graph", action="store_true",
+                        help="允许线性图（将 force_complex_graph 设为 false）")
+    parser.add_argument("--min-agents-per-node", type=int, default=3,
+                        help="每个节点最少 agent 数（默认 3）")
+    parser.add_argument("--min-discussion-rounds", type=int, default=10,
+                        help="每个节点最少讨论轮次（默认 10）")
     args = parser.parse_args()
 
     if not _acquire_singleton_lock():
         sys.exit(0)
 
+    strict_enabled = args.strict and not args.non_strict
+    force_complex_graph = args.force_complex_graph and not args.allow_linear_graph
+    execution_policy = {
+        "force_complex_graph": force_complex_graph,
+        "min_agents_per_node": args.min_agents_per_node,
+        "min_discussion_rounds": args.min_discussion_rounds,
+        "strict_enforcement": strict_enabled,
+    } if strict_enabled else None
+
     try:
-        run(task_text=args.task, hours=args.hours,
-            minutes_per_round=args.minutes, cooldown=args.cooldown)
+        run(
+            task_text=args.task,
+            hours=args.hours,
+            minutes_per_round=args.minutes,
+            cooldown=args.cooldown,
+            execution_policy=execution_policy,
+        )
     except KeyboardInterrupt:
         _log("用户中断")
         FIX_REQUEST.unlink(missing_ok=True)

@@ -315,6 +315,7 @@ class DynamicGraphBuilder:
             "review": "reviewer",
             "timeout": END,
             "continue": "executor",
+            "wait": "router",
         })
         self.add_conditional_edges("reviewer", route_after_review, {
             "pass": "router",

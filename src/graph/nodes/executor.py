@@ -1,36 +1,26 @@
 """src/graph/nodes/executor.py - Multi-Agent Discussion Executor
 
-Each subtask is executed by >=3 domain specialists engaging in >=10 rounds
-of discussion, with a final synthesizer producing consensus conclusions.
+严格模式下执行真实多 agent 往返讨论轮次；不满足策略立即 fail-closed。
 """
 import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
 
-from src.graph.state import GraphState, SubTask, NodeDiscussion, DiscussionMessage
+from src.graph.state import GraphState, SubTask, NodeDiscussion, DiscussionMessage, ExecutionPolicy
 from src.agents.caller import get_caller
 
 logger = logging.getLogger(__name__)
 
 
 def _compute_timeout(task: SubTask) -> float:
-    """Outer timeout for the 2-phase discussion.
-
-    Inner caps: 150s per specialist (parallel) + 150s synthesizer = 300s wall time.
-    Add 200s buffer => need at least 500s.
-
-    Formula: max(500s, min(est_min * 75s, 1200s))
-      est=7min => 525s  |  est=8min => 600s  |  est=16min => 1200s (cap)
-
-    Budget math: 6 subtasks x ~600s each = 60 min, well within 90 min poll deadline.
-    """
-    return max(500.0, min(task.estimated_minutes * 75.0, 1200.0))
+    """Outer timeout for multi-round discussion + synthesis."""
+    return max(900.0, min(task.estimated_minutes * 150.0, 2400.0))
 
 
 def _ensure_domains(task: SubTask, min_count: int = 3) -> list[str]:
-    """Guarantee at least min_count knowledge domains per task"""
-    domains = list(task.knowledge_domains or [task.agent_type])
+    """Guarantee at least min_count knowledge domains per task (non-strict helper)."""
+    domains = list(dict.fromkeys(task.knowledge_domains or [task.agent_type]))
     extras = [
         "code_quality", "architecture", "testing",
         "documentation", "performance", "security",
@@ -44,14 +34,75 @@ def _ensure_domains(task: SubTask, min_count: int = 3) -> list[str]:
     return domains
 
 
-def _find_next_task(state: GraphState) -> Optional[SubTask]:
+def _resolve_policy(state: GraphState) -> ExecutionPolicy:
+    raw = state.get("execution_policy")
+    if isinstance(raw, ExecutionPolicy):
+        return raw
+    if isinstance(raw, dict):
+        return ExecutionPolicy.model_validate(raw)
+    return ExecutionPolicy()
+
+
+def _task_dependencies(task: SubTask) -> list[str]:
+    deps = getattr(task, "dependencies", None)
+    return [d for d in (deps or []) if d]
+
+
+def _find_task_by_id(subtasks: list[SubTask], task_id: str | None) -> Optional[SubTask]:
+    if not task_id:
+        return None
+    return next((t for t in subtasks if t.id == task_id), None)
+
+
+def _is_ready(task: SubTask, done_ids: set[str]) -> bool:
+    deps = _task_dependencies(task)
+    return task.status == "pending" and all(d in done_ids for d in deps)
+
+
+def _collect_ready_tasks(state: GraphState) -> list[SubTask]:
     subtasks = state.get("subtasks", [])
     done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
-    for task in sorted(subtasks, key=lambda t: t.priority):
-        if task.status == "pending":
-            if all(d in done_ids for d in task.dependencies):
-                return task
+    return [t for t in sorted(subtasks, key=lambda t: t.priority) if _is_ready(t, done_ids)]
+
+
+def _find_next_task(state: GraphState) -> Optional[SubTask]:
+    subtasks = state.get("subtasks", [])
+    ready_tasks = _collect_ready_tasks(state)
+    if ready_tasks:
+        current_task = _find_task_by_id(subtasks, state.get("current_subtask_id"))
+        if current_task and current_task in ready_tasks:
+            return current_task
+        return ready_tasks[0]
+
+    current_task = _find_task_by_id(subtasks, state.get("current_subtask_id"))
+    if current_task and current_task.status == "pending":
+        return current_task
+
     return None
+
+
+def _unrecoverable_dependency_reason(task: SubTask, subtasks: list[SubTask]) -> Optional[str]:
+    status_by_id = {t.id: t.status for t in subtasks}
+
+    failed_or_missing = []
+    for dep in task.dependencies:
+        dep_status = status_by_id.get(dep)
+        if dep_status is None:
+            failed_or_missing.append(f"{dep}(missing)")
+        elif dep_status == "failed":
+            failed_or_missing.append(dep)
+
+    if failed_or_missing:
+        return f"Dependency failed: {', '.join(failed_or_missing)}"
+    return None
+
+
+def _find_running_task(state: GraphState) -> Optional[SubTask]:
+    subtasks = state.get("subtasks", [])
+    running = [t for t in subtasks if t.status == "running"]
+    if not running:
+        return None
+    return sorted(running, key=lambda t: t.priority)[0]
 
 
 def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
@@ -68,10 +119,6 @@ def _build_context(state: GraphState, current_task: SubTask) -> list[dict]:
     return prev_results
 
 
-# ------------------------------------------------------------------ #
-#  Multi-Agent Discussion Engine                                      #
-# ------------------------------------------------------------------ #
-
 async def _execute_multi_agent_discussion(
     caller,
     task: SubTask,
@@ -79,31 +126,28 @@ async def _execute_multi_agent_discussion(
     previous_results: list[dict],
     budget_ctx: dict | None,
     *,
-    min_rounds: int = 10,   # kept as param; each specialist covers this many dimensions
-    min_agents: int = 3,
+    min_rounds: int,
+    min_agents: int,
+    strict: bool,
 ) -> tuple[dict, list[dict]]:
     """
-    Multi-specialist discussion with EFFICIENT parallel design.
-
-    Architecture (2 phases total, not 10+ rounds):
-
-    Phase 1 – PARALLEL: each specialist gets ONE SDK call containing a
-    comprehensive prompt asking them to analyse the task across `min_rounds`
-    analytical dimensions from their domain perspective.
-
-    Phase 2 – SEQUENTIAL: synthesizer merges all specialist outputs into
-    a final consensus report.
-
-    This gives "3 agents, 10+ analytical dimensions" while making only
-    4 total SDK calls (3 parallel + 1 sequential) instead of 31.
-
-    Returns (call_result, discussion_log)
-    where discussion_log has min_agents*min_rounds + 1 conceptual entries.
+    真实多轮讨论：每轮所有参与 agent 对前一轮观点进行响应，形成往返。
     """
     discussion_log: list[dict] = []
 
-    # ── Phase 0: create specialists IN PARALLEL ──
-    target_domains = domains[:max(min_agents, len(domains))]
+    unique_domains = list(dict.fromkeys(domains))
+    if len(unique_domains) < min_agents and strict:
+        return (
+            {
+                "success": False,
+                "error": f"[POLICY_VIOLATION] domains<{min_agents}",
+                "result": None,
+                "specialist_id": None,
+                "actual_agents_used": 0,
+                "actual_discussion_rounds": 0,
+            },
+            discussion_log,
+        )
 
     async def _create_one(domain: str):
         return domain, await caller.get_or_create_specialist(
@@ -111,7 +155,7 @@ async def _execute_multi_agent_discussion(
             task_description=f"[{domain}] {task.description}",
         )
 
-    created = await asyncio.gather(*[_create_one(d) for d in target_domains], return_exceptions=True)
+    created = await asyncio.gather(*[_create_one(d) for d in unique_domains], return_exceptions=True)
 
     specialists: list[dict] = []
     for item in created:
@@ -121,18 +165,45 @@ async def _execute_multi_agent_discussion(
         domain, sid = item
         if sid:
             specialists.append({"id": sid, "domain": domain})
-        else:
-            logger.warning("[discussion] cannot create %s specialist", domain)
 
-    if not specialists:
+    unique_specialist_ids = list(dict.fromkeys([s["id"] for s in specialists]))
+    if strict and len(unique_specialist_ids) < min_agents:
         return (
-            {"success": False, "error": "no specialists created", "result": None, "specialist_id": None},
+            {
+                "success": False,
+                "error": f"[POLICY_VIOLATION] available_agents<{min_agents}",
+                "result": None,
+                "specialist_id": None,
+                "actual_agents_used": len(unique_specialist_ids),
+                "actual_discussion_rounds": 0,
+            },
             discussion_log,
         )
 
-    while len(specialists) < min_agents:
-        src = specialists[len(specialists) % len(specialists)]
-        specialists.append({"id": src["id"], "domain": f"{src['domain']}_ext"})
+    if not specialists:
+        return (
+            {
+                "success": False,
+                "error": "no specialists created",
+                "result": None,
+                "specialist_id": None,
+                "actual_agents_used": 0,
+                "actual_discussion_rounds": 0,
+            },
+            discussion_log,
+        )
+
+    if len(unique_specialist_ids) < min_agents:
+        while len(specialists) < min_agents:
+            src = specialists[len(specialists) % len(specialists)]
+            specialists.append({"id": src["id"], "domain": f"{src['domain']}_ext"})
+
+    criteria_str = ", ".join(task.completion_criteria) if task.completion_criteria else "none"
+    prev_summary = ""
+    if previous_results:
+        prev_summary = "\n\nContext from prerequisite tasks:\n"
+        for p in previous_results[:3]:
+            prev_summary += f"\n[{p['title']}]: {str(p['result'])[:600]}\n"
 
     subtask_dict = {
         "id": task.id,
@@ -143,45 +214,23 @@ async def _execute_multi_agent_discussion(
         "estimated_minutes": task.estimated_minutes,
         "completion_criteria": task.completion_criteria,
     }
-    criteria_str = ", ".join(task.completion_criteria) if task.completion_criteria else "none"
 
-    # Build the 10 analytical dimensions for each specialist
-    dimensions = [
-        "current state assessment – what exists / what works",
-        "gap analysis – what is missing or broken",
-        "root cause analysis – why issues exist",
-        "risk assessment – potential failure modes",
-        "dependency mapping – upstream/downstream impacts",
-        "quick wins – changes that improve things immediately",
-        "structural improvements – deeper architectural changes",
-        "validation approach – how to verify fixes work",
-        "implementation roadmap – ordered action steps",
-        "monitoring & observability – ongoing health checks",
-    ]
-    dim_list = "\n".join(f"{i+1}. {d}" for i, d in enumerate(dimensions[:min_rounds]))
+    round_outputs: dict[int, list[dict]] = {}
+    rounds_executed = 0
 
-    prev_summary = ""
-    if previous_results:
-        prev_summary = "\n\n=== Results from prerequisite tasks ===\n"
-        for p in previous_results[:3]:
-            prev_summary += f"\n**{p['title']}**:\n{str(p['result'])[:800]}\n"
-        prev_summary += "=== End prerequisite results ===\n"
-
-    # ── Phase 1: fire all specialists in PARALLEL ──
-    async def _deep_dive_specialist(spec: dict) -> dict:
+    async def _call_round_specialist(spec: dict, round_idx: int, prior_round_digest: str) -> dict:
         prompt = (
-            f"You are a senior **{spec['domain']}** specialist.\n"
+            f"You are a senior {spec['domain']} specialist in a multi-agent discussion.\n"
             f"Task: {task.title}\n"
-            f"Description: {task.description}\n"
-            f"Completion criteria: {criteria_str}\n"
+            f"Description: {task.description[:800]}\n"
+            f"Success criteria: {criteria_str[:400]}\n"
             f"{prev_summary}\n"
-            f"Please analyse this task across ALL {min_rounds} dimensions below, "
-            f"writing a dedicated section for each:\n\n"
-            f"{dim_list}\n\n"
-            f"Format: use '## Dimension N: <name>' as headers.\n"
-            f"Be specific, technical, and actionable throughout. "
-            f"Focus on your **{spec['domain']}** expertise.\n\n"
-            f"Output your complete {min_rounds}-dimension analysis:"
+            f"Current round: {round_idx}/{min_rounds}\n"
+            f"Prior round summary:\n{prior_round_digest[:1800]}\n\n"
+            "Respond in two parts:\n"
+            "1) Your updated proposal for this round\n"
+            "2) Direct response to at least one other perspective from prior round\n"
+            "Keep it concrete and concise (<500 words)."
         )
         try:
             res = await asyncio.wait_for(
@@ -191,89 +240,113 @@ async def _execute_multi_agent_discussion(
                     previous_results=previous_results,
                     time_budget=budget_ctx,
                 ),
-                timeout=150.0,  # 2.5 min per specialist
+                timeout=360.0,
             )
         except asyncio.TimeoutError:
-            logger.warning("[discussion] %s deep-dive timed out (150s)", spec["domain"])
-            res = {"success": False, "error": "timed out after 150s", "result": None}
+            res = {"success": False, "error": "timed out after 360s", "result": None}
         except Exception as e:
-            logger.warning("[discussion] %s deep-dive failed: %s", spec["domain"], e)
             res = {"success": False, "error": str(e), "result": None}
 
-        output = ""
+        content = ""
         if res.get("success") and res.get("result"):
-            output = str(res["result"]).strip()
+            content = str(res["result"]).strip()
         elif res.get("error"):
-            output = f"[{spec['domain']} failed: {res['error']}]"
+            content = f"[{spec['domain']} failed: {res['error']}]"
         else:
-            output = "[no output]"
+            content = "[no output]"
 
-        # Split output into per-dimension log entries for visibility
-        sections = output.split("## Dimension ")
-        if len(sections) > 1:
-            for i, sec in enumerate(sections[1:], start=1):
-                discussion_log.append({
-                    "agent": spec["id"],
-                    "domain": spec["domain"],
-                    "round": i,
-                    "content": ("## Dimension " + sec)[:2000],
-                    "type": "analysis",
-                })
-        else:
-            # Fallback: single entry
-            discussion_log.append({
-                "agent": spec["id"],
-                "domain": spec["domain"],
-                "round": 1,
-                "content": output[:3000],
-                "type": "analysis",
-            })
+        return {
+            "agent": spec["id"],
+            "domain": spec["domain"],
+            "round": round_idx,
+            "content": content[:3000],
+            "type": "response",
+            "success": bool(res.get("success") and res.get("result")),
+        }
 
-        return {"domain": spec["domain"], "id": spec["id"], "output": output}
+    prior_digest = "No prior round yet."
+    for round_idx in range(1, min_rounds + 1):
+        batch = await asyncio.gather(
+            *[_call_round_specialist(spec, round_idx, prior_digest) for spec in specialists],
+            return_exceptions=True,
+        )
 
-    logger.info("[discussion] Phase 1: firing %d specialists in parallel", len(specialists))
-    specialist_results = await asyncio.gather(
-        *[_deep_dive_specialist(spec) for spec in specialists],
-        return_exceptions=True,
-    )
+        entries: list[dict] = []
+        for item in batch:
+            if isinstance(item, Exception):
+                logger.warning("[discussion] round=%s gather exception: %s", round_idx, item)
+                continue
+            entries.append(item)
+            discussion_log.append({k: item[k] for k in ("agent", "domain", "round", "content", "type")})
 
-    # Collect outputs
-    outputs_by_domain: dict[str, str] = {}
-    for i, res in enumerate(specialist_results):
-        domain = specialists[i]["domain"]
-        if isinstance(res, Exception):
-            logger.warning("[discussion] specialist %s raised exception: %s", domain, res)
-            outputs_by_domain[domain] = f"[exception: {res}]"
-        else:
-            outputs_by_domain[domain] = res.get("output", "[no output]")
+        if not entries:
+            return (
+                {
+                    "success": False,
+                    "error": f"discussion_round_{round_idx}_empty",
+                    "result": None,
+                    "specialist_id": None,
+                    "actual_agents_used": len(unique_specialist_ids),
+                    "actual_discussion_rounds": rounds_executed,
+                },
+                discussion_log,
+            )
 
-    if not any(v and not v.startswith("[") for v in outputs_by_domain.values()):
+        success_agents = len({e["agent"] for e in entries if e.get("success")})
+        if strict and success_agents < min_agents:
+            return (
+                {
+                    "success": False,
+                    "error": f"[POLICY_VIOLATION] round_{round_idx}_agents<{min_agents}",
+                    "result": None,
+                    "specialist_id": None,
+                    "actual_agents_used": success_agents,
+                    "actual_discussion_rounds": rounds_executed,
+                },
+                discussion_log,
+            )
+
+        rounds_executed = round_idx
+        round_outputs[round_idx] = entries
+
+        digest_lines = []
+        for e in entries[:8]:
+            digest_lines.append(f"- {e['domain']}({e['agent']}): {e['content'][:240]}")
+        prior_digest = "\n".join(digest_lines) or "No substantial updates."
+
+    if strict and rounds_executed < min_rounds:
         return (
-            {"success": False, "error": "all specialists failed", "result": None, "specialist_id": None},
+            {
+                "success": False,
+                "error": f"[POLICY_VIOLATION] rounds<{min_rounds}",
+                "result": None,
+                "specialist_id": None,
+                "actual_agents_used": len(unique_specialist_ids),
+                "actual_discussion_rounds": rounds_executed,
+            },
             discussion_log,
         )
 
-    # ── Phase 2: synthesizer ──
-    perspectives_text = "\n\n".join(
-        f"=== {domain.upper()} SPECIALIST ===\n{output[:4000]}"
-        for domain, output in outputs_by_domain.items()
-    )
+    transcript = []
+    for r in range(1, rounds_executed + 1):
+        transcript.append(f"## Round {r}")
+        for e in round_outputs.get(r, []):
+            transcript.append(f"[{e['domain']}|{e['agent']}]\n{e['content'][:1200]}")
+    transcript_text = "\n\n".join(transcript)
+
     synthesis_prompt = (
         f"You are the consensus synthesizer.\n"
         f"Task: {task.title}\nDescription: {task.description}\n\n"
-        f"{perspectives_text}\n\n"
-        f"=== END OF SPECIALIST REPORTS ===\n\n"
-        f"Synthesise ALL specialist perspectives into one final report:\n"
-        f"1. **Consensus findings** – what all specialists agree on\n"
-        f"2. **Complementary insights** – unique value from each perspective\n"
-        f"3. **Prioritised action plan** – ordered by impact × effort\n"
-        f"4. **Implementation details** – specific files, commands, or code to change\n"
-        f"5. **Verification checklist** – how to confirm completion\n\n"
-        f"Output the complete synthesis report:"
+        f"Below is the full multi-round discussion transcript ({rounds_executed} rounds):\n"
+        f"{transcript_text[:18000]}\n\n"
+        "Produce final consensus with:\n"
+        "1) Agreed findings\n"
+        "2) Main disagreements and resolution\n"
+        "3) Prioritized implementation plan\n"
+        "4) Verification checklist\n"
     )
 
     synthesizer_id = specialists[0]["id"]
-    logger.info("[discussion] Phase 2: running synthesizer")
     try:
         synth_res = await asyncio.wait_for(
             caller.call_specialist(
@@ -282,79 +355,133 @@ async def _execute_multi_agent_discussion(
                 previous_results=[],
                 time_budget=budget_ctx,
             ),
-            timeout=150.0,  # 2.5 min synthesizer
+            timeout=420.0,
         )
-    except asyncio.TimeoutError:
-        logger.warning("[discussion] synthesizer timed out (150s), using concatenation")
-        synth_res = {"success": True, "result": "\n\n---\n\n".join(
-            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
-        )}
     except Exception as e:
-        logger.warning("[discussion] synthesizer error: %s", e)
-        synth_res = {"success": True, "result": "\n\n---\n\n".join(
-            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
-        )}
+        synth_res = {"success": False, "error": str(e), "result": None}
 
     final_result = ""
     if synth_res.get("success") and synth_res.get("result"):
         final_result = str(synth_res["result"]).strip()
+
     if not final_result:
-        final_result = "\n\n---\n\n".join(
-            f"**[{d}]**\n{o}" for d, o in outputs_by_domain.items()
-        )
+        if strict:
+            return (
+                {
+                    "success": False,
+                    "error": "[POLICY_VIOLATION] synthesis_empty",
+                    "result": None,
+                    "specialist_id": None,
+                    "actual_agents_used": len(unique_specialist_ids),
+                    "actual_discussion_rounds": rounds_executed,
+                },
+                discussion_log,
+            )
+        final_result = transcript_text[:12000]
 
     discussion_log.append({
         "agent": synthesizer_id,
         "domain": "synthesis",
-        "round": min_rounds + 1,
+        "round": rounds_executed + 1,
         "content": final_result[:3000],
         "type": "synthesis",
     })
 
     return (
         {
-            "success": bool(final_result),
+            "success": True,
             "result": final_result,
-            "specialist_id": specialists[0]["id"],
-            "error": None if final_result else "discussion produced no conclusion",
+            "specialist_id": synthesizer_id,
+            "error": None,
+            "actual_agents_used": len(unique_specialist_ids),
+            "actual_discussion_rounds": rounds_executed,
         },
         discussion_log,
     )
 
 
-# ------------------------------------------------------------------ #
-#  Main Executor Node                                                 #
-# ------------------------------------------------------------------ #
-
 async def executor_node(state: GraphState) -> dict:
     """
-    Find the next executable subtask, run multi-agent discussion.
-    Flow: 3+ domain specialists x 10+ rounds -> synthesizer -> consensus
+    Find the next executable subtask and run multi-agent discussion.
     """
     from pathlib import Path as _Path
     _Path("reports").mkdir(exist_ok=True)
 
     caller = get_caller()
     subtasks = state.get("subtasks", [])
+    artifacts = dict(state.get("artifacts") or {})
+    policy = _resolve_policy(state)
 
-    next_task = _find_next_task(state)
-    if not next_task:
-        pending = [t for t in subtasks if t.status == "pending"]
-        if pending:
-            updated_subtasks = []
-            done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
-            for t in subtasks:
-                if t.status == "pending" and not all(d in done_ids for d in t.dependencies):
-                    updated_subtasks.append(t.model_copy(update={
-                        "status": "failed",
-                        "result": f"Dependency failed: {t.dependencies}",
-                    }))
-                else:
+    running_task = _find_running_task(state)
+    if running_task:
+        next_task = running_task
+    else:
+        next_task = _find_next_task(state)
+        if not next_task:
+            pending = [t for t in subtasks if t.status == "pending"]
+            if pending:
+                updated_subtasks = []
+                changed = False
+                for t in subtasks:
+                    if t.status == "pending":
+                        reason = _unrecoverable_dependency_reason(t, subtasks)
+                        if reason:
+                            changed = True
+                            updated_subtasks.append(t.model_copy(update={
+                                "status": "failed",
+                                "result": reason,
+                                "finished_at": datetime.now(),
+                            }))
+                            continue
                     updated_subtasks.append(t)
-            return {"phase": "reviewing", "current_subtask_id": None, "subtasks": updated_subtasks}
-        return {"phase": "reviewing", "current_subtask_id": None}
 
-    started_at = datetime.now()
+                if changed:
+                    return {
+                        "phase": "reviewing",
+                        "current_subtask_id": None,
+                        "subtasks": updated_subtasks,
+                        "artifacts": artifacts,
+                        "execution_log": [{
+                            "event": "pending_fail_closed",
+                            "reason": "unrecoverable_dependencies",
+                            "failed_count": sum(1 for t in updated_subtasks if t.status == "failed"),
+                            "timestamp": datetime.now().isoformat(),
+                        }],
+                    }
+
+                return {
+                    "phase": "reviewing",
+                    "current_subtask_id": None,
+                    "subtasks": updated_subtasks,
+                    "artifacts": artifacts,
+                    "execution_log": [{
+                        "event": "no_ready_tasks",
+                        "pending_count": len(pending),
+                        "timestamp": datetime.now().isoformat(),
+                    }],
+                }
+            return {"phase": "reviewing", "current_subtask_id": None, "artifacts": artifacts}
+
+        started_at = datetime.now()
+        updated_subtasks = [
+            t.model_copy(update={"status": "running", "started_at": started_at}) if t.id == next_task.id else t
+            for t in subtasks
+        ]
+        logger.info("[executor] task %s moved to running", next_task.id)
+        return {
+            "subtasks": updated_subtasks,
+            "current_subtask_id": next_task.id,
+            "phase": "executing",
+            "artifacts": artifacts,
+            "execution_log": [{
+                "event": "task_started",
+                "task_id": next_task.id,
+                "agent": next_task.agent_type,
+                "timestamp": started_at.isoformat(),
+            }],
+        }
+
+    started_at = next_task.started_at or datetime.now()
     previous_results = _build_context(state, next_task)
 
     budget_ctx: dict | None = None
@@ -372,38 +499,102 @@ async def executor_node(state: GraphState) -> dict:
             "deadline": raw_budget.deadline.isoformat() if raw_budget.deadline else None,
         }
 
-    # === Core: Multi-Agent Discussion Execution ===
-    domains = _ensure_domains(next_task, min_count=3)
+    # === Policy preflight ===
+    required_agents = max(1, policy.min_agents_per_node)
+    required_rounds = max(1, policy.min_discussion_rounds)
+
+    declared_domains = list(dict.fromkeys(next_task.knowledge_domains or [next_task.agent_type]))
+    if policy.strict_enforcement and len(declared_domains) < required_agents:
+        error = f"[POLICY_VIOLATION] declared_domains<{required_agents}"
+        fail_subtasks = [
+            t.model_copy(update={
+                "status": "failed",
+                "result": error,
+                "started_at": started_at,
+                "finished_at": datetime.now(),
+            }) if t.id == next_task.id else t
+            for t in subtasks
+        ]
+        return {
+            "subtasks": fail_subtasks,
+            "current_subtask_id": next_task.id,
+            "phase": "reviewing",
+            "artifacts": artifacts,
+            "execution_log": [{
+                "event": "policy_violation",
+                "task_id": next_task.id,
+                "error": error,
+                "required_agents": required_agents,
+                "declared_domains": len(declared_domains),
+                "timestamp": datetime.now().isoformat(),
+            }],
+        }
+
+    domains = declared_domains if policy.strict_enforcement else _ensure_domains(next_task, min_count=max(3, required_agents))
     timeout = _compute_timeout(next_task)
 
     logger.info(
-        "[executor] Starting multi-agent discussion | task=%s | domains=%s | experts=%d",
-        next_task.id, domains, len(domains),
+        "[executor] Starting discussion | task=%s | domains=%s | required_agents=%d | required_rounds=%d | strict=%s",
+        next_task.id, domains, required_agents, required_rounds, policy.strict_enforcement,
     )
 
     try:
         call_result, discussion_log = await asyncio.wait_for(
             _execute_multi_agent_discussion(
-                caller, next_task, domains, previous_results, budget_ctx,
-                min_rounds=10, min_agents=3,
+                caller,
+                next_task,
+                domains,
+                previous_results,
+                budget_ctx,
+                min_rounds=required_rounds,
+                min_agents=required_agents,
+                strict=policy.strict_enforcement,
             ),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        # Don't crash the whole graph — mark this subtask failed and let the graph continue
-        logger.warning(
-            "[executor] discussion timeout %ss for task %s — marking failed, graph continues",
-            timeout, next_task.id,
-        )
         call_result = {
             "success": False,
             "error": f"discussion timeout ({timeout:.0f}s)",
             "result": None,
             "specialist_id": None,
+            "actual_agents_used": 0,
+            "actual_discussion_rounds": 0,
+        }
+        discussion_log = []
+    except Exception as exc:
+        logger.exception("[executor] discussion crashed for task %s", next_task.id)
+        call_result = {
+            "success": False,
+            "error": f"discussion crashed: {exc}",
+            "result": None,
+            "specialist_id": None,
+            "actual_agents_used": 0,
+            "actual_discussion_rounds": 0,
         }
         discussion_log = []
 
     specialist_id = call_result.get("specialist_id")
+    actual_agents_used = int(call_result.get("actual_agents_used") or 0)
+    actual_rounds = int(call_result.get("actual_discussion_rounds") or 0)
+
+    strict_unmet = (
+        policy.strict_enforcement
+        and (actual_agents_used < required_agents or actual_rounds < required_rounds)
+    )
+
+    if strict_unmet and call_result.get("success"):
+        call_result = {
+            "success": False,
+            "error": (
+                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents} "
+                f"or actual_rounds={actual_rounds}<{required_rounds}"
+            ),
+            "result": None,
+            "specialist_id": specialist_id,
+            "actual_agents_used": actual_agents_used,
+            "actual_discussion_rounds": actual_rounds,
+        }
 
     if not call_result.get("success"):
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
@@ -420,32 +611,45 @@ async def executor_node(state: GraphState) -> dict:
             "subtasks": fail_subtasks,
             "current_subtask_id": next_task.id,
             "phase": "reviewing",
+            "artifacts": artifacts,
             "execution_log": [{
                 "event": "task_failed",
                 "task_id": next_task.id,
                 "error": call_result.get("error"),
-                "discussion_rounds": len(discussion_log),
+                "discussion_rounds": actual_rounds,
+                "discussion_agents": actual_agents_used,
+                "required_rounds": required_rounds,
+                "required_agents": required_agents,
                 "timestamp": datetime.now().isoformat(),
             }],
         }
 
     result_text = str(call_result.get("result", "")).strip()
 
-    # Try to associate report files
     _reports_dir = _Path("reports")
+    report_path = None
+    report_kind = None
+    _candidates = []
     if _reports_dir.exists():
         _task_slug = next_task.id.replace("-", "").replace(".", "")
         _candidates = sorted(
             list(_reports_dir.glob(f"{next_task.id}*.md"))
-            + list(_reports_dir.glob(f"{_task_slug}*.md")),
-            key=lambda p: p.stat().st_mtime, reverse=True,
+            + list(_reports_dir.glob(f"{_task_slug}*.md"))
+            + list(_reports_dir.glob(f"{next_task.id}*.json"))
+            + list(_reports_dir.glob(f"{_task_slug}*.json")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
         if _candidates:
+            report_path = str(_candidates[0])
+            report_kind = _candidates[0].suffix.lstrip(".").lower()
+        md_candidates = [p for p in _candidates if p.suffix.lower() == ".md"]
+        if md_candidates:
             try:
-                _file_content = _candidates[0].read_text(encoding="utf-8", errors="replace")
+                _file_content = md_candidates[0].read_text(encoding="utf-8", errors="replace")
                 if len(_file_content.strip()) > len(result_text):
                     result_text = _file_content
-                    logger.info("[executor] Using report file %s", _candidates[0].name)
+                    logger.info("[executor] Using report file %s", md_candidates[0].name)
             except Exception as _fe:
                 logger.warning("[executor] Failed to read report: %s", _fe)
 
@@ -456,7 +660,11 @@ async def executor_node(state: GraphState) -> dict:
         "finished_at": datetime.now(),
     }
 
-    # Build discussion records
+    if report_path:
+        artifacts[next_task.id] = report_path
+        if report_kind:
+            artifacts[f"{next_task.id}:{report_kind}"] = report_path
+
     existing_discussions: dict = dict(state.get("discussions") or {})
     disc = existing_discussions.get(next_task.id) or NodeDiscussion(node_id=next_task.id)
     for entry in discussion_log:
@@ -466,7 +674,7 @@ async def executor_node(state: GraphState) -> dict:
             content=entry["content"][:2000],
             message_type=entry.get("type", "info"),
             metadata={
-                "round": entry.get("round", 0),
+                "round_index": entry.get("round", 0),
                 "domain": entry.get("domain", ""),
                 "task_title": next_task.title,
             },
@@ -493,25 +701,23 @@ async def executor_node(state: GraphState) -> dict:
         else:
             updated_subtasks.append(t)
 
-    logger.info(
-        "[executor] Task %s done | agents=%d | rounds=%d | result_len=%d",
-        next_task.id, len(all_agents), len(discussion_log), len(result_text),
-    )
-
     return {
         "subtasks": updated_subtasks,
         "current_subtask_id": next_task.id,
         "time_budget": state.get("time_budget"),
         "phase": "executing",
         "discussions": existing_discussions,
+        "artifacts": artifacts,
         "execution_log": [{
             "event": "task_executed",
             "task_id": next_task.id,
             "agent": next_task.agent_type,
             "specialist_id": specialist_id,
             "status": result["status"],
-            "discussion_rounds": len(discussion_log),
-            "discussion_agents": len(all_agents),
+            "discussion_rounds": actual_rounds,
+            "discussion_agents": actual_agents_used,
+            "required_rounds": required_rounds,
+            "required_agents": required_agents,
             "timestamp": datetime.now().isoformat(),
         }],
     }

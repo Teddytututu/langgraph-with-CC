@@ -1,8 +1,10 @@
 """src/graph/nodes/planner.py — 任务分解节点"""
 import asyncio
 import json
+from collections import defaultdict, deque
 from datetime import datetime
-from src.graph.state import GraphState, SubTask
+
+from src.graph.state import GraphState, SubTask, ExecutionPolicy
 from src.utils.config import get_config
 from src.agents.caller import get_caller
 
@@ -43,6 +45,169 @@ task-007 总结报告 ← task-006
 """
 
 
+def _resolve_policy(state: GraphState) -> ExecutionPolicy:
+    policy = state.get("execution_policy")
+    if isinstance(policy, ExecutionPolicy):
+        return policy
+    if isinstance(policy, dict):
+        return ExecutionPolicy.model_validate(policy)
+    return ExecutionPolicy()
+
+
+def _policy_prompt(policy: ExecutionPolicy) -> str:
+    if not policy.strict_enforcement and not policy.force_complex_graph:
+        return ""
+    return (
+        "\n\n[执行策略约束]\n"
+        f"- force_complex_graph={policy.force_complex_graph}\n"
+        f"- min_agents_per_node={policy.min_agents_per_node}\n"
+        f"- min_discussion_rounds={policy.min_discussion_rounds}\n"
+        f"- strict_enforcement={policy.strict_enforcement}\n"
+        "- 若 strict_enforcement=true，必须返回满足约束的复杂 DAG，不允许降级为线性链。\n"
+    )
+
+
+def _topological_levels(subtasks: list[SubTask]) -> list[list[str]]:
+    by_id = {t.id: t for t in subtasks}
+    in_deg = {t.id: 0 for t in subtasks}
+    children: dict[str, list[str]] = defaultdict(list)
+
+    for t in subtasks:
+        for dep in t.dependencies:
+            if dep in by_id:
+                children[dep].append(t.id)
+                in_deg[t.id] += 1
+
+    q = deque([tid for tid, deg in in_deg.items() if deg == 0])
+    levels: list[list[str]] = []
+    visited = 0
+
+    while q:
+        layer = list(q)
+        levels.append(layer)
+        q.clear()
+        for u in layer:
+            visited += 1
+            for v in children.get(u, []):
+                in_deg[v] -= 1
+                if in_deg[v] == 0:
+                    q.append(v)
+
+    if visited != len(subtasks):
+        return []
+    return levels
+
+
+def _is_pure_linear(subtasks: list[SubTask]) -> bool:
+    if len(subtasks) <= 1:
+        return True
+    by_id = {t.id: t for t in subtasks}
+    out_deg = {t.id: 0 for t in subtasks}
+    in_deg = {t.id: 0 for t in subtasks}
+    edge_count = 0
+
+    for t in subtasks:
+        for dep in t.dependencies:
+            if dep in by_id:
+                out_deg[dep] += 1
+                in_deg[t.id] += 1
+                edge_count += 1
+
+    if edge_count != len(subtasks) - 1:
+        return False
+
+    roots = sum(1 for v in in_deg.values() if v == 0)
+    sinks = sum(1 for v in out_deg.values() if v == 0)
+    branching = any(v > 1 for v in out_deg.values())
+    converging = any(v > 1 for v in in_deg.values())
+    return roots == 1 and sinks == 1 and not branching and not converging
+
+
+def _validate_subtasks(subtasks: list[SubTask], policy: ExecutionPolicy) -> tuple[bool, str]:
+    if not subtasks:
+        return False, "empty_subtasks"
+
+    ids = [t.id for t in subtasks]
+    if len(set(ids)) != len(ids):
+        return False, "duplicate_task_ids"
+
+    by_id = {t.id: t for t in subtasks}
+    for t in subtasks:
+        if t.id in t.dependencies:
+            return False, f"self_dependency:{t.id}"
+        for dep in t.dependencies:
+            if dep not in by_id:
+                return False, f"missing_dependency:{t.id}->{dep}"
+
+    levels = _topological_levels(subtasks)
+    if not levels:
+        return False, "dependency_cycle_detected"
+
+    if policy.force_complex_graph or policy.strict_enforcement:
+        if not (6 <= len(subtasks) <= 12):
+            return False, f"subtask_count_out_of_range:{len(subtasks)}"
+
+        for t in subtasks:
+            if len(set(t.knowledge_domains or [])) < policy.min_agents_per_node:
+                return False, f"insufficient_domains:{t.id}"
+
+        parallel_groups = sum(1 for level in levels if len(level) >= 2)
+        indegrees = {t.id: len([d for d in t.dependencies if d in by_id]) for t in subtasks}
+        converge_nodes = sum(1 for v in indegrees.values() if v >= 2)
+
+        if parallel_groups < 2:
+            return False, f"parallel_groups_insufficient:{parallel_groups}"
+        if converge_nodes < 1:
+            return False, "missing_converge_node"
+        if _is_pure_linear(subtasks):
+            return False, "pure_linear_dag"
+
+    return True, ""
+
+
+def _normalize_domains(subtasks: list[SubTask], min_agents: int) -> list[SubTask]:
+    extras = [
+        "code_quality", "architecture", "testing", "documentation",
+        "performance", "security", "maintainability", "reliability",
+    ]
+    updated: list[SubTask] = []
+    for t in subtasks:
+        domains = list(dict.fromkeys(t.knowledge_domains or [t.agent_type]))
+        for extra in extras:
+            if len(domains) >= min_agents:
+                break
+            if extra not in domains:
+                domains.append(extra)
+        updated.append(t.model_copy(update={"knowledge_domains": domains}))
+    return updated
+
+
+def _normalize_dependencies_for_complex_graph(subtasks: list[SubTask]) -> list[SubTask]:
+    if len(subtasks) < 6:
+        return subtasks
+
+    ordered = sorted(subtasks, key=lambda x: (x.priority, x.id))
+    ids = [t.id for t in ordered]
+    template: dict[str, list[str]] = {
+        ids[0]: [],
+        ids[1]: [],
+        ids[2]: [ids[0], ids[1]],
+        ids[3]: [ids[2]],
+        ids[4]: [ids[2]],
+        ids[5]: [ids[3], ids[4]],
+    }
+
+    for i in range(6, len(ids)):
+        prev_id = ids[i - 1]
+        anchor_id = ids[2]
+        deps = [prev_id]
+        if anchor_id != prev_id:
+            deps.append(anchor_id)
+        template[ids[i]] = deps
+
+    return [t.model_copy(update={"dependencies": template.get(t.id, t.dependencies)}) for t in ordered]
+
+
 async def planner_node(state: GraphState) -> dict:
     """
     分解用户任务为子任务 DAG
@@ -54,6 +219,7 @@ async def planner_node(state: GraphState) -> dict:
 
     budget = state.get("time_budget")
     user_task = state["user_task"]
+    policy = _resolve_policy(state)
 
     # 构建时间预算信息
     time_budget_info = None
@@ -63,41 +229,60 @@ async def planner_node(state: GraphState) -> dict:
             "remaining_minutes": budget.remaining_minutes,
         }
 
-    # 直接调用 planner subagent（最多等 120s，超时则使用降级子任务）
+    planner_task = user_task + _policy_prompt(policy)
+
+    # 直接调用 planner subagent（最多等 120s）
     try:
         call_result = await asyncio.wait_for(
-            caller.call_planner(task=user_task, time_budget=time_budget_info),
+            caller.call_planner(task=planner_task, time_budget=time_budget_info),
             timeout=120.0,
         )
     except asyncio.TimeoutError:
         import logging as _logging
-        _logging.getLogger(__name__).warning("[planner] SDK call timed out (120s), using fallback subtasks")
+        _logging.getLogger(__name__).warning("[planner] SDK call timed out (120s)")
+        if policy.strict_enforcement:
+            raise RuntimeError("[POLICY_VIOLATION] planner_timeout_under_strict_mode")
         call_result = {"success": False, "error": "planner SDK timeout"}
     except Exception as _pe:
         import logging as _logging
-        _logging.getLogger(__name__).warning("[planner] SDK call failed: %s, using fallback subtasks", _pe)
+        _logging.getLogger(__name__).warning("[planner] SDK call failed: %s", _pe)
+        if policy.strict_enforcement:
+            raise RuntimeError(f"[POLICY_VIOLATION] planner_error_under_strict_mode: {_pe}")
         call_result = {"success": False, "error": str(_pe)}
 
-    # 检查执行是否成功（V1 降级：失败时自动使用默认四阶段子任务，不崩溃整图）
-    if not call_result.get("success"):
+    # 非严格模式保留原有降级逻辑
+    if not call_result.get("success") and not policy.strict_enforcement:
         import logging as _logging
         _logging.getLogger(__name__).warning(
             "[planner] subagent 调用失败，启用默认四阶段子任务: %s",
             call_result.get('error')
         )
         call_result = {"success": True, "result": None}
+    elif not call_result.get("success") and policy.strict_enforcement:
+        raise RuntimeError(f"[POLICY_VIOLATION] planner_call_failed: {call_result.get('error', 'unknown')}")
 
     # 解析子任务
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
 
-    # 如果 subagent 未返回有效结果，生成 6 个子任务（菱形依赖 + 修复闭环）
-    # 预算: 6 任务 × ~5 min/任务 = 30 min + 10 min 开销 ≈ 40 min < 90 min poll deadline
+    # 严格模式下，先规范化一次
+    if subtasks:
+        subtasks = _normalize_domains(subtasks, max(1, policy.min_agents_per_node))
+        ok, reason = _validate_subtasks(subtasks, policy)
+        if not ok and (policy.force_complex_graph or policy.strict_enforcement):
+            subtasks = _normalize_dependencies_for_complex_graph(subtasks)
+            subtasks = _normalize_domains(subtasks, max(1, policy.min_agents_per_node))
+            ok, reason = _validate_subtasks(subtasks, policy)
+            if not ok and policy.strict_enforcement:
+                raise RuntimeError(f"[POLICY_VIOLATION] planner_output_invalid: {reason}")
+
+    # 如果 subagent 未返回有效结果，生成 7 个子任务（并行+汇聚+报告）
+    # 预算: 7 任务 × ~5 min/任务 = 35 min + 10 min 开销 ≈ 45 min < 90 min poll deadline
     if not subtasks:
         base_mins = budget.total_minutes if budget else 60
         task_preview = user_task[:200]
         t_diag = max(7.0, base_mins * 0.10)   # 诊断类任务
-        t_fix  = max(8.0, base_mins * 0.12)   # 修复类任务
-        t_rpt  = max(4.0, base_mins * 0.08)   # 报告类任务
+        t_fix = max(8.0, base_mins * 0.12)   # 修复类任务
+        t_rpt = max(4.0, base_mins * 0.08)   # 报告类任务
         subtasks = [
             # ── Phase 1: 并行诊断（菱形展开） ──
             SubTask(
@@ -136,7 +321,7 @@ async def planner_node(state: GraphState) -> dict:
                 knowledge_domains=["root_cause_analysis", "planning", "risk_assessment", "architecture"],
                 completion_criteria=["问题按 P0/P1/P2 分级", "每个问题有具体修复方案", "修复风险评估完成"],
             ),
-            # ── Phase 3: 修复实施（交叉依赖） ──
+            # ── Phase 3: 修复实施（并行分支） ──
             SubTask(
                 id="task-004",
                 title="P0/P1 缺陷修复实施",
@@ -148,13 +333,24 @@ async def planner_node(state: GraphState) -> dict:
                 knowledge_domains=["python", "debugging", "testing", "api_design"],
                 completion_criteria=["P0 缺陷全部修复", "P1 主要缺陷修复", "修复代码有测试覆盖"],
             ),
-            # ── Phase 4: 验证闭环 ──
             SubTask(
                 id="task-005",
+                title="并行修复分支：稳定性与性能",
+                description="基于 task-003 的问题清单并行修复稳定性与性能相关问题，形成与 task-004 并行分支。",
+                agent_type="coder",
+                dependencies=["task-003"],
+                priority=3,
+                estimated_minutes=t_fix,
+                knowledge_domains=["performance", "stability", "profiling", "python"],
+                completion_criteria=["关键性能问题已修复", "稳定性缺陷已修复", "修复内容可验证"],
+            ),
+            # ── Phase 4: 验证闭环 ──
+            SubTask(
+                id="task-006",
                 title="回归验证与集成测试",
-                description="对 task-004 的修复项进行全面回归：重跑 Phase1 诊断项，确认修复生效且无新回归。",
+                description="对 task-004 / task-005 的修复项进行全面回归：重跑 Phase1 诊断项，确认修复生效且无新回归。",
                 agent_type="analyst",
-                dependencies=["task-004"],
+                dependencies=["task-004", "task-005"],
                 priority=4,
                 estimated_minutes=t_diag,
                 knowledge_domains=["testing", "regression", "validation", "quality_assurance"],
@@ -162,17 +358,22 @@ async def planner_node(state: GraphState) -> dict:
             ),
             # ── Phase 5: 报告 ──
             SubTask(
-                id="task-006",
+                id="task-007",
                 title="修复前后对比报告",
                 description="生成结构化报告：诊断发现→修复方案→验证结果。保存到 reports/ 。",
                 agent_type="writer",
-                dependencies=["task-005"],
+                dependencies=["task-006"],
                 priority=5,
                 estimated_minutes=t_rpt,
                 knowledge_domains=["documentation", "reporting", "analysis", "architecture"],
                 completion_criteria=["包含修复前后对比数据", "报告已保存到 reports/", "包含后续建议"],
             ),
         ]
+
+    # 最终校验：严格模式不允许静默降级
+    ok, reason = _validate_subtasks(subtasks, policy)
+    if not ok and policy.strict_enforcement:
+        raise RuntimeError(f"[POLICY_VIOLATION] planner_final_validation_failed: {reason}")
 
     return {
         "subtasks": subtasks,
@@ -182,6 +383,8 @@ async def planner_node(state: GraphState) -> dict:
             "timestamp": datetime.now().isoformat(),
             "subtask_count": len(subtasks),
             "subagent_called": "planner",
+            "policy_strict": policy.strict_enforcement,
+            "policy_force_complex_graph": policy.force_complex_graph,
         }],
     }
 

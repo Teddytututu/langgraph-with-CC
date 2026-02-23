@@ -4,7 +4,7 @@ import operator
 import uuid
 from typing import Annotated, Literal, Any
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing_extensions import TypedDict
 
 
@@ -106,11 +106,31 @@ class TimeBudget(BaseModel):
     is_overtime: bool = False
 
 
+class ExecutionPolicy(BaseModel):
+    """执行约束策略（用于 marathon 严格模式）"""
+    force_complex_graph: bool = False
+    min_agents_per_node: int = 1
+    min_discussion_rounds: int = 1
+    strict_enforcement: bool = False
+
+    @model_validator(mode="after")
+    def validate_strict_requirements(self):
+        if self.strict_enforcement:
+            if not self.force_complex_graph:
+                raise ValueError("strict_enforcement=true requires force_complex_graph=true")
+            if self.min_agents_per_node < 3:
+                raise ValueError("strict_enforcement=true requires min_agents_per_node>=3")
+            if self.min_discussion_rounds < 10:
+                raise ValueError("strict_enforcement=true requires min_discussion_rounds>=10")
+        return self
+
+
 class GraphState(TypedDict, total=False):
     """LangGraph StateGraph 的核心状态（TypedDict 兼容 LangGraph 1.0）"""
     # 用户输入
     user_task: str
     time_budget: TimeBudget | None
+    execution_policy: ExecutionPolicy | None
 
     # 任务分解
     subtasks: list[SubTask]

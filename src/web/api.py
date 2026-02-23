@@ -8,6 +8,7 @@ import re
 import traceback
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 # 防止后台 Task 被 GC 回收 —— asyncio 不持有强引用
 _background_tasks: set[asyncio.Task] = set()
@@ -28,9 +29,9 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from src.graph.state import GraphState, SubTask, TimeBudget
+from src.graph.state import GraphState, SubTask, TimeBudget, ExecutionPolicy
 from src.graph.builder import build_graph
 from src.graph.dynamic_builder import DynamicGraphBuilder
 from src.discussion.manager import DiscussionManager, discussion_manager
@@ -40,10 +41,30 @@ from scripts import init_project
 
 # ── 请求体模型（必须在模块层定义，FastAPI 才能正确解析 body） ──
 
+class ExecutionPolicyPayload(BaseModel):
+    """执行约束策略请求体"""
+    force_complex_graph: bool = False
+    min_agents_per_node: int = 1
+    min_discussion_rounds: int = 1
+    strict_enforcement: bool = False
+
+    @model_validator(mode="after")
+    def validate_strict_policy(self):
+        if self.strict_enforcement:
+            if not self.force_complex_graph:
+                raise ValueError("strict_enforcement=true requires force_complex_graph=true")
+            if self.min_agents_per_node < 3:
+                raise ValueError("strict_enforcement=true requires min_agents_per_node>=3")
+            if self.min_discussion_rounds < 10:
+                raise ValueError("strict_enforcement=true requires min_discussion_rounds>=10")
+        return self
+
+
 class TaskCreate(BaseModel):
     """创建任务请求"""
     task: str
     time_minutes: Optional[float] = None
+    execution_policy: Optional[ExecutionPolicyPayload] = None
 
 
 class MessagePost(BaseModel):
@@ -108,6 +129,8 @@ class AppState:
         self.start_lock = asyncio.Lock()
         self.post_init_lock = asyncio.Lock()
         self.post_init_done_task_ids: set[str] = set()
+        self.state_lock = asyncio.Lock()
+        self.state_rev: int = 0
         self._dirty: bool = False  # 标记是否有未保存的变更
 
     def append_terminal_log(self, entry: dict):
@@ -119,6 +142,83 @@ class AppState:
     def mark_dirty(self):
         self._dirty = True
 
+    def _bump_state_rev_unlocked(self):
+        self.state_rev += 1
+
+    def _snapshot_state_unlocked(self) -> dict[str, Any]:
+        return {
+            "status": self.system_status,
+            "current_node": self.current_node,
+            "current_task_id": self.current_task_id,
+            "tasks_count": len(self.tasks),
+            "running_tasks": len([t for t in self.tasks.values() if t.get("status") == "running"]),
+            "state_rev": self.state_rev,
+        }
+
+    def _set_task_and_system_state_unlocked(
+        self,
+        task_id: str,
+        *,
+        task_status: Any = _UNSET,
+        system_status: Any = _UNSET,
+        current_node: Any = _UNSET,
+        current_task_id: Any = _UNSET,
+        error: Any = _UNSET,
+        finished_at: Any = _UNSET,
+        result: Any = _UNSET,
+    ) -> dict:
+        task = self.tasks.get(task_id)
+        if not task:
+            return {}
+
+        changed = False
+
+        def set_if_diff(container: dict, key: str, value: Any):
+            nonlocal changed
+            if container.get(key) != value:
+                container[key] = value
+                changed = True
+
+        if task_status is not _UNSET:
+            set_if_diff(task, "status", task_status)
+        if error is not _UNSET:
+            if error is None:
+                if "error" in task:
+                    task.pop("error", None)
+                    changed = True
+            else:
+                set_if_diff(task, "error", error)
+        if finished_at is not _UNSET:
+            if finished_at is None:
+                if "finished_at" in task:
+                    task.pop("finished_at", None)
+                    changed = True
+            else:
+                set_if_diff(task, "finished_at", finished_at)
+        if result is not _UNSET:
+            if result is None:
+                if "result" in task:
+                    task.pop("result", None)
+                    changed = True
+            else:
+                set_if_diff(task, "result", result)
+
+        if system_status is not _UNSET and self.system_status != system_status:
+            self.system_status = system_status
+            changed = True
+        if current_node is not _UNSET and self.current_node != current_node:
+            self.current_node = current_node
+            changed = True
+        if current_task_id is not _UNSET and self.current_task_id != current_task_id:
+            self.current_task_id = current_task_id
+            changed = True
+
+        if changed:
+            self._bump_state_rev_unlocked()
+            self.mark_dirty()
+
+        return self._snapshot_state_unlocked()
+
     def save_to_disk(self):
         """把核心状态序列化到磁盘"""
         try:
@@ -128,6 +228,7 @@ class AppState:
                 "current_node": self.current_node,
                 "current_task_id": self.current_task_id,
                 "terminal_log": self.terminal_log[-300:],
+                "state_rev": self.state_rev,
             }
             _STATE_FILE.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
@@ -145,6 +246,7 @@ class AppState:
             data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
             self.tasks = data.get("tasks", {})
             self.system_status = data.get("system_status", "idle")
+            self.state_rev = int(data.get("state_rev", 0) or 0)
             # 重启后正在运行中的任务实际已停止，标为 failed
             for t in self.tasks.values():
                 if t.get("status") == "running":
@@ -233,43 +335,91 @@ def register_routes(app: FastAPI):
 
     async def _start_task_internal(task_id: str, *, force: bool = False, source: str = "manual") -> dict:
         """统一任务启动入口（带互斥）。"""
-        if task_id not in app_state.tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
-
         async with app_state.start_lock:
-            task = app_state.tasks[task_id]
-            if task.get("status") == "running":
-                if task_id not in app_state.running_task_handles:
-                    handle = _fire(run_task(task_id))
-                    app_state.running_task_handles[task_id] = handle
-                return {"status": "running", "task_id": task_id, "source": source}
+            async with app_state.state_lock:
+                task = app_state.tasks.get(task_id)
+                if task is None:
+                    raise HTTPException(status_code=404, detail="Task not found")
 
-            active_task_id = app_state.current_task_id
-            active_task = app_state.tasks.get(active_task_id) if active_task_id else None
-            if app_state.system_status == "running" and active_task and active_task.get("status") == "running":
-                if not force:
-                    raise HTTPException(status_code=409, detail=f"Task already running: {active_task_id}")
-                if active_task_id != task_id:
+                current_status = task.get("status")
+                if current_status == "running":
+                    if task_id not in app_state.running_task_handles:
+                        handle = _fire(run_task(task_id))
+                        app_state.running_task_handles[task_id] = handle
+                    return {
+                        "status": "running",
+                        "task_id": task_id,
+                        "source": source,
+                        "state": app_state._snapshot_state_unlocked(),
+                        "task": task,
+                    }
+
+                if current_status in TERMINAL_STATUSES:
+                    return {
+                        "status": current_status,
+                        "task_id": task_id,
+                        "source": source,
+                        "state": app_state._snapshot_state_unlocked(),
+                        "task": task,
+                    }
+
+                active_task_id = app_state.current_task_id
+                active_task = app_state.tasks.get(active_task_id) if active_task_id else None
+                if (
+                    app_state.system_status == "running"
+                    and active_task
+                    and active_task.get("status") == "running"
+                    and active_task_id != task_id
+                ):
+                    if not force:
+                        task["status"] = "queued"
+                        app_state._bump_state_rev_unlocked()
+                        app_state.mark_dirty()
+                        return {
+                            "status": "queued",
+                            "task_id": task_id,
+                            "source": source,
+                            "state": app_state._snapshot_state_unlocked(),
+                            "task": task,
+                        }
                     raise HTTPException(status_code=409, detail=f"Task already running: {active_task_id}")
 
-            task["status"] = "running"
-            task.pop("error", None)
-            app_state.system_status = "running"
-            app_state.current_task_id = task_id
-            app_state.current_node = ""
-            app_state.mark_dirty()
+                task["status"] = "running"
+                task.pop("error", None)
+                task.pop("finished_at", None)
+                snapshot = app_state._set_task_and_system_state_unlocked(
+                    task_id,
+                    task_status="running",
+                    system_status="running",
+                    current_task_id=task_id,
+                    current_node="",
+                    error=None,
+                    finished_at=None,
+                )
 
             await app_state.broadcast("system_status_changed", {
-                "status": "running",
+                **snapshot,
                 "task_id": task_id,
                 "task": task.get("task", ""),
                 "source": source,
+                "ts": datetime.now().isoformat(),
             })
-            await app_state.broadcast("task_started", {"id": task_id, "source": source})
+            await app_state.broadcast("task_started", {
+                "id": task_id,
+                "source": source,
+                "state_rev": snapshot.get("state_rev"),
+                "ts": datetime.now().isoformat(),
+            })
 
             handle = _fire(run_task(task_id))
             app_state.running_task_handles[task_id] = handle
-            return {"status": "running", "task_id": task_id, "source": source}
+            return {
+                "status": "running",
+                "task_id": task_id,
+                "source": source,
+                "state": snapshot,
+                "task": task,
+            }
 
     # ── 页面路由 ──
 
@@ -297,78 +447,110 @@ def register_routes(app: FastAPI):
                     except Exception:
                         pass
 
+        policy_data = req.execution_policy.model_dump() if req.execution_policy else None
+
         task_data = {
             "id": task_id,
             "task": req.task,
             "time_minutes": req.time_minutes,
+            "execution_policy": policy_data,
             "status": "created",
             "created_at": datetime.now().isoformat(),
             "subtasks": [],
             "discussions": {},
         }
 
-        app_state.tasks[task_id] = task_data
-        app_state.mark_dirty()
+        async with app_state.state_lock:
+            app_state.tasks[task_id] = task_data
+            app_state._bump_state_rev_unlocked()
+            app_state.mark_dirty()
+            create_snapshot = app_state._snapshot_state_unlocked()
+            created_payload = {**task_data, "state_rev": create_snapshot["state_rev"]}
 
-        await app_state.broadcast("task_created", task_data)
+        await app_state.broadcast("task_created", created_payload)
 
-        # 自动启动：创建后立即触发执行（若系统忙则保持 queued，避免并发双启动）
+        # 自动启动：创建后立即触发执行（若系统忙则进入 queued）
         async def _auto_start():
-            # 最多等待 30 秒；超时后保持 created，等待手动/后续触发
-            waited = 0
-            while app_state.system_status == "running" and waited < 30:
-                await asyncio.sleep(1)
-                waited += 1
+            async with app_state.state_lock:
+                task = app_state.tasks.get(task_id)
+                if not task:
+                    return
+                if task.get("status") != "created":
+                    return
+                active_task_id = app_state.current_task_id
+                active_task = app_state.tasks.get(active_task_id) if active_task_id else None
+                if (
+                    app_state.system_status == "running"
+                    and active_task
+                    and active_task.get("status") == "running"
+                ):
+                    task["status"] = "queued"
+                    app_state._bump_state_rev_unlocked()
+                    app_state.mark_dirty()
+                    deferred_payload = {
+                        "id": task_id,
+                        "reason": "system_busy",
+                        "state_rev": app_state.state_rev,
+                        "ts": datetime.now().isoformat(),
+                    }
+                else:
+                    deferred_payload = None
 
-            if app_state.system_status == "running":
-                task_data["status"] = "queued"
+            if deferred_payload:
+                await app_state.broadcast("task_start_deferred", deferred_payload)
+                return
+
+            result = await _start_task_internal(task_id, source="auto")
+            if result.get("status") == "queued":
                 await app_state.broadcast("task_start_deferred", {
                     "id": task_id,
                     "reason": "system_busy",
-                    "waited_seconds": waited,
+                    "state_rev": result.get("state", {}).get("state_rev"),
+                    "ts": datetime.now().isoformat(),
                 })
-                app_state.mark_dirty()
-                return
-
-            try:
-                await _start_task_internal(task_id, source="auto")
-            except HTTPException as exc:
-                if exc.status_code == 409:
-                    await app_state.broadcast("task_start_deferred", {
-                        "id": task_id,
-                        "reason": "start_conflict",
-                    })
-                    app_state.mark_dirty()
-                    return
-                raise
 
         _fire(_auto_start())
 
-        return {"id": task_id, "status": "created"}
+        return {
+            "id": task_id,
+            "status": "created",
+            "state_rev": create_snapshot["state_rev"],
+        }
 
     @app.get("/api/tasks")
     async def list_tasks():
         """获取任务列表"""
-        return {
-            "tasks": list(app_state.tasks.values()),
-            "count": len(app_state.tasks),
-        }
+        async with app_state.state_lock:
+            return {
+                "tasks": list(app_state.tasks.values()),
+                "count": len(app_state.tasks),
+                "state_rev": app_state.state_rev,
+            }
 
     @app.delete("/api/tasks")
     async def clear_all_tasks(force: bool = False):
         """清空所有任务及子任务，重置系统状态。force=true 时强制清空（用于服务器重启后清除僵尸任务）"""
-        running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
-        if running and not force:
-            raise HTTPException(status_code=409, detail="任务正在运行，无法清空")
-        app_state.tasks.clear()
-        app_state.current_task_id = None
-        app_state.current_node = ""
-        app_state.system_status = "idle"
-        app_state.terminal_log.clear()
-        app_state.intervention_queues.clear()
-        app_state.mark_dirty()
-        await app_state.broadcast("tasks_cleared", {})
-        return {"status": "cleared"}
+        async with app_state.state_lock:
+            running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
+            if running and not force:
+                raise HTTPException(status_code=409, detail="任务正在运行，无法清空")
+            app_state.tasks.clear()
+            app_state.current_task_id = None
+            app_state.current_node = ""
+            app_state.system_status = "idle"
+            app_state.terminal_log.clear()
+            app_state.intervention_queues.clear()
+            app_state._bump_state_rev_unlocked()
+            app_state.mark_dirty()
+            snapshot = app_state._snapshot_state_unlocked()
+
+        await app_state.broadcast("tasks_cleared", {"state_rev": snapshot["state_rev"]})
+        await app_state.broadcast("system_status_changed", {
+            **snapshot,
+            "source": "tasks_cleared",
+            "ts": datetime.now().isoformat(),
+        })
+        return {"status": "cleared", "state_rev": snapshot["state_rev"]}
 
     @app.get("/api/tasks/{task_id}")
     async def get_task(task_id: str):
@@ -401,40 +583,49 @@ def register_routes(app: FastAPI):
     @app.delete("/api/tasks/{task_id}")
     async def cancel_task(task_id: str):
         """取消/停止指定任务"""
-        if task_id not in app_state.tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
+        async with app_state.state_lock:
+            task = app_state.tasks.get(task_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail="Task not found")
 
-        task = app_state.tasks[task_id]
-        old_status = task.get("status")
+            old_status = task.get("status")
+            if old_status != "running":
+                return {"status": task.get("status", "cancelled"), "task_id": task_id}
 
-        if old_status == "running":
-            task["status"] = "cancelled"
-            task["error"] = "用户取消"
-            task["finished_at"] = datetime.now().isoformat()
-            app_state.mark_dirty()
+            now_iso = datetime.now().isoformat()
+            snapshot = app_state._set_task_and_system_state_unlocked(
+                task_id,
+                task_status="cancelled",
+                error="用户取消",
+                finished_at=now_iso,
+                system_status="idle",
+                current_node="",
+                current_task_id=None,
+            )
 
-            # 主动 cancel 后台执行 task，形成真正中断
             running_handle = app_state.running_task_handles.pop(task_id, None)
-            if running_handle and not running_handle.done():
-                running_handle.cancel()
 
-            # 如果这是当前任务，重置系统状态
-            if app_state.current_task_id == task_id:
-                app_state.system_status = "idle"
-                app_state.current_node = ""
-                app_state.current_task_id = None
+        if running_handle and not running_handle.done():
+            running_handle.cancel()
 
-            await app_state.broadcast("task_cancelled", {
-                "id": task_id,
-                "previous_status": old_status,
-            })
+        await app_state.broadcast("task_cancelled", {
+            "id": task_id,
+            "previous_status": old_status,
+            "state_rev": snapshot.get("state_rev"),
+            "ts": datetime.now().isoformat(),
+        })
+        await app_state.broadcast("system_status_changed", {
+            **snapshot,
+            "task_id": task_id,
+            "source": "cancel_task",
+            "ts": datetime.now().isoformat(),
+        })
 
-            # 检查是否还有其他运行中的任务
-            still_running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
-            if not still_running:
-                app_state.system_status = "idle"
-
-        return {"status": "cancelled", "task_id": task_id}
+        return {
+            "status": "cancelled",
+            "task_id": task_id,
+            "state_rev": snapshot.get("state_rev"),
+        }
 
     @app.post("/api/tasks/{task_id}/intervene")
     async def intervene_task(task_id: str, req: TaskIntervene):
@@ -464,7 +655,17 @@ def register_routes(app: FastAPI):
             "task_id": task_id,
             "instruction": req.instruction,
             "timestamp": entry["timestamp"],
+            "echoed_to_terminal": True,
         })
+
+        terminal_entry = {
+            "task_id": task_id,
+            "line": f"[USER] $ {req.instruction}",
+            "level": "input",
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        }
+        app_state.append_terminal_log(terminal_entry)
+        await app_state.broadcast("terminal_output", terminal_entry)
 
         return {"status": "queued", "timestamp": entry["timestamp"]}
 
@@ -683,28 +884,35 @@ def register_routes(app: FastAPI):
                 return
 
             app_state.post_init_done_task_ids.add(task_id)
-            app_state.tasks.clear()
-            app_state.intervention_queues.clear()
-            app_state.current_task_id = None
-            app_state.current_node = ""
-            app_state.system_status = "idle"
-            app_state.terminal_log.clear()
-            app_state.mark_dirty()
-            app_state.save_to_disk()
+            async with app_state.state_lock:
+                app_state.tasks.clear()
+                app_state.intervention_queues.clear()
+                app_state.current_task_id = None
+                app_state.current_node = ""
+                app_state.system_status = "idle"
+                app_state.terminal_log.clear()
+                app_state._bump_state_rev_unlocked()
+                app_state.mark_dirty()
+                app_state.save_to_disk()
+                snapshot = app_state._snapshot_state_unlocked()
 
             await app_state.broadcast("post_init_completed", {
                 "task_id": task_id,
                 "summary": init_summary,
+                "state_rev": snapshot["state_rev"],
             })
             await app_state.broadcast("system_status_changed", {
-                "status": "idle",
+                **snapshot,
                 "task_id": task_id,
                 "source": "auto_init",
+                "ts": datetime.now().isoformat(),
             })
 
     async def run_task(task_id: str):
         """执行任务（后台）"""
         task = app_state.tasks[task_id]
+        oscillation_window: list[tuple[str, str, str, tuple]] = []
+        oscillation_warned = False
 
         def is_cancelled() -> bool:
             current = app_state.tasks.get(task_id)
@@ -729,9 +937,15 @@ def register_routes(app: FastAPI):
                 await emit("⊘ 任务已取消，停止执行", "warn")
                 return
 
+            execution_policy = None
+            raw_policy = task.get("execution_policy")
+            if isinstance(raw_policy, dict):
+                execution_policy = ExecutionPolicy.model_validate(raw_policy)
+
             initial_state: GraphState = {
                 "user_task": task["task"],
                 "time_budget": TimeBudget(total_minutes=task["time_minutes"], started_at=datetime.now()) if task["time_minutes"] else None,
+                "execution_policy": execution_policy,
                 "subtasks": [],
                 "discussions": {},
                 "messages": [],
@@ -755,18 +969,55 @@ def register_routes(app: FastAPI):
                     if is_cancelled():
                         await emit("⊘ 节点处理前检测到取消信号", "warn")
                         break
-                    # 更新当前节点
-                    app_state.current_node = node_name
-                    # budget_manager 完成后，executor 即将开始 —— 提前标记
-                    if node_name == "budget_manager":
-                        app_state.current_node = "executor"
-                    # 广播时使用最终 node（已经过覆盖），让前端不显示 budget_manager
-                    task["current_node"] = app_state.current_node
+                    # 更新当前节点（与 state_rev 原子前进）
+                    async with app_state.state_lock:
+                        final_node = "executor" if node_name == "budget_manager" else node_name
+                        app_state.current_node = final_node
+                        task["current_node"] = final_node
+                        app_state._bump_state_rev_unlocked()
+                        app_state.mark_dirty()
+                        snapshot = app_state._snapshot_state_unlocked()
+
                     await app_state.broadcast("node_changed", {
                         "task_id": task_id,
-                        "node": app_state.current_node,
+                        "node": final_node,
+                        "state_rev": snapshot["state_rev"],
+                        "ts": datetime.now().isoformat(),
                     })
                     await emit(f"\u25b6 [{node_name.upper()}] phase={state_update.get('phase','')}", "node")
+
+                    # 轻量震荡检测：phase 交替且子任务摘要长期不变（仅告警，不拦截）
+                    phase = state_update.get("phase", "")
+                    current_cid = state_update.get("current_subtask_id") or ""
+                    subtask_digest = tuple(
+                        sorted(
+                            (
+                                t.id,
+                                t.status,
+                                tuple(getattr(t, "dependencies", []) or []),
+                            )
+                            for t in state_update.get("subtasks", [])
+                        )
+                    )
+                    oscillation_window.append((node_name, phase, current_cid, subtask_digest))
+                    if len(oscillation_window) > 8:
+                        oscillation_window.pop(0)
+
+                    if len(oscillation_window) == 8 and not oscillation_warned:
+                        phases = [item[1] for item in oscillation_window]
+                        digests = [item[3] for item in oscillation_window]
+                        unique_pairs = {(phases[i], phases[i + 1]) for i in range(len(phases) - 1)}
+                        alternating = len(set(phases[-6:])) <= 2 and len(unique_pairs) <= 2
+                        digest_stalled = len(set(digests[-6:])) == 1
+                        if alternating and digest_stalled:
+                            oscillation_warned = True
+                            await emit(
+                                (
+                                    f"⚠ 震荡告警: node/phase 在 {list(dict.fromkeys(phases[-6:]))} 间反复切换，"
+                                    f"current={current_cid or '-'}，subtask_digest 长时间无变化"
+                                ),
+                                "warn",
+                            )
 
                     # 解析 execution_log 中的事件
                     for log_entry in state_update.get("execution_log", []):
@@ -984,18 +1235,41 @@ def register_routes(app: FastAPI):
             """Mermaid 节点 ID 不能含连字符/空格，task-001 → task001"""
             return raw.replace("-", "").replace("_", "").replace(" ", "")
 
-        status_icon = {"running": "⟳", "done": "✓", "failed": "✗",
-                       "pending": "○", "skipped": "—"}
         status_fill = {
             "running": "fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2px",
-            "done":    "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px",
-            "failed":  "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px",
+            "done": "fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px",
+            "failed": "fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px",
             "pending": "fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px",
             "skipped": "fill:#1f1f27,color:#71717a,stroke:#3f3f46,stroke-width:1px",
+            "blocked": "fill:#1f2937,color:#93c5fd,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray:4 3",
         }
+        status_class = {
+            "running": "running",
+            "done": "done",
+            "completed": "done",
+            "failed": "failed",
+            "pending": "pending",
+            "skipped": "skipped",
+            "blocked": "blocked",
+        }
+
+        subtask_ids = {st.get("id") for st in subtasks if st.get("id")}
+        done_ids = {st.get("id") for st in subtasks if st.get("status") in ("done", "skipped")}
+        indegree = {st.get("id"): 0 for st in subtasks if st.get("id")}
+
+        for st in subtasks:
+            deps = st.get("dependencies") or []
+            sid = st.get("id")
+            if not sid:
+                continue
+            for dep_id in deps:
+                if dep_id in subtask_ids:
+                    indegree[sid] = indegree.get(sid, 0) + 1
 
         lines = ["graph LR"]
         deferred_styles = []
+        class_assignments: dict[str, str] = {}
+        edge_styles: list[str] = []
 
         # ── 顶部标题节点 ──────────────────────────────────────────────────────
         task_status = (task or {}).get("status", "")
@@ -1026,23 +1300,75 @@ def register_routes(app: FastAPI):
 
         # ── 子任务节点 ────────────────────────────────────────────────────────
         for st in subtasks:
-            sid = safe_id(st["id"])
-            icon = status_icon.get(st.get("status", "pending"), "○")
-            title = st["title"].replace('"', "'")[:24]
-            lines.append(f'    {sid}(["{icon} {title}"])')
-            fill = status_fill.get(st.get("status", "pending"), status_fill["pending"])
-            deferred_styles.append(f"    style {sid} {fill}")
+            raw_id = st.get("id")
+            if not raw_id:
+                continue
+            sid = safe_id(raw_id)
+            title = (st.get("title") or raw_id).replace('"', "'")[:24]
 
-        # ── 边：header → 根节点，依赖节点间连线 ──────────────────────────────
-        dep_ids = {dep for st in subtasks for dep in (st.get("dependencies") or [])}
-        roots = [st for st in subtasks if st["id"] not in dep_ids]
+            deps = st.get("dependencies") or []
+            is_blocked = bool(
+                st.get("status") == "pending" and deps and not all(dep in done_ids for dep in deps)
+            )
+            visual_status = "blocked" if is_blocked else (st.get("status") or "pending")
+
+            icon = {
+                "running": "⟳",
+                "done": "✓",
+                "completed": "✓",
+                "failed": "✗",
+                "pending": "○",
+                "skipped": "—",
+                "blocked": "⏸",
+            }.get(visual_status, "○")
+
+            lines.append(f'    {sid}(["{icon} {title}"])')
+            fill = status_fill.get(visual_status, status_fill["pending"])
+            deferred_styles.append(f"    style {sid} {fill}")
+            class_assignments[sid] = status_class.get(visual_status, "pending")
+
+        # ── 边：header → 根节点（入度=0），依赖边方向 dependency --> dependent ─────
+        roots = [st for st in subtasks if st.get("id") and indegree.get(st.get("id"), 0) == 0]
         for st in roots:
             lines.append(f"    {hid} --> {safe_id(st['id'])}")
 
         for st in subtasks:
-            for dep_id in (st.get("dependencies") or []):
-                if any(s["id"] == dep_id for s in subtasks):
-                    lines.append(f"    {safe_id(dep_id)} --> {safe_id(st['id'])}")
+            sid_raw = st.get("id")
+            if not sid_raw:
+                continue
+            sid = safe_id(sid_raw)
+            deps = st.get("dependencies") or []
+            for dep_id in deps:
+                if dep_id not in subtask_ids:
+                    continue
+
+                dep_sid = safe_id(dep_id)
+                lines.append(f"    {dep_sid} -->|depends_on| {sid}")
+
+                dep_task = next((x for x in subtasks if x.get("id") == dep_id), None)
+                dep_status = (dep_task or {}).get("status")
+                if dep_status == "running":
+                    edge_styles.append("stroke:#a855f7,stroke-width:2.2px")
+                elif dep_status not in ("done", "skipped"):
+                    edge_styles.append("stroke:#475569,stroke-width:1.6px,stroke-dasharray:4 3")
+                else:
+                    edge_styles.append("stroke:#64748b,stroke-width:1.6px")
+
+        # class 定义（供前端做增量状态渲染）
+        lines.extend([
+            "    classDef pending fill:#27272a,color:#a1a1aa,stroke:#52525b,stroke-width:1.5px;",
+            "    classDef running fill:#4c1d95,color:#e9d5ff,stroke:#a855f7,stroke-width:2px;",
+            "    classDef done fill:#14532d,color:#bbf7d0,stroke:#22c55e,stroke-width:2px;",
+            "    classDef failed fill:#7f1d1d,color:#fca5a5,stroke:#ef4444,stroke-width:2px;",
+            "    classDef skipped fill:#1f1f27,color:#71717a,stroke:#3f3f46,stroke-width:1px;",
+            "    classDef blocked fill:#1f2937,color:#93c5fd,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray:4 3;",
+        ])
+
+        for sid, cls in class_assignments.items():
+            lines.append(f"    class {sid} {cls};")
+
+        for i, style in enumerate(edge_styles):
+            lines.append(f"    linkStyle {i} {style};")
 
         lines.extend(deferred_styles)
         return "\n".join(lines)
@@ -1193,22 +1519,70 @@ def register_routes(app: FastAPI):
                     if message.get("type") == "terminal_input":
                         task_id = message.get("task_id") or app_state.current_task_id
                         cmd = message.get("command", "").strip()
-                        if task_id and cmd and task_id in app_state.tasks:
-                            app_state.intervention_queues.setdefault(task_id, []).append(cmd)
-                            entry = {"content": cmd, "timestamp": datetime.now().isoformat()}
-                            app_state.tasks[task_id].setdefault("interventions", []).append(entry)
-                            app_state.mark_dirty()
-                            await app_state.broadcast("task_intervened", {
+                        if not cmd:
+                            entry = {
                                 "task_id": task_id,
-                                "instruction": cmd,
-                                "timestamp": entry["timestamp"],
-                            })
-                            await app_state.broadcast("terminal_output", {
-                                "task_id": task_id,
-                                "line": f"[USER] $ {cmd}",
-                                "level": "input",
+                                "line": "[SYSTEM] Empty terminal command ignored",
+                                "level": "warn",
                                 "ts": datetime.now().strftime("%H:%M:%S"),
-                            })
+                            }
+                            app_state.append_terminal_log(entry)
+                            await app_state.broadcast("terminal_output", entry)
+                            continue
+
+                        if not task_id:
+                            entry = {
+                                "task_id": "",
+                                "line": "[SYSTEM] No active task context, command rejected",
+                                "level": "warn",
+                                "ts": datetime.now().strftime("%H:%M:%S"),
+                            }
+                            app_state.append_terminal_log(entry)
+                            await app_state.broadcast("terminal_output", entry)
+                            continue
+
+                        task = app_state.tasks.get(task_id)
+                        if not task:
+                            entry = {
+                                "task_id": task_id,
+                                "line": f"[SYSTEM] Task {task_id} not found, command rejected",
+                                "level": "error",
+                                "ts": datetime.now().strftime("%H:%M:%S"),
+                            }
+                            app_state.append_terminal_log(entry)
+                            await app_state.broadcast("terminal_output", entry)
+                            continue
+
+                        if task.get("status") != "running":
+                            entry = {
+                                "task_id": task_id,
+                                "line": f"[SYSTEM] Task {task_id} status={task.get('status')} (not running), command queued denied",
+                                "level": "warn",
+                                "ts": datetime.now().strftime("%H:%M:%S"),
+                            }
+                            app_state.append_terminal_log(entry)
+                            await app_state.broadcast("terminal_output", entry)
+                            continue
+
+                        app_state.intervention_queues.setdefault(task_id, []).append(cmd)
+                        entry = {"content": cmd, "timestamp": datetime.now().isoformat()}
+                        task.setdefault("interventions", []).append(entry)
+                        app_state.mark_dirty()
+                        await app_state.broadcast("task_intervened", {
+                            "task_id": task_id,
+                            "instruction": cmd,
+                            "timestamp": entry["timestamp"],
+                            "echoed_to_terminal": True,
+                        })
+
+                        terminal_entry = {
+                            "task_id": task_id,
+                            "line": f"[USER] $ {cmd}",
+                            "level": "input",
+                            "ts": datetime.now().strftime("%H:%M:%S"),
+                        }
+                        app_state.append_terminal_log(terminal_entry)
+                        await app_state.broadcast("terminal_output", terminal_entry)
                 except json.JSONDecodeError:
                     pass
         except WebSocketDisconnect:

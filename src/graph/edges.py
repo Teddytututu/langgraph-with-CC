@@ -33,8 +33,12 @@ def route_after_router(state: GraphState) -> str:
         # 预算管理完成，进入执行
         return "executing"
     if phase == "reviewing":
-        # 审查中，继续到 reviewer
-        return "reviewing"
+        current = _get_current(state)
+        if current is not None:
+            return "reviewing"
+        if _all_terminal(subtasks):
+            return "complete"
+        return "executing"
     if phase == "reflecting":
         # 反思完成，返回执行
         return "executing"
@@ -66,20 +70,54 @@ def route_after_review(state: GraphState) -> str:
     return "revise"
 
 
+def _task_dependencies(task) -> list[str]:
+    deps = getattr(task, "dependencies", None)
+    return [d for d in (deps or []) if d]
+
+
+def _collect_ready_tasks(subtasks: list) -> list:
+    done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
+    ready = [
+        t for t in sorted(subtasks, key=lambda t: t.priority)
+        if t.status == "pending" and all(dep in done_ids for dep in _task_dependencies(t))
+    ]
+    return ready
+
+
 def should_continue_or_timeout(state: GraphState) -> str:
-    """执行后判断：继续 / 审查 / 超时"""
+    """执行后判断：继续 / 审查 / 等待 / 超时"""
     if _check_timeout(state):
         return "timeout"
+
     current = _get_current(state)
-    # 无当前任务（executor 未找到可执行项），进入审查阶段
+    subtasks = state.get("subtasks", [])
+
     if not current:
+        if _all_terminal(subtasks):
+            return "review"
+
+        ready_tasks = _collect_ready_tasks(subtasks)
+        if ready_tasks:
+            return "continue"
+
+        has_pending = any(t.status == "pending" for t in subtasks)
+        if has_pending:
+            # 有未完成任务但当前无 ready：交由 router/reflect 路径处理阻塞态
+            return "wait"
+
         return "review"
+
     if current.status in ("done", "failed"):
         return "review"
+
     return "continue"
 
 
 # ── 工具函数 ──
+def _all_terminal(subtasks: list) -> bool:
+    return bool(subtasks) and all(t.status in ("done", "skipped", "failed") for t in subtasks)
+
+
 def _get_current(state: GraphState):
     subtasks = state.get("subtasks", [])
     cid = state.get("current_subtask_id")

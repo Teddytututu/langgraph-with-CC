@@ -1,6 +1,7 @@
 """src/graph/nodes/router.py — 全局路由节点"""
 from datetime import datetime
 from pathlib import Path
+import json
 from src.graph.state import GraphState
 
 _REPORTS_DIR = Path("reports")
@@ -94,37 +95,68 @@ def _build_final_output(state: GraphState, timeout: bool = False, budget=None) -
             f"/ 预算 {eff_budget.total_minutes:.0f} 分钟"
         )
 
-    # 扫描 reports/ 目录，将所有 .md 文件追加到输出
-    if _REPORTS_DIR.exists():
+    report_sections = []
+    artifacts = dict(state.get("artifacts") or {})
+
+    for t in subtasks:
+        candidate_paths = []
+        for key in (t.id, f"{t.id}:md", f"{t.id}:json"):
+            path = artifacts.get(key)
+            if path and path not in candidate_paths:
+                candidate_paths.append(path)
+
+        for p in candidate_paths:
+            report_path = Path(p)
+            if not report_path.exists() or not report_path.is_file():
+                continue
+
+            suffix = report_path.suffix.lower()
+            try:
+                if suffix == ".md":
+                    content = report_path.read_text(encoding="utf-8", errors="replace")
+                    report_sections.append(f"### {report_path.stem}\n")
+                    report_sections.append(content)
+                    report_sections.append("\n")
+                    break
+                if suffix == ".json":
+                    data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+                    report_sections.append(f"### {report_path.stem}\n")
+                    report_sections.append(f"```json\n{json.dumps(data, ensure_ascii=False, indent=2)}\n```\n")
+                    break
+            except Exception:
+                continue
+
+    # reports 目录兜底扫描：仅在索引为空/失效时启用
+    if _REPORTS_DIR.exists() and not report_sections:
         md_files = sorted(
             _REPORTS_DIR.glob("*.md"),
             key=lambda p: p.stat().st_mtime,
         )
         if md_files:
-            lines.append("\n---\n## 📁 详细分析报告\n")
             for f in md_files:
                 try:
                     content = f.read_text(encoding="utf-8", errors="replace")
-                    lines.append(f"### {f.stem}\n")
-                    lines.append(content)
-                    lines.append("\n")
+                    report_sections.append(f"### {f.stem}\n")
+                    report_sections.append(content)
+                    report_sections.append("\n")
                 except Exception:
                     pass
 
-        # 扫描 JSON 报告
         json_files = sorted(
             _REPORTS_DIR.glob("*.json"),
             key=lambda p: p.stat().st_mtime,
         )
         if json_files:
-            lines.append("\n---\n## 📊 数据文件\n")
-            import json as _json
             for f in json_files:
                 try:
-                    data = _json.loads(f.read_text(encoding="utf-8", errors="replace"))
-                    lines.append(f"### {f.stem}\n")
-                    lines.append(f"```json\n{_json.dumps(data, ensure_ascii=False, indent=2)}\n```\n")
+                    data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+                    report_sections.append(f"### {f.stem}\n")
+                    report_sections.append(f"```json\n{json.dumps(data, ensure_ascii=False, indent=2)}\n```\n")
                 except Exception:
                     pass
+
+    if report_sections:
+        lines.append("\n---\n## 📁 详细分析报告\n")
+        lines.extend(report_sections)
 
     return "\n".join(lines)

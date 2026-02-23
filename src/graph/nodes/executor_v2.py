@@ -28,115 +28,12 @@ def _compute_timeout(task: SubTask) -> float:
     return max(120.0, min(task.estimated_minutes * 120, 1800.0))
 
 
+from src.graph.nodes.executor import executor_node
+
+
 async def executor_v2_node(state: GraphState) -> dict:
-    """
-    集成讨论协作的执行节点
-
-    流程:
-    1. 协调者选择协作模式
-    2. 根据模式执行:
-       - CHAIN: 顺序执行，结果传递
-       - PARALLEL: 并行执行，结果合并
-       - DISCUSSION: 通过 DiscussionManager 协商后执行
-    3. 返回执行结果
-    """
-    caller = get_caller()
-    subtasks = state.get("subtasks", [])
-
-    # 找到依赖已满足的下一个待执行任务
-    next_task = _find_next_task(state)
-    if not next_task:
-        pending = [t for t in subtasks if t.status == "pending"]
-        if pending:
-            updated_subtasks = []
-            done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
-            for t in subtasks:
-                if t.status == "pending" and not all(d in done_ids for d in t.dependencies):
-                    updated_subtasks.append(t.model_copy(update={
-                        "status": "failed",
-                        "result": f"依赖任务失败，无法执行：{t.dependencies}",
-                    }))
-                else:
-                    updated_subtasks.append(t)
-            return {"phase": "reviewing", "current_subtask_id": None, "subtasks": updated_subtasks}
-        return {"phase": "reviewing", "current_subtask_id": None}
-
-    started_at = datetime.now()
-    previous_results = _build_context(state, next_task)
-
-    # 使用协调者选择协作模式
-    mode = _coordinator.choose_collaboration_mode(
-        task=next_task.description,
-        agents=next_task.knowledge_domains or [next_task.agent_type],
-        subtasks=state.get("subtasks", []),
-    )
-
-    timeout = _compute_timeout(next_task)
-
-    # 根据协作模式执行
-    if mode == CollaborationMode.DISCUSSION:
-        call_result = await _execute_with_discussion(
-            caller, next_task, previous_results, timeout
-        )
-    elif mode == CollaborationMode.PARALLEL:
-        call_result = await _execute_parallel_v2(
-            caller, next_task, previous_results, timeout
-        )
-    else:  # CHAIN
-        call_result = await _execute_chain(
-            caller, next_task, previous_results, timeout
-        )
-
-    # 检查执行是否成功
-    if not call_result.get("success"):
-        raise RuntimeError(f"Executor 执行失败: {call_result.get('error')}")
-
-    result_data = call_result.get("result")
-    result_text = str(result_data).strip() if result_data else ""
-    if not result_text:
-        raise RuntimeError(f"Executor 执行失败: 子代理未返回有效结果（task={next_task.id}）")
-
-    result = {
-        "status": "done",
-        "result": result_text,
-        "specialist_id": call_result.get("specialist_id"),
-        "collaboration_mode": mode.value,
-        "finished_at": datetime.now(),
-    }
-
-    # 标记专业 subagent 完成
-    if result.get("specialist_id"):
-        caller.complete_subtask(result["specialist_id"])
-
-    # 更新子任务状态
-    updated_subtasks = []
-    for t in subtasks:
-        if t.id == next_task.id:
-            updated_subtasks.append(t.model_copy(update={
-                "status": result["status"],
-                "result": result["result"],
-                "started_at": started_at,
-                "finished_at": result["finished_at"],
-                "assigned_agents": [result["specialist_id"]] if result.get("specialist_id") else [],
-            }))
-        else:
-            updated_subtasks.append(t)
-
-    return {
-        "subtasks": updated_subtasks,
-        "current_subtask_id": next_task.id,
-        "time_budget": state.get("time_budget"),
-        "phase": "executing",
-        "execution_log": [{
-            "event": "task_executed_v2",
-            "task_id": next_task.id,
-            "agent": next_task.agent_type,
-            "collaboration_mode": mode.value,
-            "specialist_id": result.get("specialist_id"),
-            "status": result["status"],
-            "timestamp": datetime.now().isoformat(),
-        }],
-    }
+    """V2 执行入口：复用严格策略执行器，避免约束被绕过。"""
+    return await executor_node(state)
 
 
 async def _execute_with_discussion(
@@ -434,14 +331,43 @@ async def _fallback_execution(
         raise RuntimeError(f"降级执行超时：任务 {task.id}")
 
 
+def _task_dependencies(task: SubTask) -> list[str]:
+    deps = getattr(task, "dependencies", None)
+    return [d for d in (deps or []) if d]
+
+
+def _find_task_by_id(subtasks: list[SubTask], task_id: str | None) -> Optional[SubTask]:
+    if not task_id:
+        return None
+    return next((t for t in subtasks if t.id == task_id), None)
+
+
+def _is_ready(task: SubTask, done_ids: set[str]) -> bool:
+    deps = _task_dependencies(task)
+    return task.status == "pending" and all(d in done_ids for d in deps)
+
+
+def _collect_ready_tasks(state: GraphState) -> list[SubTask]:
+    subtasks = state.get("subtasks", [])
+    done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
+    return [t for t in sorted(subtasks, key=lambda t: t.priority) if _is_ready(t, done_ids)]
+
+
 def _find_next_task(state: GraphState) -> Optional[SubTask]:
     """找到依赖已满足的下一个待执行任务"""
     subtasks = state.get("subtasks", [])
-    done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
-    for task in sorted(subtasks, key=lambda t: t.priority):
-        if task.status == "pending":
-            if all(d in done_ids for d in task.dependencies):
-                return task
+    ready_tasks = _collect_ready_tasks(state)
+    if ready_tasks:
+        current_task = _find_task_by_id(subtasks, state.get("current_subtask_id"))
+        if current_task and current_task in ready_tasks:
+            return current_task
+        return ready_tasks[0]
+
+    # 兼容兜底：当依赖字段缺失或异常时，回退旧 current_subtask_id 语义
+    current_task = _find_task_by_id(subtasks, state.get("current_subtask_id"))
+    if current_task and current_task.status == "pending":
+        return current_task
+
     return None
 
 

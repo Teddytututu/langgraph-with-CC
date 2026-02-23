@@ -33,7 +33,19 @@ async def reviewer_node(state: GraphState) -> dict:
 
     current = _find_current_subtask(subtasks, cid)
     if not current or not current.result:
-        return {"phase": "executing"}
+        subtask_summary = [f"{t.id}:{t.status}" for t in subtasks[:8]]
+        skip_reason = "missing_current_subtask" if not current else "missing_current_result"
+        return {
+            "phase": "executing",
+            "execution_log": [{
+                "event": "review_skipped",
+                "reason": skip_reason,
+                "current_subtask_id": cid,
+                "resolved_current": current.id if current else None,
+                "subtasks_overview": subtask_summary,
+                "timestamp": datetime.now().isoformat(),
+            }],
+        }
 
     # 本地快速验证：先做本地检查，通过且内容充分则直接 PASS，无需调用 subagent
     local_issues = _validate_result_locally(current)
