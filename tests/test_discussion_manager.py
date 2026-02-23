@@ -71,12 +71,12 @@ class TestDiscussionManager:
         """测试发送消息"""
         msg = await self.manager.post_message(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             content="Hello world",
         )
 
         assert msg is not None
-        assert msg.from_agent == "agent_1"
+        assert msg.from_agent == "agent_01"
         assert msg.content == "Hello world"
 
         # 验证消息已添加到讨论库
@@ -88,7 +88,7 @@ class TestDiscussionManager:
         """测试广播消息"""
         msg = await self.manager.broadcast(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             content="Broadcast message",
         )
 
@@ -99,9 +99,9 @@ class TestDiscussionManager:
         """测试发起查询"""
         msg = await self.manager.query(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             question="What do you think?",
-            to_agents=["agent_2", "agent_3"],
+            to_agents=["agent_02", "agent_03"],
         )
 
         assert msg.message_type == "query"
@@ -113,15 +113,15 @@ class TestDiscussionManager:
         # 先发起查询
         query = await self.manager.query(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             question="Question?",
-            to_agents=["agent_2"],
+            to_agents=["agent_02"],
         )
 
         # 回复
         response = await self.manager.respond(
             node_id="node_1",
-            from_agent="agent_2",
+            from_agent="agent_02",
             content="My answer",
             query_id=query.metadata["query_id"],
         )
@@ -141,7 +141,7 @@ class TestConsensusMechanism:
         """测试请求共识"""
         msg = await self.manager.request_consensus(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             topic="Should we use Python?",
         )
 
@@ -158,14 +158,14 @@ class TestConsensusMechanism:
         # 先请求共识
         await self.manager.request_consensus(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             topic="Topic",
         )
 
         # 确认共识
         msg = await self.manager.confirm_consensus(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
         )
 
         assert "CONFIRMED" in msg.content
@@ -180,33 +180,33 @@ class TestConsensusMechanism:
         # 创建讨论
         await self.manager.post_message(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             content="First message",
         )
         await self.manager.post_message(
             node_id="node_1",
-            from_agent="agent_2",
+            from_agent="agent_02",
             content="Second message",
         )
 
         # 请求共识
         await self.manager.request_consensus(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             topic="Topic",
         )
 
         discussion = self.manager.get_discussion("node_1")
         # 添加第二个参与者
-        discussion.participants = ["agent_1", "agent_2"]
+        discussion.participants = ["agent_01", "agent_02"]
 
         # 第一个参与者确认
-        await self.manager.confirm_consensus("node_1", "agent_1")
+        await self.manager.confirm_consensus("node_1", "agent_01")
         # 此时还没完全达成（需要所有参与者确认）
-        # 但 confirmations 集合已记录 agent_1
+        # 但 confirmations 集合已记录 agent_01
 
         # 第二个参与者确认
-        await self.manager.confirm_consensus("node_1", "agent_2")
+        await self.manager.confirm_consensus("node_1", "agent_02")
 
         # 重新获取讨论状态
         discussion = self.manager.get_discussion("node_1")
@@ -218,7 +218,7 @@ class TestConsensusMechanism:
         with pytest.raises(ValueError, match="Discussion .* not found"):
             await self.manager.confirm_consensus(
                 node_id="nonexistent",
-                from_agent="agent_1",
+                from_agent="agent_01",
             )
 
 
@@ -233,9 +233,9 @@ class TestConflictHandling:
         """测试报告冲突"""
         msg = await self.manager.report_conflict(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             conflict_description="Disagreement on approach",
-            involved_agents=["agent_2"],
+            involved_agents=["agent_02"],
         )
 
         assert msg.message_type == "conflict"
@@ -250,15 +250,15 @@ class TestConflictHandling:
         # 先报告冲突
         await self.manager.report_conflict(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             conflict_description="Disagreement",
-            involved_agents=["agent_2"],
+            involved_agents=["agent_02"],
         )
 
         # 解决冲突
         msg = await self.manager.resolve_conflict(
             node_id="node_1",
-            from_agent="agent_1",
+            from_agent="agent_01",
             resolution="Decided to use approach A",
         )
 
@@ -281,7 +281,7 @@ class TestQueryMethods:
         for i in range(5):
             await self.manager.post_message(
                 node_id="node_1",
-                from_agent="agent_1",
+                from_agent="agent_01",
                 content=f"Message {i}",
             )
 
@@ -340,7 +340,7 @@ class TestEventHandlers:
 
         self.manager.on_message(handler)
 
-        await self.manager.post_message("node_1", "agent_1", "Hello")
+        await self.manager.post_message("node_1", "agent_01", "Hello")
 
         assert len(received_messages) == 1
         assert received_messages[0].content == "Hello"

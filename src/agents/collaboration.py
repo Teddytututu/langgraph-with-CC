@@ -132,7 +132,7 @@ class ParallelCollaboration(BaseCollaboration):
             if isinstance(result, dict):
                 merged.update(result)
             else:
-                merged[f"agent_{i}"] = result
+                merged[f"agent_{i + 1:02d}"] = result
         return merged
 
 

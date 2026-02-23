@@ -199,14 +199,14 @@ async def test_discussion_manager():
     # 发送消息
     await discussion_manager.post_message(
         node_id=discussion_id,
-        from_agent="agent_1",
+        from_agent="agent_01",
         content="我的建议是方案A",
         message_type="proposal",
     )
 
     await discussion_manager.post_message(
         node_id=discussion_id,
-        from_agent="agent_2",
+        from_agent="agent_02",
         content="我同意方案A",
         message_type="agreement",
     )
@@ -221,11 +221,11 @@ async def test_discussion_manager():
     # 确认共识
     await discussion_manager.confirm_consensus(
         node_id=discussion_id,
-        from_agent="agent_1",
+        from_agent="agent_01",
     )
     await discussion_manager.confirm_consensus(
         node_id=discussion_id,
-        from_agent="agent_2",
+        from_agent="agent_02",
     )
 
     # 获取讨论

@@ -121,7 +121,7 @@ class TestCoordinatorAgent:
         """测试协作模式选择 - 单个 agent"""
         mode = self.coordinator.choose_collaboration_mode(
             task="test task",
-            agents=["agent_1"],
+            agents=["agent_01"],
         )
         assert mode == CollaborationMode.CHAIN
         assert self.coordinator._mode_stats["chain"] == 1
@@ -130,13 +130,13 @@ class TestCoordinatorAgent:
         """测试协作模式选择 - 记录历史"""
         mode = self.coordinator.choose_collaboration_mode(
             task="test task",
-            agents=["agent_1", "agent_2"],
+            agents=["agent_01", "agent_02"],
         )
 
         assert len(self.coordinator._decision_history) == 1
         decision = self.coordinator._decision_history[0]
         assert "task" in decision
-        assert decision["agents"] == ["agent_1", "agent_2"]
+        assert decision["agents"] == ["agent_01", "agent_02"]
         assert "mode" in decision
         assert "timestamp" in decision
 
@@ -155,7 +155,7 @@ class TestCoordinatorAgent:
         """测试执行计划生成"""
         plan = self.coordinator.plan_execution(
             task="test task",
-            agents=["agent_1", "agent_2"],
+            agents=["agent_01", "agent_02"],
         )
 
         assert "mode" in plan

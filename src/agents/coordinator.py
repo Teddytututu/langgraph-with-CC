@@ -270,7 +270,7 @@ COORDINATOR_SYSTEM_PROMPT = """你是一个任务协调者。
 {
   "mode": "chain",
   "reasoning": "选择原因",
-  "execution_order": ["agent_1", "agent_2", "agent_3"]
+  "execution_order": ["agent_01", "agent_02", "agent_03"]
 }
 ```
 """
