@@ -210,21 +210,33 @@ def _wait_for_idle(timeout: int = 600, stable_samples: int = IDLE_STABLE_SAMPLES
     return False
 
 
-def _submit_task(task_text: str, time_minutes: float, execution_policy: dict | None) -> str | None:
-    """提交任务，返回 task_id。失败返回 None。"""
+def _submit_task(
+    task_text: str,
+    time_minutes: float,
+    execution_policy: dict | None,
+    idle_timeout: int | None = None,
+) -> tuple[str | None, str]:
+    """提交任务，返回 (task_id, reason)。
+
+    reason 取值：
+    - ok
+    - wait_idle_timeout
+    - post_error:...
+    """
     # 确保系统空闲再提交，避免多任务并发
-    if not _wait_for_idle(timeout=600):
-        _log("等待系统空闲超时，跳过本次提交")
-        return None
+    wait_timeout = idle_timeout if idle_timeout is not None else max(600, int(time_minutes * 60 * 1.2))
+    if not _wait_for_idle(timeout=wait_timeout):
+        _log(f"等待系统空闲超时（{wait_timeout}s），暂不提交新任务")
+        return None, "wait_idle_timeout"
     try:
         payload = {"task": task_text, "time_minutes": time_minutes}
         if execution_policy is not None:
             payload["execution_policy"] = execution_policy
         resp = _api("POST", "/api/tasks", payload)
-        return resp.get("id")
+        return resp.get("id"), "ok"
     except Exception as e:
         _log(f"提交任务失败: {e}")
-        return None
+        return None, f"post_error:{e}"
 
 
 def _check_transient_task_status(task_id: str, retries: int = TRANSIENT_RECHECKS) -> tuple[str, str]:
@@ -357,11 +369,40 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         # ── 提交任务 ──
         task_id = None
         while task_id is None:
-            task_id = _submit_task(task_text, minutes_per_round, execution_policy)
+            task_id, submit_reason = _submit_task(
+                task_text,
+                minutes_per_round,
+                execution_policy,
+                idle_timeout=max(600, int(minutes_per_round * 60 * 1.2)),
+            )
             if task_id is None:
+                # 系统仍在运行旧任务时，不应误判为 POST 失败
+                if submit_reason == "wait_idle_timeout":
+                    active_running = 0
+                    active_total = 0
+                    try:
+                        tasks_resp = _api("GET", "/api/tasks")
+                        active = [
+                            t for t in tasks_resp.get("tasks", [])
+                            if t.get("status") in ("running", "created", "queued")
+                        ]
+                        active_total = len(active)
+                        active_running = len([t for t in active if t.get("status") == "running"])
+                    except Exception:
+                        pass
+
+                    detail = (
+                        f"等待系统空闲超时（active={active_total}, running={active_running}），"
+                        "保留现有运行任务继续推进，不触发 fix_request"
+                    )
+                    round_failure_reason = detail
+                    _log(f"提交延后: {detail}")
+                    time.sleep(min(POLL_INTERVAL, 10))
+                    continue
+
                 round_failure_reason = "POST /api/tasks 返回错误"
                 round_fix_triggers += 1
-                _wait_for_fix("任务提交失败", round_num, "POST /api/tasks 返回错误")
+                _wait_for_fix("任务提交失败", round_num, f"POST /api/tasks 返回错误: {submit_reason}")
 
         round_start = time.monotonic()
         _log(f"任务已提交: {task_id}，时间预算 {minutes_per_round} 分钟")
