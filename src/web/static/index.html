@@ -91,7 +91,7 @@
                                 <span class="task-status" :class="task.status">{{ task.status }}</span>
                                 <span class="task-meta">{{ task.time_minutes || '∞' }}m</span>
                             </div>
-                            <p class="task-desc">{{ task.task }}</p>
+                            <p class="task-desc markdown-inline" v-html="renderTaskInline(task.task)"></p>
                         </div>
                         <div v-if="tasks.length === 0" class="empty">
                             <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -124,7 +124,7 @@
                         </div>
                     </div>
                     <div class="task-detail-body">
-                        <p class="task-detail-desc">{{ selectedTask.task }}</p>
+                        <div class="task-detail-desc markdown" v-html="renderTaskMd(selectedTask.task)"></div>
                         <div class="task-detail-meta">
                             <span>Created: {{ formatTime(selectedTask.created_at) }}</span>
                             <span v-if="selectedTask.finished_at">· Finished: {{ formatTime(selectedTask.finished_at) }}</span>
@@ -189,14 +189,21 @@
                             </svg>
                             Workflow
                         </span>
-                        <div v-if="currentNode" class="node-badge">
-                            <span class="pulse"></span>
-                            {{ currentNode }}
+                        <div class="graph-toolbar">
+                            <button class="btn btn-ghost graph-tool-btn" title="Zoom out" @click="zoomGraphOut">−</button>
+                            <button class="btn btn-ghost graph-tool-btn" title="Zoom in" @click="zoomGraphIn">+</button>
+                            <button class="btn btn-ghost graph-tool-btn" title="Reset view" @click="resetGraphView">Reset</button>
+                            <button class="btn btn-ghost graph-tool-btn" title="Fit to viewport" @click="fitGraphView">Fit</button>
+                            <span class="graph-zoom-label">{{ Math.round(graphZoom * 100) }}%</span>
+                            <div v-if="currentNode" class="node-badge">
+                                <span class="pulse"></span>
+                                {{ currentNode }}
+                            </div>
                         </div>
                     </div>
-                    <div class="card-body">
+                    <div class="card-body" id="graph-body">
                         <!-- 动态子任务 DAG（Mermaid LR） -->
-                        <div v-if="isDynamicGraph && mermaidSvg" v-html="mermaidSvg" class="mermaid-wrap"></div>
+                        <div v-if="isDynamicGraph && mermaidSvg" v-html="mermaidSvg" class="mermaid-wrap" id="graph-wrap"></div>
 
                         <!-- 静态流程图（无任务时：手绘 SVG Pipeline） -->
                         <svg v-else class="workflow-svg" viewBox="0 0 560 200" xmlns="http://www.w3.org/2000/svg">
@@ -349,7 +356,7 @@
                                 <div class="subtask-info">
                                     <h4>{{ s.title }}</h4>
                                     <span class="agent">{{ s.agent_type }}</span>
-                                    <span v-if="s.assigned_agents?.length" class="agent-id">{{ s.assigned_agents[0] }}</span>
+                                    <span v-if="s.assigned_agents?.length" class="agent-id">{{ s.assigned_agents.join(', ') }}</span>
                                 </div>
                                 <button
                                     class="subtask-edit-btn"
@@ -542,11 +549,11 @@
                             </div>
                         </div>
                         <div class="composer">
-                            <select v-model="newMessage.from_agent" class="composer-select">
-                                <option v-for="agent in discussionAgents" :key="agent.value" :value="agent.value">{{ agent.label }}</option>
-                            </select>
+                            <div class="composer-targets" v-if="selectedSubtask?.assigned_agents?.length">
+                                <span class="status-chip">to: {{ selectedSubtask.assigned_agents.join(', ') }}</span>
+                            </div>
                             <div class="composer-row">
-                                <input v-model="newMessage.content" @keyup.enter="sendMessage" placeholder="Message..." class="composer-input">
+                                <input v-model="newMessage.content" @keyup.enter="sendMessage" placeholder="Message to all assigned agents..." class="composer-input">
                                 <button class="composer-btn" @click="sendMessage">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                                         <line x1="22" y1="2" x2="11" y2="13"/>

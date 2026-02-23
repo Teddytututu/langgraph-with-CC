@@ -27,13 +27,13 @@ mermaid.initialize({
     },
     flowchart: {
         htmlLabels: true,
-        padding: 30,
-        nodeSpacing: 100,
-        rankSpacing: 120,
-        curve: 'linear',
-        diagramMarginX: 50,
-        diagramMarginY: 50,
-        useMaxWidth: true,
+        padding: 36,
+        nodeSpacing: 140,
+        rankSpacing: 160,
+        curve: 'basis',
+        diagramMarginX: 72,
+        diagramMarginY: 72,
+        useMaxWidth: false,
         arrowMarkerAbsolute: true,
     },
 });
@@ -50,6 +50,7 @@ createApp({
         const selectedSubtask = ref(null);
         const discussionMessages = ref([]);
         const discussionParticipants = ref([]);
+        const discussionCacheByNode = ref({});
         const discussionStatus = ref({
             taskId: '',
             nodeId: '',
@@ -69,6 +70,9 @@ createApp({
         const timelineIdSet = new Set();
         const lastSystemStatusForTimeline = ref('');
         const mermaidSvg = ref('');
+        const graphZoom = ref(1);
+        const graphPanX = ref(0);
+        const graphPanY = ref(0);
         const rawMermaid = ref('');  // 缓存后端基础图结构，避免重复请求
         const showNewTask = ref(false);
         const terminalLines = ref([]);
@@ -176,7 +180,7 @@ createApp({
         });
 
         const newTask = ref({ task: '', time_minutes: null });
-        const newMessage = ref({ from_agent: 'director', content: '' });
+        const newMessage = ref({ from_agent: 'user', content: '' });
         const interveneText = ref('');
 
         // Subtask edit state
@@ -249,6 +253,50 @@ createApp({
                 participantCount: discussionParticipants.value.length,
                 latestSpeaker: latestMessage?.from_agent || '',
             };
+        };
+
+        const discussionCacheKey = (taskId, nodeId) => `${taskId || ''}::${nodeId || ''}`;
+
+        const mergeDiscussionMessages = (baseMessages = [], extraMessages = []) => {
+            const merged = [];
+            const seen = new Set();
+            [...baseMessages, ...extraMessages].forEach(msg => {
+                const id = msg?.id;
+                if (id && seen.has(id)) return;
+                if (id) seen.add(id);
+                merged.push(msg);
+            });
+            return merged;
+        };
+
+        const upsertDiscussionCache = (taskId, nodeId, incomingMessage = null, participants = null) => {
+            const key = discussionCacheKey(taskId, nodeId);
+            const current = discussionCacheByNode.value[key] || { messages: [], participants: [] };
+            const next = {
+                messages: current.messages.slice(),
+                participants: current.participants.slice(),
+            };
+
+            if (incomingMessage) {
+                if (!next.messages.find(m => m.id === incomingMessage.id)) {
+                    next.messages.push(incomingMessage);
+                }
+                if (incomingMessage.from_agent && !next.participants.includes(incomingMessage.from_agent)) {
+                    next.participants.push(incomingMessage.from_agent);
+                }
+                (incomingMessage.to_agents || []).forEach(agent => {
+                    if (agent && !next.participants.includes(agent)) next.participants.push(agent);
+                });
+            }
+
+            if (Array.isArray(participants)) {
+                participants.forEach(agent => {
+                    if (agent && !next.participants.includes(agent)) next.participants.push(agent);
+                });
+            }
+
+            discussionCacheByNode.value[key] = next;
+            return next;
         };
         let ws = null;
         let _wsEverConnected = false;
@@ -446,15 +494,19 @@ createApp({
                     termLog(`⚡ 已注入 ${payload.instructions?.length || 1} 条指令`, 'input');
                     break;
                 case 'discussion_message': {
+                    const cache = upsertDiscussionCache(
+                        payload.task_id,
+                        payload.node_id,
+                        payload.message,
+                    );
+
                     if (
                         selectedTask.value?.id === payload.task_id &&
                         selectedSubtask.value?.id === payload.node_id
                     ) {
                         const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
                         if (!exists) discussionMessages.value.push(payload.message);
-                        if (payload.message?.from_agent && !discussionParticipants.value.includes(payload.message.from_agent)) {
-                            discussionParticipants.value.push(payload.message.from_agent);
-                        }
+                        discussionParticipants.value = cache.participants.slice();
                         refreshDiscussionStatusFromSelection();
                     }
                     addTimelineItem({
@@ -488,6 +540,7 @@ createApp({
                     selectedSubtask.value = null;
                     discussionMessages.value = [];
                     discussionParticipants.value = [];
+                    discussionCacheByNode.value = {};
                     discussionStatus.value = {
                         taskId: '',
                         nodeId: '',
@@ -704,6 +757,62 @@ createApp({
         let _graphStructureHash = '';
         let _graphStatusHash = '';
 
+        const clampGraphZoom = (value) => Math.max(0.4, Math.min(2.5, value));
+
+        const applyGraphViewportTransform = () => {
+            Vue.nextTick(() => {
+                const wrap = document.getElementById('graph-wrap');
+                if (!wrap) return;
+                wrap.style.transform = `translate(${graphPanX.value}px, ${graphPanY.value}px) scale(${graphZoom.value})`;
+                wrap.style.transformOrigin = 'top left';
+            });
+        };
+
+        const zoomGraphIn = () => {
+            graphZoom.value = clampGraphZoom(graphZoom.value + 0.15);
+            applyGraphViewportTransform();
+        };
+
+        const zoomGraphOut = () => {
+            graphZoom.value = clampGraphZoom(graphZoom.value - 0.15);
+            applyGraphViewportTransform();
+        };
+
+        const resetGraphView = () => {
+            graphZoom.value = 1;
+            graphPanX.value = 0;
+            graphPanY.value = 0;
+            applyGraphViewportTransform();
+        };
+
+        const fitGraphView = () => {
+            Vue.nextTick(() => {
+                const host = document.getElementById('graph-body');
+                const wrap = document.getElementById('graph-wrap');
+                if (!host || !wrap) return;
+
+                const svg = wrap.querySelector('svg');
+                if (!svg) {
+                    resetGraphView();
+                    return;
+                }
+
+                const hostRect = host.getBoundingClientRect();
+                const svgRect = svg.getBoundingClientRect();
+                if (!hostRect.width || !hostRect.height || !svgRect.width || !svgRect.height) {
+                    resetGraphView();
+                    return;
+                }
+
+                const scaleX = (hostRect.width * 0.94) / svgRect.width;
+                const scaleY = (hostRect.height * 0.9) / svgRect.height;
+                graphZoom.value = clampGraphZoom(Math.min(scaleX, scaleY, 1));
+                graphPanX.value = Math.max(0, (hostRect.width - svgRect.width * graphZoom.value) / 2);
+                graphPanY.value = Math.max(0, (hostRect.height - svgRect.height * graphZoom.value) / 2);
+                applyGraphViewportTransform();
+            });
+        };
+
         const parseMermaidStateSignature = (mermaidText) => {
             const lines = (mermaidText || '').split('\n');
             const classes = lines
@@ -819,6 +928,7 @@ createApp({
                 if (graphFeatureFlags.incremental && statusChanged) {
                     applyGraphStateIncremental(stateSig);
                 }
+                applyGraphViewportTransform();
             } catch (e) {
                 console.error('Mermaid render error:', e);
             }
@@ -993,11 +1103,13 @@ createApp({
                 const res = await fetch('/api/reports');
                 if (!res.ok) return;
                 const data = await res.json();
-                reports.value = data.files || [];
+                reports.value = (data.files || []).filter(
+                    r => typeof r?.name === 'string' && r.name.toLowerCase().endsWith('.md')
+                );
                 // 自动加载最新的 md 文件：当前无选中，或选中的文件已不在列表中时自动切换
                 const stillExists = reports.value.some(r => r.name === activeReport.value);
                 if (reports.value.length > 0 && !stillExists) {
-                    const first = reports.value.find(r => r.ext === '.md') || reports.value[0];
+                    const first = reports.value[0];
                     if (first) loadReport(first.name);
                 }
             } catch (e) {
@@ -1023,6 +1135,7 @@ createApp({
             selectedSubtask.value = null;
             discussionMessages.value = [];
             discussionParticipants.value = [];
+            discussionCacheByNode.value = {};
             discussionStatus.value = {
                 taskId: task?.id || '',
                 nodeId: '',
@@ -1054,9 +1167,15 @@ createApp({
 
         const selectSubtask = async (subtask) => {
             selectedSubtask.value = subtask;
-            // 自动将发言者切换为当前节点第一个已分配的 agent（没有则留在 user）
-            newMessage.value.from_agent =
-                subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
+            // 默认发言者：优先保留当前已选且仍可用；否则 assigned_agents 首项；再兜底 agent_type/user
+            const currentFromAgent = newMessage.value.from_agent;
+            const discussionAgentValues = discussionAgents.value.map(a => a.value);
+            if (discussionAgentValues.includes(currentFromAgent)) {
+                newMessage.value.from_agent = currentFromAgent;
+            } else {
+                newMessage.value.from_agent =
+                    subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
+            }
             discussionParticipants.value = [];
             discussionStatus.value = {
                 ...discussionStatus.value,
@@ -1074,16 +1193,31 @@ createApp({
                         throw new Error(`HTTP ${res.status}`);
                     }
                     const data = await res.json();
-                    discussionMessages.value = data.messages || [];
-                    discussionParticipants.value = data.participants || [];
-                    // 如果记录到了更多参与者，刷新默选
-                    if (discussionParticipants.value.length > 0 &&
-                        !subtask.assigned_agents?.length) {
-                        newMessage.value.from_agent = discussionParticipants.value[0];
+                    const key = discussionCacheKey(selectedTask.value.id, subtask.id);
+                    const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
+                    const mergedMessages = mergeDiscussionMessages(data.messages || [], cached.messages || []);
+                    discussionMessages.value = mergedMessages;
+                    const mergedParticipants = Array.from(new Set([
+                        ...(data.participants || []),
+                        ...(cached.participants || []),
+                    ]));
+                    discussionParticipants.value = mergedParticipants;
+                    discussionCacheByNode.value[key] = {
+                        messages: mergedMessages,
+                        participants: mergedParticipants,
+                    };
+                    // 讨论参与者加载后再校验一次默认发言者，避免切换节点时出现无效默认值
+                    const updatedAgentValues = discussionAgents.value.map(a => a.value);
+                    if (!updatedAgentValues.includes(newMessage.value.from_agent)) {
+                        newMessage.value.from_agent =
+                            subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
                     }
                 } catch (e) {
                     console.error('selectSubtask: failed to load discussion', subtask.id, e);
-                    discussionMessages.value = [];
+                    const key = discussionCacheKey(selectedTask.value.id, subtask.id);
+                    const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
+                    discussionMessages.value = cached.messages || [];
+                    discussionParticipants.value = cached.participants || [];
                 }
             }
             refreshDiscussionStatusFromSelection();
@@ -1092,10 +1226,17 @@ createApp({
         const sendMessage = async () => {
             if (!newMessage.value.content.trim() || !selectedSubtask.value) return;
             try {
+                const toAgents = Array.isArray(selectedSubtask.value.assigned_agents)
+                    ? selectedSubtask.value.assigned_agents.filter(Boolean)
+                    : [];
+                const payload = {
+                    ...newMessage.value,
+                    to_agents: toAgents,
+                };
                 const res = await fetch(`/api/tasks/${selectedTask.value.id}/nodes/${selectedSubtask.value.id}/discussion`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(newMessage.value)
+                    body: JSON.stringify(payload)
                 });
                 if (!res.ok) {
                     throw new Error(`HTTP ${res.status}`);
@@ -1105,6 +1246,11 @@ createApp({
                 if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
                     discussionMessages.value.push(saved);
                 }
+                upsertDiscussionCache(
+                    selectedTask.value?.id,
+                    selectedSubtask.value?.id,
+                    saved,
+                );
                 refreshDiscussionStatusFromSelection();
                 addTimelineItem({
                     id: `discussion_local|${selectedTask.value?.id || ''}|${selectedSubtask.value?.id || ''}|${saved?.id || saved?.timestamp || newMessage.value.content}`,
@@ -1197,6 +1343,32 @@ createApp({
         // Utils
         const getStatusText = (s) => ({ idle: 'Idle', running: 'Running', completed: 'Done', failed: 'Failed' }[s] || s);
         const formatTime = (t) => formatTimestampHHMMSS(t);
+
+        const escapeHtml = (text) => String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+        const renderTaskMd = (text) => {
+            if (!text) return '';
+            try {
+                return marked.parse(escapeHtml(text), { breaks: true, gfm: true });
+            } catch (e) {
+                return escapeHtml(text);
+            }
+        };
+
+        const renderTaskInline = (text) => {
+            if (!text) return '';
+            try {
+                return marked.parseInline(escapeHtml(text), { breaks: true, gfm: true });
+            } catch (e) {
+                return escapeHtml(text);
+            }
+        };
+
         const renderMd = (text) => {
             if (!text) return '';
             try { return marked.parse(text, { breaks: true, gfm: true }); }
@@ -1209,6 +1381,7 @@ createApp({
             await fetchSystemStatus(true);  // true = 恢复终端日志
             scheduleGraphRefresh(0);
             fetchReports();
+            window.addEventListener('resize', fitGraphView);
 
             // 刷新后自动选中正在运行的任务，否则选最新任务
             if (!selectedTask.value && tasks.value.length) {
@@ -1239,10 +1412,12 @@ createApp({
             discussionMessages, discussionParticipants, discussionStatus, statusTimeline, filteredTimeline, timelineScope, mermaidSvg, isDynamicGraph, showNewTask, newTask, newMessage,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
+            graphZoom,
             stats, getCompletedSubtasks, discussionAgents,
             reports, activeReport, activeReportContent,
-            createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd,
+            createTask, selectTask, selectSubtask, sendMessage, intervene, getStatusText, formatTime, renderMd, renderTaskMd, renderTaskInline,
             fetchGraph, fetchReports, loadReport, openEditSubtask, saveSubtask, sendTerminalCmd, clearTerminal, sendChat, clearAllTasks,
+            zoomGraphIn, zoomGraphOut, resetGraphView, fitGraphView,
         };
     }
 }).mount('#app');

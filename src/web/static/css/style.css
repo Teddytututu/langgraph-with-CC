@@ -610,10 +610,34 @@ body {
     font-size: 0.875rem;
     color: var(--text-2);
     line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+}
+
+.task-desc.markdown-inline {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.task-desc.markdown-inline :is(p, ul, ol, li, pre, table, blockquote, h1, h2, h3, h4, h5, h6) {
+    display: inline;
+    margin: 0;
+    padding: 0;
+}
+
+.task-desc.markdown-inline code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.8em;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 4px;
 }
 
 .task-item.active .task-desc {
@@ -747,6 +771,81 @@ body {
     margin: 0 0 10px;
 }
 
+.task-detail-desc.markdown {
+    white-space: normal;
+}
+
+.task-detail-desc.markdown > *:first-child {
+    margin-top: 0;
+}
+
+.task-detail-desc.markdown > *:last-child {
+    margin-bottom: 0;
+}
+
+.task-detail-desc.markdown h1,
+.task-detail-desc.markdown h2,
+.task-detail-desc.markdown h3,
+.task-detail-desc.markdown h4,
+.task-detail-desc.markdown h5,
+.task-detail-desc.markdown h6 {
+    margin: 12px 0 8px;
+    line-height: 1.35;
+    color: var(--text-1);
+}
+
+.task-detail-desc.markdown h1 { font-size: 1.1rem; }
+.task-detail-desc.markdown h2 { font-size: 1.02rem; }
+.task-detail-desc.markdown h3,
+.task-detail-desc.markdown h4,
+.task-detail-desc.markdown h5,
+.task-detail-desc.markdown h6 { font-size: 0.95rem; }
+
+.task-detail-desc.markdown p {
+    margin: 0 0 8px;
+}
+
+.task-detail-desc.markdown ul,
+.task-detail-desc.markdown ol {
+    margin: 0 0 8px 18px;
+    padding: 0;
+}
+
+.task-detail-desc.markdown li {
+    margin: 3px 0;
+}
+
+.task-detail-desc.markdown code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.82em;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+
+.task-detail-desc.markdown pre {
+    margin: 8px 0;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 10px 12px;
+    overflow-x: auto;
+}
+
+.task-detail-desc.markdown pre code {
+    background: transparent;
+    border: 0;
+    padding: 0;
+}
+
+.task-detail-desc.markdown blockquote {
+    margin: 8px 0;
+    padding: 4px 10px;
+    border-left: 3px solid var(--violet-light);
+    color: var(--text-3);
+}
+
 .task-detail-meta {
     display: flex;
     flex-wrap: wrap;
@@ -768,14 +867,43 @@ body {
     flex-direction: column;
 }
 
+.graph-card .card-header {
+    gap: 10px;
+}
+
+.graph-toolbar {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.graph-tool-btn {
+    padding: 4px 10px;
+    font-size: 0.72rem;
+    line-height: 1.1;
+    min-width: 34px;
+}
+
+.graph-zoom-label {
+    font-size: 0.72rem;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+    min-width: 48px;
+    text-align: right;
+}
+
 .graph-card .card-body {
     flex: 1;
     display: flex;
-    align-items: center;
-    justify-content: center;
+    align-items: stretch;
+    justify-content: flex-start;
     background: linear-gradient(135deg, var(--violet-bg) 0%, var(--blue-bg) 100%);
     position: relative;
-    padding: 24px;
+    padding: 12px;
+    min-height: 620px;
+    overflow: auto;
 }
 
 /* Graph 背景装饰 */
@@ -792,16 +920,16 @@ body {
 
 /* ── Mermaid SVG 容器 ── */
 .graph-card .card-body > div {
-    width: 100%;
-    max-height: 520px;
-    overflow: auto;
+    width: max-content;
+    min-width: 100%;
+    max-height: none;
+    overflow: visible;
     z-index: 1;
     position: relative;
     padding: 20px 16px;
     box-sizing: border-box;
-    /* 美化滚动条 */
-    scrollbar-width: thin;
-    scrollbar-color: #3f3f46 transparent;
+    transform-origin: top left;
+    transition: transform 0.16s var(--ease);
 }
 .graph-card .card-body > div::-webkit-scrollbar { width: 5px; height: 5px; }
 .graph-card .card-body > div::-webkit-scrollbar-track { background: transparent; }
@@ -809,7 +937,8 @@ body {
 
 /* SVG 本体 */
 .graph-card .card-body svg {
-    width: 100%;
+    width: auto;
+    min-width: 100%;
     height: auto;
     display: block;
     filter: drop-shadow(0 2px 12px rgba(0,0,0,0.4));
