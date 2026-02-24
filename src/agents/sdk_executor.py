@@ -353,8 +353,15 @@ class SDKExecutor:
             parts.append("")
 
         # 输出格式要求
-        subtask_id = context.get("subtask", {}).get("id", "task")
+        subtask = context.get("subtask", {})
+        subtask_id = subtask.get("id", "task")
+        agent_type = str(subtask.get("agent_type", "")).strip().lower()
+        is_code_task = agent_type in {"coder", "executor", "debugger", "developer"}
+
         parts.append("## ║ 输出要求")
+        if is_code_task:
+            parts.append("0. 【最高优先级】先修改真实源码：必须使用 Edit/Bash 对项目文件做实际修改，禁止只给修复建议不落地")
+            parts.append("0.1 若未产生源码改动（可由 git diff 或文件内容变化证明），该任务视为失败")
         parts.append(f"1. 将详细的工作成果写入文件 `reports/{subtask_id}.md`，使用标准 Markdown 格式")
         parts.append("2. Markdown 必须包含以下章节（缺一不可）：")
         parts.append("   - Reproduction Commands")

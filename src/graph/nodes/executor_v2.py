@@ -23,11 +23,6 @@ from src.discussion.manager import discussion_manager
 _coordinator = CoordinatorAgent()
 
 
-def _compute_timeout(task: SubTask) -> float:
-    """计算子任务执行超时时间（秒）"""
-    return max(120.0, min(task.estimated_minutes * 120, 1800.0))
-
-
 from src.graph.nodes.executor import executor_node
 
 
@@ -40,7 +35,6 @@ async def _execute_with_discussion(
     caller,
     task: SubTask,
     previous_results: list,
-    timeout: float
 ) -> dict:
     """
     讨论协作模式执行
@@ -77,7 +71,7 @@ async def _execute_with_discussion(
 
     if not agent_executors:
         # 没有专家可用，降级为普通执行
-        return await _fallback_execution(caller, task, previous_results, timeout)
+        return await _fallback_execution(caller, task, previous_results)
 
     # 2. 各专家发表初步意见（并行）
     async def gather_opinion(agent: AgentExecutor) -> dict:
@@ -95,13 +89,8 @@ async def _execute_with_discussion(
                 "success": False,
             }
 
-    try:
-        opinion_results = await asyncio.wait_for(
-            asyncio.gather(*[gather_opinion(a) for a in agent_executors]),
-            timeout=timeout * 0.6,  # 留 40% 时间用于协商
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"讨论协作超时：任务 {task.id}")
+    # 超时已禁用：让任务自然完成
+    opinion_results = await asyncio.gather(*[gather_opinion(a) for a in agent_executors])
 
     # 3. 将意见发送到讨论库
     for opinion_result in opinion_results:
@@ -164,7 +153,6 @@ async def _execute_parallel_v2(
     caller,
     task: SubTask,
     previous_results: list,
-    timeout: float
 ) -> dict:
     """
     并行协作模式执行（改进版）
@@ -178,7 +166,7 @@ async def _execute_parallel_v2(
 
     if len(domains) < 2:
         # 单域，使用链式
-        return await _execute_chain(caller, task, previous_results, timeout)
+        return await _execute_chain(caller, task, previous_results)
 
     subtask_dict = {
         "id": task.id,
@@ -204,13 +192,8 @@ async def _execute_parallel_v2(
             previous_results=previous_results,
         )
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[run_one(d) for d in domains]),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"并行执行超时：任务 {task.id}")
+    # 超时已禁用：让任务自然完成
+    results = await asyncio.gather(*[run_one(d) for d in domains])
 
     # 合并结果
     merged_parts = []
@@ -235,7 +218,6 @@ async def _execute_chain(
     caller,
     task: SubTask,
     previous_results: list,
-    timeout: float
 ) -> dict:
     """
     链式协作模式执行
@@ -258,26 +240,18 @@ async def _execute_chain(
         "knowledge_domains": task.knowledge_domains,
     }
 
-    try:
-        if specialist_id:
-            call_result = await asyncio.wait_for(
-                caller.call_specialist(
-                    agent_id=specialist_id,
-                    subtask=subtask_dict,
-                    previous_results=previous_results,
-                ),
-                timeout=timeout,
-            )
-        else:
-            call_result = await asyncio.wait_for(
-                caller.call_executor(
-                    subtask=subtask_dict,
-                    previous_results=previous_results,
-                ),
-                timeout=timeout,
-            )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"链式执行超时：任务 {task.id}")
+    # 超时已禁用：让任务自然完成
+    if specialist_id:
+        call_result = await caller.call_specialist(
+            agent_id=specialist_id,
+            subtask=subtask_dict,
+            previous_results=previous_results,
+        )
+    else:
+        call_result = await caller.call_executor(
+            subtask=subtask_dict,
+            previous_results=previous_results,
+        )
 
     return call_result
 
@@ -308,7 +282,6 @@ async def _fallback_execution(
     caller,
     task: SubTask,
     previous_results: list,
-    timeout: float
 ) -> dict:
     """降级执行（当没有专家可用时）"""
     subtask_dict = {
@@ -319,16 +292,11 @@ async def _fallback_execution(
         "knowledge_domains": task.knowledge_domains,
     }
 
-    try:
-        return await asyncio.wait_for(
-            caller.call_executor(
-                subtask=subtask_dict,
-                previous_results=previous_results,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"降级执行超时：任务 {task.id}")
+    # 超时已禁用：让任务自然完成
+    return await caller.call_executor(
+        subtask=subtask_dict,
+        previous_results=previous_results,
+    )
 
 
 def _task_dependencies(task: SubTask) -> list[str]:

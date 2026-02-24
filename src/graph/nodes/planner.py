@@ -233,19 +233,11 @@ async def planner_node(state: GraphState) -> dict:
 
     planner_task = user_task + _policy_prompt(policy)
 
-    # 直接调用 planner subagent（最多等 120s）
+    # 调用 planner subagent（不设置时间上限）
     planner_call_error = ""
     fallback_reason = ""
     try:
-        call_result = await asyncio.wait_for(
-            caller.call_planner(task=planner_task, time_budget=time_budget_info),
-            timeout=120.0,
-        )
-    except asyncio.TimeoutError:
-        import logging as _logging
-        planner_call_error = "planner_call_failed: planner SDK timeout"
-        _logging.getLogger(__name__).warning("[planner] %s", planner_call_error)
-        call_result = {"success": False, "error": planner_call_error}
+        call_result = await caller.call_planner(task=planner_task, time_budget=time_budget_info)
     except Exception as _pe:
         import logging as _logging
         planner_call_error = f"planner_call_failed: {_pe}"

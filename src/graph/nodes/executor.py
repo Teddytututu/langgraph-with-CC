@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import re
-import time as _time
 from datetime import datetime
 from typing import Optional
 
@@ -298,7 +297,6 @@ def _build_discussion_fallback_result(
         "actual_discussion_rounds": actual_rounds,
         "required_agents": required_agents,
         "required_rounds": required_rounds,
-        "synthesis_timeout_sec": float(call_result.get("synthesis_timeout_sec") or 0.0),
     }
 
 
@@ -326,36 +324,6 @@ def _build_reliability_degraded_result(
         original_error=original_error,
         violation_type=violation_type,
     )
-
-
-def _compute_discussion_timeout_sec(
-    *,
-    estimated_minutes: float,
-    required_rounds: int,
-    required_agents: int,
-    strict: bool,
-) -> float:
-    rounds = max(1, int(required_rounds or 1))
-    agents = max(1, int(required_agents or 1))
-
-    if strict:
-        # Strict 模式下，单轮常见耗时会被慢 specialist 主导；
-        # 需要给足每轮时间，避免在第 6 轮左右被总超时提前截断。
-        round_floor_per_round = 72.0 + 8.0 * min(agents, 6)
-        baseline = 600.0
-    else:
-        round_floor_per_round = 30.0 + 5.0 * min(agents, 6)
-        baseline = 180.0
-
-    round_floor_total = rounds * round_floor_per_round
-
-    estimate_window = 0.0
-    if estimated_minutes > 0:
-        estimate_multiplier = 2.0 if strict else 1.2
-        estimate_window = estimated_minutes * 60.0 * estimate_multiplier
-
-    timeout = max(baseline, round_floor_total, estimate_window)
-    return min(7200.0, timeout)
 
 
 def _find_task_by_id(subtasks: list[SubTask], task_id: str | None) -> Optional[SubTask]:
@@ -454,8 +422,6 @@ async def _execute_multi_agent_discussion(
     min_rounds: int,
     min_agents: int,
     strict: bool,
-    deadline: float | None = None,
-    discussion_timeout_sec: float | None = None,
 ) -> tuple[dict, list[dict]]:
     """
     真实多轮讨论：每轮所有参与 agent 对前一轮观点进行响应，形成往返。
@@ -572,8 +538,7 @@ async def _execute_multi_agent_discussion(
     round_outputs: dict[int, list[dict]] = {}
     rounds_executed = 0
     successful_agent_ids: list[str] = []
-    discussion_started_monotonic = _time.monotonic()
-    deadline_reached = False
+
     async def _call_round_specialist(spec: dict, round_idx: int, prior_round_digest: str) -> dict:
         prompt = (
             f"You are a senior {spec['domain']} specialist in a multi-agent discussion.\n"
@@ -630,19 +595,6 @@ async def _execute_multi_agent_discussion(
 
     prior_digest = "No prior round yet."
     for round_idx in range(1, min_rounds + 1):
-        # 预算截止检查：超时立即收敛为 strict 轮次不足失败（fail-closed）
-        if deadline and _time.monotonic() > deadline:
-            elapsed_seconds = _time.monotonic() - discussion_started_monotonic
-            logger.warning(
-                "[discussion] deadline reached before round %d/%d | rounds_executed=%d | discussion_timeout_sec=%.1f | elapsed_seconds=%.1f",
-                round_idx,
-                min_rounds,
-                rounds_executed,
-                float(discussion_timeout_sec or 0.0),
-                elapsed_seconds,
-            )
-            deadline_reached = True
-            break
         batch = await asyncio.gather(
             *[_call_round_specialist(spec, round_idx, prior_digest) for spec in specialists],
             return_exceptions=True,
@@ -754,14 +706,10 @@ async def _execute_multi_agent_discussion(
 
     # 严格模式轮次不足：必须 fail-closed（包括 1..N-1）
     if strict and rounds_executed < min_rounds:
-        elapsed_seconds = _time.monotonic() - discussion_started_monotonic
         logger.warning(
-            "[discussion] partial rounds under strict policy | required_rounds=%d | rounds_executed=%d | discussion_timeout_sec=%.1f | elapsed_seconds=%.1f | deadline_reached=%s",
+            "[discussion] partial rounds under strict policy | required_rounds=%d | rounds_executed=%d",
             min_rounds,
             rounds_executed,
-            float(discussion_timeout_sec or 0.0),
-            elapsed_seconds,
-            deadline_reached,
         )
         pv = _build_policy_violation(
             violation_type="rounds_insufficient",
@@ -807,19 +755,13 @@ async def _execute_multi_agent_discussion(
     )
 
     synthesizer_id = specialists[0]["id"]
-    synthesis_timeout_sec = max(45.0, min(240.0, 20.0 + rounds_executed * 12.0))
     try:
-        synth_res = await asyncio.wait_for(
-            caller.call_specialist(
-                agent_id=synthesizer_id,
-                subtask={**subtask_dict, "description": synthesis_prompt},
-                previous_results=[],
-                time_budget=budget_ctx,
-            ),
-            timeout=synthesis_timeout_sec,
+        synth_res = await caller.call_specialist(
+            agent_id=synthesizer_id,
+            subtask={**subtask_dict, "description": synthesis_prompt},
+            previous_results=[],
+            time_budget=budget_ctx,
         )
-    except asyncio.TimeoutError:
-        synth_res = {"success": False, "error": f"discussion_synthesis_timeout>{synthesis_timeout_sec:.0f}s", "result": None}
     except Exception as e:
         synth_res = {"success": False, "error": f"discussion_synthesis_error:{e}", "result": None}
 
@@ -851,7 +793,6 @@ async def _execute_multi_agent_discussion(
             "error": None,
             "actual_agents_used": len(successful_agent_ids),
             "actual_discussion_rounds": rounds_executed,
-            "synthesis_timeout_sec": synthesis_timeout_sec,
         },
         discussion_log,
     )
@@ -1008,44 +949,17 @@ async def executor_node(state: GraphState) -> dict:
         next_task.id, domains, required_agents, required_rounds, policy.strict_enforcement,
     )
 
-    # 讨论总预算：按 required_rounds + 任务估时联合计算，避免 strict 轮次与预算冲突
-    _est_outer = float(getattr(next_task, "estimated_minutes", 0.0) or 0.0)
-    discussion_timeout_sec = _compute_discussion_timeout_sec(
-        estimated_minutes=_est_outer,
-        required_rounds=required_rounds,
-        required_agents=required_agents,
-        strict=policy.strict_enforcement,
-    )
-    _discussion_deadline = _time.monotonic() + discussion_timeout_sec
-
     try:
-        call_result, discussion_log = await asyncio.wait_for(
-            _execute_multi_agent_discussion(
-                caller,
-                next_task,
-                domains,
-                previous_results,
-                budget_ctx,
-                min_rounds=required_rounds,
-                min_agents=required_agents,
-                strict=policy.strict_enforcement,
-                deadline=_discussion_deadline,
-                discussion_timeout_sec=discussion_timeout_sec,
-            ),
-            timeout=discussion_timeout_sec,
+        call_result, discussion_log = await _execute_multi_agent_discussion(
+            caller,
+            next_task,
+            domains,
+            previous_results,
+            budget_ctx,
+            min_rounds=required_rounds,
+            min_agents=required_agents,
+            strict=policy.strict_enforcement,
         )
-    except asyncio.TimeoutError:
-        logger.warning("[executor] discussion total timeout task=%s timeout=%.1fs", next_task.id, discussion_timeout_sec)
-        call_result = {
-            "success": False,
-            "error": f"discussion_total_timeout>{discussion_timeout_sec:.0f}s",
-            "result": None,
-            "specialist_id": None,
-            "assigned_agents": [],
-            "actual_agents_used": 0,
-            "actual_discussion_rounds": 0,
-        }
-        discussion_log = []
     except Exception as exc:
         logger.exception("[executor] discussion crashed for task %s", next_task.id)
         call_result = {
@@ -1063,7 +977,6 @@ async def executor_node(state: GraphState) -> dict:
     assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
     actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), 0)
     actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), 0)
-    synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or 0.0)
 
     agents_shortfall = actual_agents_used < required_agents
     rounds_shortfall = actual_rounds < required_rounds
@@ -1160,7 +1073,6 @@ async def executor_node(state: GraphState) -> dict:
     assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
     actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), actual_agents_used)
     actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), actual_rounds)
-    synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or synthesis_timeout_sec)
 
     def _normalize_discussion_message_type(raw_type: str | None) -> str:
         allowed_types = {
@@ -1257,7 +1169,6 @@ async def executor_node(state: GraphState) -> dict:
                     "actual_rounds": actual_rounds,
                     "required_agents": required_agents,
                     "actual_agents_used": actual_agents_used,
-                    "discussion_timeout_sec": discussion_timeout_sec,
                     "failure_stage": effective_failure_stage,
                     "terminal_failure": hard_terminal,
                     "fallback_applied": bool(call_result.get("fallback_applied")),
@@ -1305,8 +1216,6 @@ async def executor_node(state: GraphState) -> dict:
                     "required_agents": required_agents,
                     "actual_rounds": actual_rounds,
                     "actual_agents_used": actual_agents_used,
-                    "discussion_timeout_sec": discussion_timeout_sec,
-                    "synthesis_timeout_sec": synthesis_timeout_sec,
                     "fallback_applied": False,
                     "fallback_reason": None,
                     "original_error": call_result.get("original_error") or failure_error,
@@ -1326,7 +1235,7 @@ async def executor_node(state: GraphState) -> dict:
 
         degraded_subtasks = [
             t.model_copy(update={
-                "status": "failed" if strict_failed else "done",
+                "status": "done",
                 "result": degraded_result,
                 "started_at": started_at,
                 "finished_at": datetime.now(),
@@ -1348,15 +1257,13 @@ async def executor_node(state: GraphState) -> dict:
                 "failure_stage": effective_failure_stage,
                 "violation_type": policy_violation.get("violation_type"),
                 "terminal": False,
-                "terminal_reason": "strict_execution_failed_nonterminal" if strict_failed else "reliability_mode_non_terminal",
+                "terminal_reason": "reliability_mode_non_terminal",
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
                 "required_rounds": required_rounds,
                 "required_agents": required_agents,
                 "actual_rounds": actual_rounds,
                 "actual_agents_used": actual_agents_used,
-                "discussion_timeout_sec": discussion_timeout_sec,
-                "synthesis_timeout_sec": synthesis_timeout_sec,
                 "fallback_applied": bool(call_result.get("fallback_applied", True)),
                 "fallback_reason": call_result.get("fallback_reason") or "degraded_continue",
                 "original_error": call_result.get("original_error") or failure_error,
@@ -1430,7 +1337,6 @@ async def executor_node(state: GraphState) -> dict:
                 "actual_rounds": actual_rounds,
                 "required_agents": required_agents,
                 "actual_agents_used": actual_agents_used,
-                "discussion_timeout_sec": discussion_timeout_sec,
             },
         ))
     disc.status = "resolved"
@@ -1476,8 +1382,6 @@ async def executor_node(state: GraphState) -> dict:
             "required_agents": required_agents,
             "actual_rounds": actual_rounds,
             "actual_agents_used": actual_agents_used,
-            "discussion_timeout_sec": discussion_timeout_sec,
-            "synthesis_timeout_sec": synthesis_timeout_sec,
             "failure_stage": _derive_failure_stage(call_result.get("original_error") or call_result.get("error")),
             "violation_type": (call_result.get("policy_violation") or {}).get("violation_type"),
             "fallback_applied": bool(call_result.get("fallback_applied")),

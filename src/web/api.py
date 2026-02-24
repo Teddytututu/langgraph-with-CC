@@ -651,10 +651,6 @@ def register_routes(app: FastAPI):
                     "normalizer": "sdk",
                 },
             }
-        except asyncio.TimeoutError:
-            fallback["format_meta"]["reason"] = "sdk_timeout"
-            fallback["format_meta"]["quality_note"] = "sdk_timeout_fallback_raw"
-            return fallback
         except Exception as e:
             fallback["format_meta"]["reason"] = f"sdk_exception:{str(e)[:120]}"
             fallback["format_meta"]["quality_note"] = "sdk_exception_fallback_raw"
@@ -718,15 +714,12 @@ def register_routes(app: FastAPI):
 
         try:
             executor = get_executor()
-            result = await asyncio.wait_for(
-                executor.execute(
-                    agent_id="task_final_quality_checker",
-                    system_prompt=system_prompt,
-                    context={"task": prompt},
-                    tools=[],
-                    max_turns=4,
-                ),
-                timeout=25,
+            result = await executor.execute(
+                agent_id="task_final_quality_checker",
+                system_prompt=system_prompt,
+                context={"task": prompt},
+                tools=[],
+                max_turns=4,
             )
             if not result.success:
                 fallback["reason"] = f"sdk_failed:{(result.error or 'unknown')[:120]}"
@@ -756,9 +749,6 @@ def register_routes(app: FastAPI):
                 "used_improved_markdown": False,
                 "checker": "sdk",
             }
-        except asyncio.TimeoutError:
-            fallback["reason"] = "sdk_timeout"
-            return fallback
         except Exception as e:
             fallback["reason"] = f"sdk_exception:{str(e)[:120]}"
             return fallback
@@ -1722,8 +1712,6 @@ def register_routes(app: FastAPI):
                 "phase": "init",
                 "iteration": 0,
                 "max_iterations": 3,
-                "overtime_hits": 0,
-                "timeout_hard_stop": False,
                 "stalled_event": None,
                 "error": None,
                 "final_output": None,
@@ -1820,9 +1808,7 @@ def register_routes(app: FastAPI):
                         await emit(
                             (
                                 "⚠ stalled: "
-                                f"reason={stalled_event.get('reason','unknown')} "
-                                f"overtime_hits={stalled_event.get('overtime_hits','-')}/"
-                                f"{stalled_event.get('hard_stop_threshold','-')}"
+                                f"reason={stalled_event.get('reason','unknown')}"
                             ),
                             "warn",
                             node_id=final_node,

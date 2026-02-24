@@ -22,9 +22,6 @@ from src.discussion.manager import discussion_manager
 # 评审专家数量
 REVIEWER_COUNT = 3
 
-# 评审超时（秒）
-REVIEW_TIMEOUT = 90
-
 # 通过阈值（至少 N 个 reviewer 通过）
 PASS_THRESHOLD = 2
 
@@ -137,14 +134,8 @@ async def _parallel_review(caller, task: SubTask) -> list[dict]:
     # 获取可用的 reviewer agent
     reviewer_ids = _get_available_reviewers()
 
-    # 并行执行
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[review_with_reviewer(rid) for rid in reviewer_ids]),
-            timeout=REVIEW_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        results = []
+    # 超时已禁用：让任务自然完成
+    results = await asyncio.gather(*[review_with_reviewer(rid) for rid in reviewer_ids])
 
     return [r for r in results if r]
 

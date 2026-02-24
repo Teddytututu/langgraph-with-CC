@@ -17,10 +17,6 @@ from src.agents.caller import get_caller
 from src.discussion.manager import discussion_manager
 
 
-# 反思超时（秒）
-REFLECTION_TIMEOUT = 90
-
-
 # 反思视角定义
 REFLECTION_PERSPECTIVES = {
     "technical": {
@@ -90,7 +86,7 @@ async def reflector_v2_node(state: GraphState) -> dict:
     await _submit_reflections_for_discussion(discussion_id, reflections, current)
 
     # === 阶段3: 等待共识 ===
-    consensus = await _wait_for_consensus(discussion_id, timeout=45.0)
+    consensus = await _wait_for_consensus(discussion_id)
 
     # === 阶段4: 合成改进方案 ===
     improvement = _synthesize_improvement(reflections, consensus, issues)
@@ -184,13 +180,8 @@ async def _parallel_reflection(
         for p, c in REFLECTION_PERSPECTIVES.items()
     ]
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks),
-            timeout=REFLECTION_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        results = []
+    # 超时已禁用：让任务自然完成
+    results = await asyncio.gather(*tasks)
 
     # 组织结果
     reflections = {}
@@ -266,7 +257,7 @@ async def _submit_reflections_for_discussion(
     )
 
 
-async def _wait_for_consensus(discussion_id: str, timeout: float = 45.0) -> dict:
+async def _wait_for_consensus(discussion_id: str) -> dict:
     """等待反思共识"""
     discussion = discussion_manager.get_discussion(discussion_id)
 

@@ -161,12 +161,10 @@ class GraphState(TypedDict, total=False):
     # 流程控制
     phase: Literal[
         "init", "planning", "budgeting", "executing",
-        "reviewing", "reflecting", "complete", "timeout"
+        "reviewing", "reflecting", "complete"
     ]
     iteration: int
     max_iterations: int
-    overtime_hits: int
-    timeout_hard_stop: bool
     stalled_event: dict[str, Any] | None
     error: str | None
 

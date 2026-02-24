@@ -11,6 +11,7 @@ Subagent 状态管理器
 
 import json
 import logging
+import re
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -50,6 +51,8 @@ class SubagentManager:
         "planner", "executor", "reviewer", "reflector",
         "coordinator", "writer_1", "writer_2", "writer_3"
     ]
+    # 与 SubagentPool.create_agent_file() 的编号上限保持一致（agent_01 ~ agent_99）
+    MAX_POOL_SIZE = 99
 
     def __init__(self, pool_dir: str = ".claude/agents"):
         self.pool_dir = Path(pool_dir)
@@ -66,14 +69,14 @@ class SubagentManager:
                 state=SubagentState.READY  # 独立 subagent 始终为 ready
             )
 
-        # 初始化编号池（agent_01 ~ agent_60）
-        for i in range(1, 61):
+        # 初始化编号池（agent_01 ~ agent_99）
+        for i in range(1, self.MAX_POOL_SIZE + 1):
             agent_id = f"agent_{i:02d}"
             self.states[agent_id] = SubagentInfo(agent_id=agent_id)
 
     def get_next_empty(self) -> Optional[str]:
         """获取下一个空槽位（编号池）"""
-        for i in range(1, 61):
+        for i in range(1, self.MAX_POOL_SIZE + 1):
             agent_id = f"agent_{i:02d}"
             if self.states[agent_id].state == SubagentState.EMPTY:
                 return agent_id
@@ -90,7 +93,7 @@ class SubagentManager:
             可用的 agent_id 或 None
         """
         # 首先查找编号池中 ready 状态的
-        for i in range(1, 61):
+        for i in range(1, self.MAX_POOL_SIZE + 1):
             agent_id = f"agent_{i:02d}"
             info = self.states[agent_id]
             if info.state == SubagentState.READY:
@@ -264,6 +267,49 @@ tools: []
         if agent_id in self.states:
             return self.states[agent_id].state
         return None
+
+    def ensure_agent(
+        self,
+        agent_id: str,
+        *,
+        filled: bool = False,
+        name: str = "",
+        description: str = "",
+        skills: list[str] | None = None,
+    ) -> Optional[SubagentState]:
+        """确保 agent 在状态表中存在（用于运行时自愈缺失状态）。"""
+        if agent_id in self.states:
+            return self.states[agent_id].state
+
+        if agent_id in self.INDEPENDENT_AGENTS:
+            self.states[agent_id] = SubagentInfo(
+                agent_id=agent_id,
+                state=SubagentState.READY,
+                name=name,
+                description=description,
+                skills=skills or [],
+                filled_at=datetime.now(),
+            )
+            return self.states[agent_id].state
+
+        match = re.match(r"^agent_(\d{2})$", str(agent_id))
+        if not match:
+            return None
+
+        slot_idx = int(match.group(1))
+        if slot_idx < 1 or slot_idx > self.MAX_POOL_SIZE:
+            return None
+
+        state = SubagentState.READY if filled else SubagentState.EMPTY
+        self.states[agent_id] = SubagentInfo(
+            agent_id=agent_id,
+            state=state,
+            name=name,
+            description=description,
+            skills=skills or [],
+            filled_at=datetime.now() if filled else None,
+        )
+        return self.states[agent_id].state
 
     def get_info(self, agent_id: str) -> Optional[SubagentInfo]:
         """获取指定 subagent 的详细信息"""

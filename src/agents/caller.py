@@ -39,8 +39,27 @@ class SubagentCaller:
         Returns:
             执行结果
         """
-        # 检查 subagent 状态
+        # 检查 subagent 状态（支持运行时对缺失状态进行自愈）
         state = self.manager.get_state(agent_id)
+
+        template = self.pool.get_template(agent_id)
+        if state is None:
+            inferred_filled = bool(template and template.is_filled())
+            recovered_state = self.manager.ensure_agent(
+                agent_id,
+                filled=inferred_filled,
+                name=template.name if template else "",
+                description=template.description if template else "",
+                skills=[],
+            )
+            if recovered_state is not None:
+                state = recovered_state
+                logger.warning(
+                    "Subagent state missing, auto-recovered: agent_id=%s state=%s",
+                    agent_id,
+                    state,
+                )
+
         if state not in (SubagentState.READY, SubagentState.IN_USE):
             return {
                 "success": False,
@@ -49,7 +68,6 @@ class SubagentCaller:
             }
 
         # 获取 subagent 模板
-        template = self.pool.get_template(agent_id)
         if not template:
             return {
                 "success": False,

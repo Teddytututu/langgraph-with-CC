@@ -380,6 +380,50 @@ def run(
             continue
 
         if phase == "REPAIR_WAIT":
+            # 自驱修复：不再仅死等外部删除 fix_request.json
+            if FIX_REQUEST.exists():
+                try:
+                    fix_data = json.loads(FIX_REQUEST.read_text(encoding="utf-8"))
+                except Exception as e:
+                    _emit("auto_repair_parse_failed", round=round_no, error=f"{type(e).__name__}: {e}")
+                    _wait_for_fix(wait_poll=max(1, wait_poll), wait_timeout=max(0, wait_timeout))
+                    _emit("repair_cleared", round=round_no, consecutive_failures=consecutive_failures)
+                    phase = "COOLDOWN"
+                    continue
+
+                fix_instruction = str(fix_data.get("instruction") or "").strip()
+                fix_failure = str(fix_data.get("failure") or "").strip()
+                fix_goal = str(fix_data.get("goal") or "").strip()
+                repair_task_text = (
+                    "紧急修复阶段：根据失败信息直接修改代码并验证。\n"
+                    f"Goal: {fix_goal}\n"
+                    f"Instruction: {fix_instruction}\n"
+                    f"Failure: {fix_failure}"
+                )
+
+                try:
+                    _emit("auto_repair_started", round=round_no)
+                    fix_task_id = _submit_task(repair_task_text)
+                    _emit("auto_repair_submitted", round=round_no, task_id=fix_task_id)
+                    fix_status, fix_detail = _poll_until_terminal(
+                        fix_task_id,
+                        poll_interval=max(1, poll_interval),
+                        round_timeout=max(0, round_timeout),
+                    )
+                    if fix_status == "completed":
+                        FIX_REQUEST.unlink(missing_ok=True)
+                        _emit("auto_repair_completed", round=round_no, task_id=fix_task_id)
+                    else:
+                        _emit(
+                            "auto_repair_failed",
+                            round=round_no,
+                            task_id=fix_task_id,
+                            status=fix_status,
+                            detail=str(fix_detail)[:500],
+                        )
+                except Exception as e:
+                    _emit("auto_repair_crashed", round=round_no, error=f"{type(e).__name__}: {e}")
+
             _wait_for_fix(wait_poll=max(1, wait_poll), wait_timeout=max(0, wait_timeout))
             _emit("repair_cleared", round=round_no, consecutive_failures=consecutive_failures)
             phase = "COOLDOWN"
@@ -413,7 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown", type=int, default=30, help="每轮冷却秒")
     parser.add_argument("--backoff-base", type=int, default=10, help="失败退避基数秒")
     parser.add_argument("--backoff-max", type=int, default=300, help="失败退避上限秒")
-    parser.add_argument("--round-timeout", type=int, default=1800, help="单轮任务超时秒，0=不超时")
+    parser.add_argument("--round-timeout", type=int, default=3600, help="单轮任务超时秒，0=不超时")
     return parser
 
 

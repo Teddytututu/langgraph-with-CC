@@ -20,9 +20,6 @@ from src.discussion.manager import discussion_manager
 # 多规划专家数量
 PLANNER_COUNT = 3
 
-# 规划超时（秒）
-PLANNING_TIMEOUT = 120
-
 
 async def planner_v2_node(state: GraphState) -> dict:
     """
@@ -60,7 +57,7 @@ async def planner_v2_node(state: GraphState) -> dict:
     await _submit_plans_for_discussion(discussion_id, plans)
 
     # 等待共识（带超时）
-    consensus = await _wait_for_consensus(discussion_id, timeout=60.0)
+    consensus = await _wait_for_consensus(discussion_id)
 
     # === 阶段3: 合并方案 ===
     final_subtasks = _merge_plans(plans, consensus, budget)
@@ -100,15 +97,8 @@ async def _parallel_planning(caller, task: str, time_budget: dict) -> list[dict]
     # 获取可用的 planner agent
     planner_ids = _get_available_planners(caller)
 
-    # 并行执行
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[plan_with_planner(pid) for pid in planner_ids]),
-            timeout=PLANNING_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        # 超时，返回已完成的
-        results = []
+    # 超时已禁用：让任务自然完成
+    results = await asyncio.gather(*[plan_with_planner(pid) for pid in planner_ids])
 
     # 过滤空结果
     return [r for r in results if r]
@@ -223,7 +213,7 @@ def _calculate_dependency_depth(plan: list[dict]) -> int:
     return max(get_depth(t.get("id")) for t in plan) if plan else 0
 
 
-async def _wait_for_consensus(discussion_id: str, timeout: float = 60.0) -> dict:
+async def _wait_for_consensus(discussion_id: str) -> dict:
     """
     等待规划共识
 

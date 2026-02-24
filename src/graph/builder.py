@@ -54,7 +54,6 @@ def build_graph(checkpointer=None):
         "executing": "executor",
         "reviewing": "reviewer",
         "complete":  END,
-        "timeout":   END,
     })
     g.add_edge("planner", "budget_manager")
     g.add_edge("budget_manager", "executor")

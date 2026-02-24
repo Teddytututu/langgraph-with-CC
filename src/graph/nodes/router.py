@@ -58,69 +58,31 @@ async def router_node(state: GraphState) -> dict:
         }
 
     current_iteration = state.get("iteration", 0)
-    overtime_hits = int(state.get("overtime_hits", 0) or 0)
-    timeout_hard_stop = bool(state.get("timeout_hard_stop", False))
 
-    # 超时默认走可恢复路径：继续执行并记录超时次数
+    # 超时默认走可恢复路径：继续执行
     if budget and budget.is_overtime:
-        overtime_hits += 1
-        hard_stop_threshold = 6
-        timeout_hard_stop = overtime_hits >= hard_stop_threshold
-        if timeout_hard_stop:
-            return {
-                "phase": "timeout",
-                "final_output": _build_final_output(state, timeout=True, budget=budget),
-                "time_budget": budget,
-                "overtime_hits": overtime_hits,
-                "timeout_hard_stop": True,
-            }
         return {
             "phase": "executing" if subtasks else "init",
             "time_budget": budget,
             "iteration": current_iteration + 1,
-            "overtime_hits": overtime_hits,
-            "timeout_hard_stop": False,
-            "stalled_event": {
-                "event": "stalled",
-                "reason": "budget_overtime",
-                "overtime_hits": overtime_hits,
-                "hard_stop_threshold": hard_stop_threshold,
-            },
-        }
-
-    # 迭代上限防护：超过 200 次循环强制超时交付
-    if current_iteration > 200:
-        import logging as _log
-        _log.getLogger(__name__).error("[router] 迭代已达 %d 次，强制超时交付", current_iteration)
-        return {
-            "phase": "timeout",
-            "final_output": _build_final_output(state, timeout=True, budget=budget),
-            "time_budget": budget,
-            "timeout_hard_stop": True,
         }
 
     return {
         "phase": state.get("phase", "init") if subtasks else "init",
         "time_budget": budget,
         "iteration": current_iteration + 1,
-        "overtime_hits": 0,
-        "timeout_hard_stop": False,
     }
 
 
-def _build_final_output(state: GraphState, timeout: bool = False, budget=None) -> str:
+def _build_final_output(state: GraphState, budget=None) -> str:
     """汇总所有子任务结果
 
     Args:
         state: 当前图状态
-        timeout: 是否超时交付
         budget: 已更新过 elapsed_minutes 的 TimeBudget 对象（不传则从 state 读取）
     """
     lines = []
-    if timeout:
-        lines.append("⚠️ **时间预算已用尽，以下为已完成部分：**\n")
-    else:
-        lines.append("✅ **所有任务已完成：**\n")
+    lines.append("✅ **所有任务已完成：**\n")
 
     subtasks = state.get("subtasks", [])
     for t in subtasks:

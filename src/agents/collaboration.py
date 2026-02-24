@@ -250,19 +250,17 @@ class DiscussionCollaboration(BaseCollaboration):
 
     async def _wait_consensus(self, discussion_id: str, timeout: float = 60.0) -> dict:
         """
-        等待共识达成
+        等待共识达成（超时已禁用）
 
         Args:
             discussion_id: 讨论ID
-            timeout: 超时时间（秒）
+            timeout: 已废弃，保留参数兼容性
 
         Returns:
             共识结果
         """
         if not self.discussion_manager:
             return {"status": "consensus_reached", "discussion_id": discussion_id}
-
-        start_time = asyncio.get_running_loop().time()
 
         while True:
             discussion = self.discussion_manager.get_discussion(discussion_id)
@@ -301,15 +299,6 @@ class DiscussionCollaboration(BaseCollaboration):
                             "discussion_id": discussion_id,
                             "agree_count": agree_count,
                         }
-
-            # 超时检查
-            elapsed = asyncio.get_running_loop().time() - start_time
-            if elapsed >= timeout:
-                return {
-                    "status": "timeout",
-                    "discussion_id": discussion_id,
-                    "error": f"共识超时（{timeout}秒）",
-                }
 
             # 等待一小段时间再检查
             await asyncio.sleep(0.5)

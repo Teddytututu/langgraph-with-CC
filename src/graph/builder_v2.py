@@ -75,14 +75,12 @@ def build_graph_v2(checkpointer=None):
         "executing": "executor",
         "reviewing": "reviewer",
         "complete":  END,
-        "timeout":   END,
     })
     g.add_edge("planner", "budget_manager")
     g.add_edge("budget_manager", "executor")
 
     g.add_conditional_edges("executor", should_continue_or_timeout, {
         "review":   "reviewer",
-        "timeout":  END,
         "continue": "executor",
         "wait":     "router",
     })

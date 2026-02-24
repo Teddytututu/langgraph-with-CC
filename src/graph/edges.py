@@ -1,6 +1,5 @@
 """src/graph/edges.py — 条件路由函数"""
 import logging
-from datetime import datetime
 from src.graph.state import GraphState
 
 logger = logging.getLogger(__name__)
@@ -10,19 +9,14 @@ def route_after_router(state: GraphState) -> str:
     """Router 之后的路由决策
 
     路由规则（按优先级）：
-    1. 超时硬截止（hard stop）→ timeout
-    2. phase == init → planning
-    3. phase == budgeting → executing（等待预算管理完成）
-    4. phase == executing/reviewing → 继续当前阶段
-    5. phase == reflecting → executing（reflector 已完成反思）
-    6. phase == complete/timeout → 保持当前状态
-    7. 所有任务完成 → complete
-    8. 默认 → executing
+    1. phase == init → planning
+    2. phase == budgeting → executing（等待预算管理完成）
+    3. phase == executing/reviewing → 继续当前阶段
+    4. phase == reflecting → executing（reflector 已完成反思）
+    5. phase == complete → 保持当前状态
+    6. 所有任务完成 → complete
+    7. 默认 → executing
     """
-    budget = state.get("time_budget")
-    if budget and budget.is_overtime and state.get("timeout_hard_stop"):
-        return "timeout"
-
     phase = state.get("phase", "init")
     subtasks = state.get("subtasks", [])
 
@@ -42,7 +36,7 @@ def route_after_router(state: GraphState) -> str:
     if phase == "reflecting":
         # 反思完成，返回执行
         return "executing"
-    if phase == "complete" or phase == "timeout":
+    if phase == "complete":
         # 终态，保持
         return phase
 
@@ -76,10 +70,6 @@ def _collect_ready_tasks(subtasks: list) -> list:
 
 def should_continue_or_timeout(state: GraphState) -> str:
     """执行后判断：继续 / 审查 / 等待"""
-    if _check_timeout(state):
-        # 预算超时不直接终止，回 router 做可恢复处理
-        return "wait"
-
     current = _get_current(state)
     subtasks = state.get("subtasks", [])
 
@@ -118,10 +108,3 @@ def _get_current(state: GraphState):
         (t for t in subtasks if t.id == cid),
         None,
     )
-
-
-def _check_timeout(state: GraphState) -> bool:
-    budget = state.get("time_budget")
-    if not budget or not budget.deadline:
-        return False
-    return datetime.now() > budget.deadline

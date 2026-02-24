@@ -307,13 +307,11 @@ class DynamicGraphBuilder:
             "executing": "executor",
             "reviewing": "reviewer",
             "complete":  END,
-            "timeout":   END,
         })
         self.add_edge("planner", "budget_manager")
         self.add_edge("budget_manager", "executor")
         self.add_conditional_edges("executor", should_continue_or_timeout, {
             "review": "reviewer",
-            "timeout": END,
             "continue": "executor",
             "wait": "router",
         })
