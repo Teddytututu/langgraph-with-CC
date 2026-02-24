@@ -363,39 +363,19 @@ def register_routes(app: FastAPI):
                         "task": task,
                     }
 
-                active_task_id = app_state.current_task_id
-                active_task = app_state.tasks.get(active_task_id) if active_task_id else None
-                if (
-                    app_state.system_status == "running"
-                    and active_task
-                    and active_task.get("status") == "running"
-                    and active_task_id != task_id
-                ):
-                    if not force:
-                        task["status"] = "queued"
-                        app_state._bump_state_rev_unlocked()
-                        app_state.mark_dirty()
-                        return {
-                            "status": "queued",
-                            "task_id": task_id,
-                            "source": source,
-                            "state": app_state._snapshot_state_unlocked(),
-                            "task": task,
-                        }
-                    raise HTTPException(status_code=409, detail=f"Task already running: {active_task_id}")
-
                 task["status"] = "running"
+                task["started_at"] = datetime.now().isoformat()
+                task["updated_at"] = task["started_at"]
                 task.pop("error", None)
                 task.pop("finished_at", None)
                 snapshot = app_state._set_task_and_system_state_unlocked(
                     task_id,
                     task_status="running",
-                    system_status="running",
-                    current_task_id=task_id,
                     current_node="",
                     error=None,
                     finished_at=None,
                 )
+                snapshot = _recompute_system_state_unlocked(preferred_task_id=task_id)
 
             await app_state.broadcast("system_status_changed", {
                 **snapshot,
@@ -420,6 +400,105 @@ def register_routes(app: FastAPI):
                 "state": snapshot,
                 "task": task,
             }
+
+    def _pick_next_queued_task_id(*, exclude_task_id: Optional[str] = None) -> str:
+        candidates: list[tuple[str, str]] = []
+        for tid, t in app_state.tasks.items():
+            if exclude_task_id and tid == exclude_task_id:
+                continue
+            if t.get("status") != "queued":
+                continue
+            created_at = str(t.get("created_at") or "")
+            candidates.append((created_at, tid))
+
+        if not candidates:
+            return ""
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][1]
+
+    async def _start_next_queued_task(*, triggered_by_task_id: str, source: str = "auto_queue") -> dict[str, Any]:
+        async with app_state.state_lock:
+            active_task_id = app_state.current_task_id
+            active_task = app_state.tasks.get(active_task_id) if active_task_id else None
+            if (
+                app_state.system_status == "running"
+                and active_task
+                and active_task.get("status") == "running"
+            ):
+                return {"status": "busy"}
+
+            next_task_id = _pick_next_queued_task_id(exclude_task_id=triggered_by_task_id)
+
+        if not next_task_id:
+            return {"status": "empty"}
+
+        result = await _start_task_internal(next_task_id, source=source)
+        if result.get("status") == "running":
+            await app_state.broadcast("task_dequeued", {
+                "id": next_task_id,
+                "triggered_by": triggered_by_task_id,
+                "state_rev": result.get("state", {}).get("state_rev"),
+                "ts": datetime.now().isoformat(),
+            })
+
+        return result
+
+    def _recompute_system_state_unlocked(*, preferred_task_id: Optional[str] = None) -> dict[str, Any]:
+        """基于 tasks 聚合系统状态（支持多任务并行）。"""
+
+        running_items: list[tuple[str, dict[str, Any]]] = [
+            (tid, t)
+            for tid, t in app_state.tasks.items()
+            if (t or {}).get("status") == "running"
+        ]
+
+        next_status = "idle"
+        next_current_task_id: Optional[str] = None
+        next_current_node = ""
+
+        if running_items:
+            next_status = "running"
+
+            if preferred_task_id and any(tid == preferred_task_id for tid, _ in running_items):
+                next_current_task_id = preferred_task_id
+            else:
+                def _focus_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[str, str]:
+                    tid, t = item
+                    ts = str(
+                        t.get("started_at")
+                        or t.get("updated_at")
+                        or t.get("created_at")
+                        or ""
+                    )
+                    return (ts, tid)
+
+                next_current_task_id = max(running_items, key=_focus_sort_key)[0]
+
+            focus_task = app_state.tasks.get(next_current_task_id) or {}
+            next_current_node = str(focus_task.get("current_node") or "")
+        else:
+            if any((t or {}).get("status") == "failed" for t in app_state.tasks.values()):
+                next_status = "failed"
+            next_current_task_id = None
+            next_current_node = ""
+
+        changed = False
+        if app_state.system_status != next_status:
+            app_state.system_status = next_status
+            changed = True
+        if app_state.current_task_id != next_current_task_id:
+            app_state.current_task_id = next_current_task_id
+            changed = True
+        if app_state.current_node != next_current_node:
+            app_state.current_node = next_current_node
+            changed = True
+
+        if changed:
+            app_state._bump_state_rev_unlocked()
+            app_state.mark_dirty()
+
+        return app_state._snapshot_state_unlocked()
 
     # ── 页面路由 ──
 
@@ -470,28 +549,42 @@ def register_routes(app: FastAPI):
             "raw_task": original,
             "format_meta": {
                 "transformed": False,
+                "fallback_used": True,
                 "reason": "fallback_to_raw",
+                "structure_score": 0,
+                "quality_note": "normalization_fallback_raw_input",
+                "sections": [],
+                "normalizer": "sdk",
             },
         }
 
         if not compact:
             fallback["format_meta"]["reason"] = "empty_input"
+            fallback["format_meta"]["quality_note"] = "empty_input_kept_raw"
             return fallback
 
         if not _is_task_normalize_enabled():
             fallback["format_meta"]["reason"] = "disabled_by_config"
+            fallback["format_meta"]["quality_note"] = "normalization_disabled_by_env"
             return fallback
 
         system_prompt = (
-            "你是任务描述整理器。只做重组与轻度润色，不改变用户意图，不新增不存在的约束。\n"
-            "请将输入任务整理成结构化 Markdown，优先使用这些标题并按需省略空章节：\n"
-            "## Goal\n## Scope\n## Constraints\n## Acceptance Criteria\n## Deliverables\n\n"
-            "输出必须是 JSON 对象且仅包含以下字段：\n"
-            "{\"normalized_task\": string, \"transformed\": boolean, \"reason\": string}\n"
-            "- normalized_task: 整理后的 Markdown\n"
-            "- transformed: 仅当结构明显优化时为 true\n"
-            "- reason: 简短说明（如 structured_sections / already_structured）\n"
-            "不要输出 JSON 之外的任何内容。"
+            "你是任务输入规范化器。目标：将杂乱输入重组为 UI 可直接渲染的高质量 Markdown。\n"
+            "必须严格保持用户意图：不得发明新需求、截止时间、技术约束或验收项。\n"
+            "输出 Markdown 时优先按下列顺序组织章节（无内容可省略）：\n"
+            "## Goal\n## Scope\n## Inputs/Context\n## Constraints\n## Acceptance Criteria\n## Deliverables\n"
+            "条目使用短句 bullet/checklist，避免长段落堆叠。\n"
+            "你必须只输出 JSON 对象，且仅允许以下字段：\n"
+            "{\"normalized_task\": string, \"transformed\": boolean, \"reason\": string, \"structure_score\": number, \"quality_note\": string, \"sections\": string[], \"warnings\": string[]}\n"
+            "字段要求：\n"
+            "- normalized_task: 结构化 Markdown（用于前端显示）\n"
+            "- transformed: 是否进行了明显结构优化\n"
+            "- reason: 例如 structured_sections / already_structured / minimally_touched\n"
+            "- structure_score: 0-10，结构清晰度评分\n"
+            "- quality_note: 一句简短质量说明\n"
+            "- sections: 实际输出的章节名列表\n"
+            "- warnings: 若发现歧义，写简短提示；无则 []\n"
+            "禁止输出 JSON 以外任何文本。"
         )
 
         prompt = (
@@ -516,30 +609,158 @@ def register_routes(app: FastAPI):
 
             if not result.success:
                 fallback["format_meta"]["reason"] = f"sdk_failed:{(result.error or 'unknown')[:120]}"
+                fallback["format_meta"]["quality_note"] = "sdk_call_failed_fallback_raw"
                 return fallback
 
             parsed = _extract_json_object(str(result.result or ""))
             normalized_task = str(parsed.get("normalized_task") or "").strip()
             if not normalized_task:
                 fallback["format_meta"]["reason"] = "empty_normalized_output"
+                fallback["format_meta"]["quality_note"] = "sdk_returned_empty_markdown"
                 return fallback
 
             transformed = bool(parsed.get("transformed")) and normalized_task != original
             reason = str(parsed.get("reason") or ("structured_sections" if transformed else "already_structured"))
+            try:
+                structure_score = max(0, min(10, int(round(float(parsed.get("structure_score", 0))))))
+            except Exception:
+                structure_score = 0
+            quality_note = str(parsed.get("quality_note") or "")[:300]
+            sections = [
+                str(s).strip()[:80]
+                for s in (parsed.get("sections") or [])
+                if str(s).strip()
+            ][:12]
+            warnings = [
+                str(w).strip()[:200]
+                for w in (parsed.get("warnings") or [])
+                if str(w).strip()
+            ][:12]
 
             return {
                 "normalized_task": normalized_task,
                 "raw_task": original,
                 "format_meta": {
                     "transformed": transformed,
+                    "fallback_used": False,
                     "reason": reason[:200],
+                    "structure_score": structure_score,
+                    "quality_note": quality_note,
+                    "sections": sections,
+                    "warnings": warnings,
+                    "normalizer": "sdk",
                 },
             }
         except asyncio.TimeoutError:
             fallback["format_meta"]["reason"] = "sdk_timeout"
+            fallback["format_meta"]["quality_note"] = "sdk_timeout_fallback_raw"
             return fallback
         except Exception as e:
             fallback["format_meta"]["reason"] = f"sdk_exception:{str(e)[:120]}"
+            fallback["format_meta"]["quality_note"] = "sdk_exception_fallback_raw"
+            return fallback
+
+    async def _check_final_output_quality_via_sdk(final_output: str, subtasks: list[dict[str, Any]]) -> dict[str, Any]:
+        output_text = (final_output or "").strip()
+        fallback = {
+            "status": "fallback",
+            "pass": True,
+            "score": None,
+            "issues": [],
+            "reason": "quality_check_fallback",
+            "improved_markdown": "",
+            "used_improved_markdown": False,
+            "checker": "sdk",
+        }
+
+        if not output_text:
+            fallback["pass"] = False
+            fallback["score"] = 0
+            fallback["issues"] = ["empty_final_output"]
+            fallback["reason"] = "empty_final_output"
+            return fallback
+
+        if not _is_task_normalize_enabled():
+            fallback["reason"] = "disabled_by_config"
+            return fallback
+
+        subtask_lines: list[str] = []
+        for st in subtasks or []:
+            if not isinstance(st, dict):
+                continue
+            sid = str(st.get("id") or "").strip() or "-"
+            title = str(st.get("title") or "").strip()[:120]
+            status = str(st.get("status") or "").strip() or "unknown"
+            result_excerpt = str(st.get("result") or "").strip().replace("\n", " ")[:200]
+            subtask_lines.append(
+                f"- id={sid}; status={status}; title={title}; result_excerpt={result_excerpt}"
+            )
+
+        system_prompt = (
+            "你是任务最终结果质量审查器。只评估质量与可读性，不改变任务目标。\n"
+            "请基于 final_output 与 subtask outcomes 判断结果是否可直接交付。\n"
+            "评分维度：结构清晰、结论完整、与子任务结果一致、可验证性。\n"
+            "若不通过，可给 improved_markdown（在不新增需求的前提下重写结构与表达）。\n"
+            "仅输出 JSON 对象，且只允许字段：\n"
+            "{\"pass\": boolean, \"score\": number, \"issues\": string[], \"improved_markdown\": string, \"reason\": string}\n"
+            "要求：score 取 0-10；issues 为简短问题列表。"
+        )
+
+        prompt = (
+            "请评估以下任务最终结果质量并返回 JSON。\n"
+            "----- FINAL OUTPUT START -----\n"
+            f"{output_text}\n"
+            "----- FINAL OUTPUT END -----\n"
+            "----- SUBTASK OUTCOMES START -----\n"
+            f"{chr(10).join(subtask_lines) if subtask_lines else '- (none)'}\n"
+            "----- SUBTASK OUTCOMES END -----"
+        )
+
+        try:
+            executor = get_executor()
+            result = await asyncio.wait_for(
+                executor.execute(
+                    agent_id="task_final_quality_checker",
+                    system_prompt=system_prompt,
+                    context={"task": prompt},
+                    tools=[],
+                    max_turns=4,
+                ),
+                timeout=25,
+            )
+            if not result.success:
+                fallback["reason"] = f"sdk_failed:{(result.error or 'unknown')[:120]}"
+                return fallback
+
+            parsed = _extract_json_object(str(result.result or ""))
+            passed = bool(parsed.get("pass"))
+            try:
+                score = max(0, min(10, int(round(float(parsed.get("score", 0))))))
+            except Exception:
+                score = 0
+            issues = [
+                str(item).strip()[:200]
+                for item in (parsed.get("issues") or [])
+                if str(item).strip()
+            ][:20]
+            improved_markdown = str(parsed.get("improved_markdown") or "").strip()
+            reason = str(parsed.get("reason") or ("quality_pass" if passed else "quality_failed"))[:200]
+
+            return {
+                "status": "checked",
+                "pass": passed,
+                "score": score,
+                "issues": issues,
+                "reason": reason,
+                "improved_markdown": improved_markdown,
+                "used_improved_markdown": False,
+                "checker": "sdk",
+            }
+        except asyncio.TimeoutError:
+            fallback["reason"] = "sdk_timeout"
+            return fallback
+        except Exception as e:
+            fallback["reason"] = f"sdk_exception:{str(e)[:120]}"
             return fallback
 
     @app.post("/api/tasks")
@@ -584,7 +805,7 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_created", created_payload)
 
-        # 自动启动：创建后立即触发执行（若系统忙则进入 queued）
+        # 自动启动：创建后立即触发执行
         async def _auto_start():
             async with app_state.state_lock:
                 task = app_state.tasks.get(task_id)
@@ -592,37 +813,8 @@ def register_routes(app: FastAPI):
                     return
                 if task.get("status") != "created":
                     return
-                active_task_id = app_state.current_task_id
-                active_task = app_state.tasks.get(active_task_id) if active_task_id else None
-                if (
-                    app_state.system_status == "running"
-                    and active_task
-                    and active_task.get("status") == "running"
-                ):
-                    task["status"] = "queued"
-                    app_state._bump_state_rev_unlocked()
-                    app_state.mark_dirty()
-                    deferred_payload = {
-                        "id": task_id,
-                        "reason": "system_busy",
-                        "state_rev": app_state.state_rev,
-                        "ts": datetime.now().isoformat(),
-                    }
-                else:
-                    deferred_payload = None
 
-            if deferred_payload:
-                await app_state.broadcast("task_start_deferred", deferred_payload)
-                return
-
-            result = await _start_task_internal(task_id, source="auto")
-            if result.get("status") == "queued":
-                await app_state.broadcast("task_start_deferred", {
-                    "id": task_id,
-                    "reason": "system_busy",
-                    "state_rev": result.get("state", {}).get("state_rev"),
-                    "ts": datetime.now().isoformat(),
-                })
+            await _start_task_internal(task_id, source="auto")
 
         _fire(_auto_start())
 
@@ -804,10 +996,9 @@ def register_routes(app: FastAPI):
                 task_status="cancelled",
                 error="用户取消",
                 finished_at=now_iso,
-                system_status="idle",
-                current_node="",
-                current_task_id=None,
             )
+            task["updated_at"] = now_iso
+            snapshot = _recompute_system_state_unlocked()
 
             running_handle = app_state.running_task_handles.pop(task_id, None)
 
@@ -826,6 +1017,10 @@ def register_routes(app: FastAPI):
             "source": "cancel_task",
             "ts": datetime.now().isoformat(),
         })
+        _fire(_start_next_queued_task(
+            triggered_by_task_id=task_id,
+            source="auto_queue_after_cancel",
+        ))
 
         return {
             "status": "cancelled",
@@ -1002,6 +1197,49 @@ def register_routes(app: FastAPI):
                 items.append(f.name)
         return items
 
+    def _build_reproducibility_summary() -> dict[str, Any]:
+        command_count = 0
+        anchor_count = 0
+        has_repro_block = False
+        has_verify_block = False
+
+        if _REPORTS_DIR.exists() and _REPORTS_DIR.is_dir():
+            for f in sorted(_REPORTS_DIR.iterdir()):
+                if not f.is_file() or f.suffix.lower() not in {".md", ".json"}:
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                if f.suffix.lower() == ".json":
+                    try:
+                        data = json.loads(text)
+                    except Exception:
+                        data = {}
+                    repro_cmds = (data.get("reproduction") or {}).get("commands") or []
+                    ver_cmds = (data.get("verification") or {}).get("commands") or []
+                    anchors = data.get("evidence_anchors") or []
+                    command_count += len([c for c in repro_cmds if str(c).strip()])
+                    command_count += len([c for c in ver_cmds if str(c).strip()])
+                    anchor_count += len([a for a in anchors if str(a).strip()])
+                    has_repro_block = has_repro_block or bool(repro_cmds)
+                    has_verify_block = has_verify_block or bool(ver_cmds)
+                else:
+                    cmd_blocks = re.findall(r"```(?:bash|sh|shell|zsh|cmd|powershell)?\n[\s\S]*?```", text, flags=re.IGNORECASE)
+                    command_count += len(cmd_blocks)
+                    anchor_count += len(re.findall(r"\b(grep|rg|findstr|python\s+-c)\b", text, flags=re.IGNORECASE))
+                    anchor_count += len(re.findall(r"(?:[A-Za-z]:/|/)[\w./-]+\.[a-z0-9]+", text))
+                    has_repro_block = has_repro_block or bool(re.search(r"Reproduction Commands", text, re.IGNORECASE))
+                    has_verify_block = has_verify_block or bool(re.search(r"Verification Commands\s*&\s*Results", text, re.IGNORECASE))
+
+        reproducibility_pass = bool(command_count > 0 and anchor_count > 0 and has_repro_block and has_verify_block)
+        return {
+            "command_count": command_count,
+            "anchor_count": anchor_count,
+            "reproducibility_pass": reproducibility_pass,
+        }
+
     def _build_task_export_payload(task_id: str) -> dict[str, Any]:
         task = app_state.tasks.get(task_id, {})
         subtasks_payload = []
@@ -1027,6 +1265,7 @@ def register_routes(app: FastAPI):
             "result": result,
             "subtasks": subtasks_payload,
             "reports_manifest": _collect_reports_manifest(),
+            "reproducibility_summary": _build_reproducibility_summary(),
             "exported_at": datetime.now().isoformat(),
         }
 
@@ -1067,6 +1306,13 @@ def register_routes(app: FastAPI):
         else:
             for name in reports_manifest:
                 lines.append(f"- {name}")
+
+        lines.append("")
+        lines.append("## Reproducibility Summary")
+        reproducibility = payload.get("reproducibility_summary", {}) or {}
+        lines.append(f"- command_count: {reproducibility.get('command_count', 0)}")
+        lines.append(f"- anchor_count: {reproducibility.get('anchor_count', 0)}")
+        lines.append(f"- reproducibility_pass: {bool(reproducibility.get('reproducibility_pass', False))}")
 
         lines.append("")
         lines.append(f"_exported_at: {payload.get('exported_at', '')}_")
@@ -1445,27 +1691,60 @@ def register_routes(app: FastAPI):
                                 )
 
                     if state_update.get("final_output"):
+                        raw_final_output = str(state_update.get("final_output") or "")
+                        quality_eval = await _check_final_output_quality_via_sdk(
+                            raw_final_output,
+                            task.get("subtasks", []),
+                        )
+
+                        final_output_for_publish = raw_final_output
+                        used_improved = False
+                        if (
+                            quality_eval.get("status") == "checked"
+                            and not quality_eval.get("pass", True)
+                            and str(quality_eval.get("improved_markdown") or "").strip()
+                        ):
+                            final_output_for_publish = str(quality_eval.get("improved_markdown") or "").strip()
+                            used_improved = True
+                            quality_eval["used_improved_markdown"] = True
+
+                        verification_status = "completed"
+                        if quality_eval.get("status") == "checked":
+                            verification_status = "quality_pass" if quality_eval.get("pass") else "quality_warn"
+                        elif quality_eval.get("status") == "fallback":
+                            verification_status = "quality_fallback"
+
                         now_iso = datetime.now().isoformat()
                         async with app_state.state_lock:
                             current = app_state.tasks.get(task_id)
                             if not current:
                                 break
                             current["subtasks"] = task.get("subtasks", [])
+                            current["quality_meta"] = quality_eval
+                            current["updated_at"] = now_iso
                             snapshot = app_state._set_task_and_system_state_unlocked(
                                 task_id,
                                 task_status="completed",
-                                result=state_update["final_output"],
+                                result=final_output_for_publish,
                                 finished_at=now_iso,
-                                system_status="completed",
                                 current_node="",
-                                current_task_id=None,
                             )
+                            snapshot = _recompute_system_state_unlocked()
 
-                        await emit(f"✓ 任务完成", "success")
+                        if quality_eval.get("status") == "checked" and quality_eval.get("pass"):
+                            await emit("✓ 任务完成（质量检查通过）", "success")
+                        elif quality_eval.get("status") == "checked" and used_improved:
+                            await emit("✓ 任务完成（质量未通过，已应用结构化改写）", "warn")
+                        elif quality_eval.get("status") == "checked":
+                            await emit("✓ 任务完成（质量有警告）", "warn")
+                        else:
+                            await emit("✓ 任务完成（质量检查回退）", "warn")
+
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
-                            "result": state_update["final_output"],
+                            "result": final_output_for_publish,
                             "subtasks": task.get("subtasks", []),
+                            "quality_check": quality_eval,
                             "state_rev": snapshot["state_rev"],
                             "finished_at": now_iso,
                             "ts": now_iso,
@@ -1473,8 +1752,8 @@ def register_routes(app: FastAPI):
                                 task_id=task_id,
                                 node_id=final_node,
                                 phase=state_update.get("phase", ""),
-                                summary=(state_update.get("final_output") or "")[:240],
-                                verification="completed",
+                                summary=(final_output_for_publish or "")[:240],
+                                verification=verification_status,
                                 report_path="reports/",
                                 timestamp=now_iso,
                             ),
@@ -1505,18 +1784,17 @@ def register_routes(app: FastAPI):
             async with app_state.state_lock:
                 current = app_state.tasks.get(task_id)
                 if current and current.get("status") != "cancelled":
+                    current["updated_at"] = now_iso
                     app_state._set_task_and_system_state_unlocked(
                         task_id,
                         task_status="cancelled",
                         error="任务被取消",
                         finished_at=now_iso,
-                        system_status="idle",
                         current_node="",
-                        current_task_id=None,
                     )
-                    cancel_snapshot = app_state._snapshot_state_unlocked()
+                    cancel_snapshot = _recompute_system_state_unlocked()
                 else:
-                    cancel_snapshot = app_state._snapshot_state_unlocked()
+                    cancel_snapshot = _recompute_system_state_unlocked()
             await emit("⊘ 执行协程已取消", "warn")
             await app_state.broadcast("system_status_changed", {
                 **cancel_snapshot,
@@ -1530,20 +1808,19 @@ def register_routes(app: FastAPI):
             async with app_state.state_lock:
                 current = app_state.tasks.get(task_id)
                 if current:
+                    current["updated_at"] = now_iso
                     app_state._set_task_and_system_state_unlocked(
                         task_id,
                         task_status="failed",
                         error=str(e),
                         finished_at=now_iso,
-                        system_status="failed",
                         current_node="",
-                        current_task_id=None,
                     )
                     failed_node = current.get("current_node") or app_state.current_node
-                    fail_snapshot = app_state._snapshot_state_unlocked()
+                    fail_snapshot = _recompute_system_state_unlocked()
                 else:
                     failed_node = app_state.current_node
-                    fail_snapshot = app_state._snapshot_state_unlocked()
+                    fail_snapshot = _recompute_system_state_unlocked()
             await emit(f"✗ 崩溃: {str(e)[:200]}", "error")
 
             # 生成崩溃报告
@@ -1590,14 +1867,11 @@ def register_routes(app: FastAPI):
             async with app_state.state_lock:
                 current = app_state.tasks.get(task_id)
                 if current:
+                    current["updated_at"] = now_iso
                     status = current.get("status")
-                    if status in TERMINAL_STATUSES:
-                        app_state._set_task_and_system_state_unlocked(
-                            task_id,
-                            current_node="",
-                            current_task_id=None,
-                        )
-                final_snapshot = app_state._snapshot_state_unlocked()
+                    if status in TERMINAL_STATUSES and current.get("current_node"):
+                        current["current_node"] = ""
+                final_snapshot = _recompute_system_state_unlocked()
 
             if current and current.get("status") in TERMINAL_STATUSES:
                 await app_state.broadcast("system_status_changed", {
@@ -1606,6 +1880,10 @@ def register_routes(app: FastAPI):
                     "source": "run_task_finalized",
                     "ts": now_iso,
                 })
+                _fire(_start_next_queued_task(
+                    triggered_by_task_id=task_id,
+                    source="auto_queue_after_finalize",
+                ))
                 app_state.save_to_disk()
                 _fire(_schedule_post_task_init(task_id))
 

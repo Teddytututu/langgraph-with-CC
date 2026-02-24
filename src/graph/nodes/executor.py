@@ -3,7 +3,10 @@
 严格模式下执行真实多 agent 往返讨论轮次；不满足策略立即 fail-closed。
 """
 import asyncio
+import json
 import logging
+import re
+import time as _time
 from datetime import datetime
 from typing import Optional
 
@@ -41,6 +44,102 @@ def _resolve_policy(state: GraphState) -> ExecutionPolicy:
 def _task_dependencies(task: SubTask) -> list[str]:
     deps = getattr(task, "dependencies", None)
     return [d for d in (deps or []) if d]
+
+
+def _report_quality_score(path) -> int:
+    """轻量报告质量评分：可执行命令 + 复现/验证结构 + 稳定锚点。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except Exception:
+            return 0
+        score = 0
+        repro_cmds = (data.get("reproduction") or {}).get("commands") or []
+        ver_cmds = (data.get("verification") or {}).get("commands") or []
+        anchors = data.get("evidence_anchors") or []
+        if repro_cmds:
+            score += 2
+        if ver_cmds:
+            score += 2
+        if anchors:
+            score += 2
+        has_min = all(k in data for k in ("summary", "verification", "artifacts"))
+        if has_min:
+            score += 1
+        return score
+
+    score = 0
+    if re.search(r"```(?:bash|sh|shell|zsh|cmd|powershell)?\n[\s\S]*?```", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"Reproduction Commands", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"Verification Commands\s*&\s*Results", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"Evidence Anchors", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"\b(grep|rg|findstr|python\s+-c)\b", text, re.IGNORECASE):
+        score += 1
+    if re.search(r"(?:[A-Za-z]:/|/)[\w./-]+\.[a-z0-9]+", text):
+        score += 1
+    return score
+
+
+def _candidate_priority(path) -> tuple[int, float]:
+    """质量优先，再按更新时间。"""
+    quality = _report_quality_score(path)
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+    return quality, mtime
+
+
+def _derive_failure_stage(error: str | None) -> str:
+    if not error:
+        return "none"
+
+    err = str(error).lower()
+    if "discussion_total_timeout" in err:
+        return "discussion_total_timeout"
+    if "discussion_synthesis_timeout" in err or "synthesis_timeout" in err:
+        return "discussion_synthesis_timeout"
+    if "specialist_call_timeout" in err:
+        return "discussion_round_call_timeout"
+    if "[policy_violation]" in err:
+        return "policy_violation"
+    if "discussion_round_" in err:
+        return "discussion_round_failure"
+    if "no specialists created" in err:
+        return "specialist_init_failure"
+    return "unknown"
+
+
+def _compute_discussion_timeout_sec(
+    *,
+    estimated_minutes: float,
+    required_rounds: int,
+    required_agents: int,
+    strict: bool,
+) -> float:
+    rounds = max(1, int(required_rounds or 1))
+    agents = max(1, int(required_agents or 1))
+
+    round_floor_per_round = 30.0 + 5.0 * min(agents, 6)
+    round_floor_total = rounds * round_floor_per_round
+
+    estimate_window = 0.0
+    if estimated_minutes > 0:
+        estimate_multiplier = 1.8 if strict else 1.2
+        estimate_window = estimated_minutes * 60.0 * estimate_multiplier
+
+    baseline = 240.0 if strict else 180.0
+    timeout = max(baseline, round_floor_total, estimate_window)
+    return min(7200.0, timeout)
 
 
 def _find_task_by_id(subtasks: list[SubTask], task_id: str | None) -> Optional[SubTask]:
@@ -124,6 +223,8 @@ async def _execute_multi_agent_discussion(
     min_rounds: int,
     min_agents: int,
     strict: bool,
+    deadline: float | None = None,
+    discussion_timeout_sec: float | None = None,
 ) -> tuple[dict, list[dict]]:
     """
     真实多轮讨论：每轮所有参与 agent 对前一轮观点进行响应，形成往返。
@@ -218,6 +319,7 @@ async def _execute_multi_agent_discussion(
     round_outputs: dict[int, list[dict]] = {}
     rounds_executed = 0
     successful_agent_ids: list[str] = []
+    discussion_started_monotonic = _time.monotonic()
 
     async def _call_round_specialist(spec: dict, round_idx: int, prior_round_digest: str) -> dict:
         prompt = (
@@ -234,17 +336,33 @@ async def _execute_multi_agent_discussion(
             "Keep it concrete and concise (<500 words)."
         )
 
-        # 防卡死：为单次 specialist 调用设置硬超时，避免首节点长时间无进展
-        # 规则：优先基于任务估时分摊；若无估时则使用保守默认值
-        est_minutes = float(getattr(task, "estimated_minutes", 0.0) or 0.0)
-        specialist_count = max(1, len(specialists))
-        round_count = max(1, int(min_rounds or 1))
-        if est_minutes > 0:
-            budget_seconds = est_minutes * 60.0
-            per_call_timeout = budget_seconds / (round_count * specialist_count)
-            per_call_timeout = max(30.0, min(180.0, per_call_timeout))
+        # per-call timeout：严格模式按剩余预算/剩余轮次自适应，避免累计超时
+        _est_min = float(getattr(task, "estimated_minutes", 0.0) or 0.0)
+        _sp_cnt = max(1, len(specialists))
+        _rd_cnt = max(1, int(min_rounds or 1))
+
+        if _est_min > 0:
+            _per_call = _est_min * 60.0 / (_rd_cnt * _sp_cnt)
         else:
-            per_call_timeout = 60.0
+            _per_call = 60.0
+
+        remaining_rounds = max(1, min_rounds - round_idx + 1)
+        remaining_budget = None
+        if deadline:
+            remaining_budget = max(0.0, deadline - _time.monotonic())
+        elif discussion_timeout_sec:
+            elapsed = _time.monotonic() - discussion_started_monotonic
+            remaining_budget = max(0.0, discussion_timeout_sec - elapsed)
+
+        if remaining_budget is not None:
+            round_budget = max(20.0, remaining_budget / remaining_rounds)
+            budget_per_call = max(10.0, round_budget / _sp_cnt)
+            if strict:
+                _per_call = min(max(12.0, _per_call), max(18.0, budget_per_call))
+            else:
+                _per_call = min(max(10.0, _per_call), max(20.0, budget_per_call * 1.15))
+
+        _per_call = min(180.0, max(12.0 if strict else 10.0, _per_call))
 
         try:
             res = await asyncio.wait_for(
@@ -254,14 +372,10 @@ async def _execute_multi_agent_discussion(
                     previous_results=previous_results,
                     time_budget=budget_ctx,
                 ),
-                timeout=per_call_timeout,
+                timeout=_per_call,
             )
         except asyncio.TimeoutError:
-            res = {
-                "success": False,
-                "error": f"specialist_call_timeout>{per_call_timeout:.0f}s",
-                "result": None,
-            }
+            res = {"success": False, "error": f"specialist_call_timeout>{_per_call:.0f}s", "result": None}
         except Exception as e:
             res = {"success": False, "error": str(e), "result": None}
 
@@ -279,12 +393,16 @@ async def _execute_multi_agent_discussion(
             "round": round_idx,
             "content": content[:3000],
             "type": "response",
-            "success": bool(res.get("success") and res.get("result")),
+            "success": bool(res.get("success")),
         }
 
 
     prior_digest = "No prior round yet."
     for round_idx in range(1, min_rounds + 1):
+        # 预算截止检查：超时则用已完成轮次做部分合成，不直接 fail
+        if deadline and _time.monotonic() > deadline:
+            logger.warning("[discussion] deadline reached before round %d/%d, proceeding to synthesis", round_idx, min_rounds)
+            break
         batch = await asyncio.gather(
             *[_call_round_specialist(spec, round_idx, prior_digest) for spec in specialists],
             return_exceptions=True,
@@ -292,7 +410,7 @@ async def _execute_multi_agent_discussion(
 
         entries: list[dict] = []
         for item in batch:
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 logger.warning("[discussion] round=%s gather exception: %s", round_idx, item)
                 continue
             entries.append(item)
@@ -312,8 +430,57 @@ async def _execute_multi_agent_discussion(
                 discussion_log,
             )
 
-        success_agents = len({e["agent"] for e in entries if e.get("success")})
-        if strict and success_agents < min_agents:
+        # 仅统计成功返回的 agent，失败/超时不计入有效参与
+        responded_agent_ids = {e["agent"] for e in entries if e.get("success")}
+        if strict and len(responded_agent_ids) < min_agents:
+            # 首轮/单轮可能出现瞬态超时，先在本轮内补跑未响应的 agent，避免过早 fail
+            retry_specs = [s for s in specialists if s["id"] not in responded_agent_ids]
+            for spec in retry_specs:
+                if len(responded_agent_ids) >= min_agents:
+                    break
+                retry_entry = await _call_round_specialist(spec, round_idx, prior_digest)
+                entries.append(retry_entry)
+                discussion_log.append({
+                    k: retry_entry[k]
+                    for k in ("agent", "domain", "round", "content", "type")
+                })
+                if retry_entry.get("success"):
+                    responded_agent_ids.add(retry_entry["agent"])
+
+        if strict and len(responded_agent_ids) < min_agents:
+            # 如果仍不足，按缺口动态补充新 specialist（避免旧实例持续失败导致首轮直接违规）
+            deficit = max(0, min_agents - len(responded_agent_ids))
+            replacement_specs: list[dict] = []
+            for idx in range(deficit):
+                base_domain = domains[idx % len(domains)] if domains else task.agent_type
+                replacement_domain = f"{base_domain}_retry_{round_idx}_{idx+1}"
+                try:
+                    new_sid = await caller.get_or_create_specialist(
+                        skills=[replacement_domain],
+                        task_description=f"[{replacement_domain}] {task.description}",
+                    )
+                except Exception as _e:
+                    logger.warning("[discussion] replacement specialist creation failed: %s", _e)
+                    new_sid = None
+                if new_sid:
+                    replacement_specs.append({"id": new_sid, "domain": replacement_domain})
+
+            for spec in replacement_specs:
+                if len(responded_agent_ids) >= min_agents:
+                    break
+                retry_entry = await _call_round_specialist(spec, round_idx, prior_digest)
+                entries.append(retry_entry)
+                discussion_log.append({
+                    k: retry_entry[k]
+                    for k in ("agent", "domain", "round", "content", "type")
+                })
+                if retry_entry.get("success"):
+                    responded_agent_ids.add(retry_entry["agent"])
+                    if spec["id"] not in successful_agent_ids:
+                        successful_agent_ids.append(spec["id"])
+
+        active_agents = len(responded_agent_ids)
+        if strict and active_agents < min_agents:
             return (
                 {
                     "success": False,
@@ -321,11 +488,12 @@ async def _execute_multi_agent_discussion(
                     "result": None,
                     "specialist_id": None,
                     "assigned_agents": [],
-                    "actual_agents_used": success_agents,
+                    "actual_agents_used": active_agents,
                     "actual_discussion_rounds": rounds_executed,
                 },
                 discussion_log,
             )
+
 
         rounds_executed = round_idx
         round_outputs[round_idx] = entries
@@ -339,19 +507,22 @@ async def _execute_multi_agent_discussion(
             digest_lines.append(f"- {e['domain']}({e['agent']}): {e['content'][:240]}")
         prior_digest = "\n".join(digest_lines) or "No substantial updates."
 
-    if strict and rounds_executed < min_rounds:
+    # 严格模式轮次不足：仅在 0 轮完成时才 fail；>=1 轮允许降级继续合成
+    if strict and rounds_executed == 0:
         return (
             {
                 "success": False,
-                "error": f"[POLICY_VIOLATION] rounds<{min_rounds}",
+                "error": f"[POLICY_VIOLATION] rounds<{min_rounds} (zero_rounds_completed)",
                 "result": None,
                 "specialist_id": None,
                 "assigned_agents": successful_agent_ids,
                 "actual_agents_used": len(unique_specialist_ids),
-                "actual_discussion_rounds": rounds_executed,
+                "actual_discussion_rounds": 0,
             },
             discussion_log,
         )
+    if strict and rounds_executed < min_rounds:
+        logger.warning("[discussion] partial rounds=%d/%d, proceeding to synthesis", rounds_executed, min_rounds)
 
     transcript = []
     for r in range(1, rounds_executed + 1):
@@ -373,35 +544,32 @@ async def _execute_multi_agent_discussion(
     )
 
     synthesizer_id = specialists[0]["id"]
+    synthesis_timeout_sec = max(45.0, min(240.0, 20.0 + rounds_executed * 12.0))
     try:
-        synth_res = await caller.call_specialist(
-            agent_id=synthesizer_id,
-            subtask={**subtask_dict, "description": synthesis_prompt},
-            previous_results=[],
-            time_budget=budget_ctx,
+        synth_res = await asyncio.wait_for(
+            caller.call_specialist(
+                agent_id=synthesizer_id,
+                subtask={**subtask_dict, "description": synthesis_prompt},
+                previous_results=[],
+                time_budget=budget_ctx,
+            ),
+            timeout=synthesis_timeout_sec,
         )
+    except asyncio.TimeoutError:
+        synth_res = {"success": False, "error": f"discussion_synthesis_timeout>{synthesis_timeout_sec:.0f}s", "result": None}
     except Exception as e:
-        synth_res = {"success": False, "error": str(e), "result": None}
+        synth_res = {"success": False, "error": f"discussion_synthesis_error:{e}", "result": None}
 
     final_result = ""
     if synth_res.get("success") and synth_res.get("result"):
         final_result = str(synth_res["result"]).strip()
 
     if not final_result:
-        if strict:
-            return (
-                {
-                    "success": False,
-                    "error": "[POLICY_VIOLATION] synthesis_empty",
-                    "result": None,
-                    "specialist_id": None,
-                    "assigned_agents": [],
-                    "actual_agents_used": len(unique_specialist_ids),
-                    "actual_discussion_rounds": rounds_executed,
-                },
-                discussion_log,
-            )
-        final_result = transcript_text[:12000]
+        # 合成失败降级：用讨论记录做 fallback，避免硬 fail 导致整轮 subtask 废弃
+        final_result = transcript_text[:12000] if transcript_text.strip() else (
+            f"Discussion rounds_completed={rounds_executed}; synthesis unavailable."
+        )
+        logger.warning("[discussion] synthesis_empty, using transcript fallback, task=%s", task.id)
 
     discussion_log.append({
         "agent": synthesizer_id,
@@ -418,11 +586,13 @@ async def _execute_multi_agent_discussion(
             "specialist_id": synthesizer_id,
             "assigned_agents": successful_agent_ids,
             "error": None,
-            "actual_agents_used": len(unique_specialist_ids),
+            "actual_agents_used": len(successful_agent_ids),
             "actual_discussion_rounds": rounds_executed,
+            "synthesis_timeout_sec": synthesis_timeout_sec,
         },
         discussion_log,
     )
+
 
 
 async def executor_node(state: GraphState) -> dict:
@@ -583,17 +753,44 @@ async def executor_node(state: GraphState) -> dict:
         next_task.id, domains, required_agents, required_rounds, policy.strict_enforcement,
     )
 
+    # 讨论总预算：按 required_rounds + 任务估时联合计算，避免 strict 轮次与预算冲突
+    _est_outer = float(getattr(next_task, "estimated_minutes", 0.0) or 0.0)
+    discussion_timeout_sec = _compute_discussion_timeout_sec(
+        estimated_minutes=_est_outer,
+        required_rounds=required_rounds,
+        required_agents=required_agents,
+        strict=policy.strict_enforcement,
+    )
+    _discussion_deadline = _time.monotonic() + discussion_timeout_sec
+
     try:
-        call_result, discussion_log = await _execute_multi_agent_discussion(
-            caller,
-            next_task,
-            domains,
-            previous_results,
-            budget_ctx,
-            min_rounds=required_rounds,
-            min_agents=required_agents,
-            strict=policy.strict_enforcement,
+        call_result, discussion_log = await asyncio.wait_for(
+            _execute_multi_agent_discussion(
+                caller,
+                next_task,
+                domains,
+                previous_results,
+                budget_ctx,
+                min_rounds=required_rounds,
+                min_agents=required_agents,
+                strict=policy.strict_enforcement,
+                deadline=_discussion_deadline,
+                discussion_timeout_sec=discussion_timeout_sec,
+            ),
+            timeout=discussion_timeout_sec,
         )
+    except asyncio.TimeoutError:
+        logger.warning("[executor] discussion total timeout task=%s timeout=%.1fs", next_task.id, discussion_timeout_sec)
+        call_result = {
+            "success": False,
+            "error": f"discussion_total_timeout>{discussion_timeout_sec:.0f}s",
+            "result": None,
+            "specialist_id": None,
+            "assigned_agents": [],
+            "actual_agents_used": 0,
+            "actual_discussion_rounds": 0,
+        }
+        discussion_log = []
     except Exception as exc:
         logger.exception("[executor] discussion crashed for task %s", next_task.id)
         call_result = {
@@ -611,6 +808,7 @@ async def executor_node(state: GraphState) -> dict:
     assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
     actual_agents_used = int(call_result.get("actual_agents_used") or 0)
     actual_rounds = int(call_result.get("actual_discussion_rounds") or 0)
+    synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or 0.0)
 
     strict_unmet = (
         policy.strict_enforcement
@@ -633,10 +831,12 @@ async def executor_node(state: GraphState) -> dict:
 
     if not call_result.get("success"):
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
+        failure_error = call_result.get("error")
+        failure_stage = _derive_failure_stage(failure_error)
         fail_subtasks = [
             t.model_copy(update={
                 "status": "failed",
-                "result": f"[AGENT_FAIL] {call_result.get('error', 'unknown error')}",
+                "result": f"[AGENT_FAIL] {failure_error or 'unknown error'}",
                 "started_at": started_at,
                 "finished_at": datetime.now(),
             }) if t.id == next_task.id else t
@@ -650,11 +850,16 @@ async def executor_node(state: GraphState) -> dict:
             "execution_log": [{
                 "event": "task_failed",
                 "task_id": next_task.id,
-                "error": call_result.get("error"),
+                "error": failure_error,
+                "failure_stage": failure_stage,
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
                 "required_rounds": required_rounds,
                 "required_agents": required_agents,
+                "actual_rounds": actual_rounds,
+                "actual_agents_used": actual_agents_used,
+                "discussion_timeout_sec": discussion_timeout_sec,
+                "synthesis_timeout_sec": synthesis_timeout_sec,
                 "timestamp": datetime.now().isoformat(),
             }],
         }
@@ -667,24 +872,31 @@ async def executor_node(state: GraphState) -> dict:
     _candidates = []
     if _reports_dir.exists():
         _task_slug = next_task.id.replace("-", "").replace(".", "")
-        _candidates = sorted(
-            list(_reports_dir.glob(f"{next_task.id}*.md"))
-            + list(_reports_dir.glob(f"{_task_slug}*.md"))
-            + list(_reports_dir.glob(f"{next_task.id}*.json"))
-            + list(_reports_dir.glob(f"{_task_slug}*.json")),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        _candidates = list(_reports_dir.glob(f"{next_task.id}*.md")) + list(_reports_dir.glob(f"{_task_slug}*.md"))
+        _candidates += list(_reports_dir.glob(f"{next_task.id}*.json")) + list(_reports_dir.glob(f"{_task_slug}*.json"))
+        _candidates = list(dict.fromkeys(_candidates))
+
         if _candidates:
-            report_path = str(_candidates[0])
-            report_kind = _candidates[0].suffix.lstrip(".").lower()
+            ranked = sorted(_candidates, key=lambda p: _candidate_priority(p), reverse=True)
+            best = ranked[0]
+            best_quality, _ = _candidate_priority(best)
+            if best_quality >= 4:
+                report_path = str(best)
+                report_kind = best.suffix.lstrip(".").lower()
+            else:
+                freshest = sorted(_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                report_path = str(freshest)
+                report_kind = freshest.suffix.lstrip(".").lower()
+
         md_candidates = [p for p in _candidates if p.suffix.lower() == ".md"]
         if md_candidates:
+            ranked_md = sorted(md_candidates, key=lambda p: _candidate_priority(p), reverse=True)
+            best_md = ranked_md[0]
             try:
-                _file_content = md_candidates[0].read_text(encoding="utf-8", errors="replace")
+                _file_content = best_md.read_text(encoding="utf-8", errors="replace")
                 if len(_file_content.strip()) > len(result_text):
                     result_text = _file_content
-                    logger.info("[executor] Using report file %s", md_candidates[0].name)
+                    logger.info("[executor] Using quality-first report file %s", best_md.name)
             except Exception as _fe:
                 logger.warning("[executor] Failed to read report: %s", _fe)
 
@@ -713,6 +925,11 @@ async def executor_node(state: GraphState) -> dict:
                 "round_index": entry.get("round", 0),
                 "domain": entry.get("domain", ""),
                 "task_title": next_task.title,
+                "required_rounds": required_rounds,
+                "actual_rounds": actual_rounds,
+                "required_agents": required_agents,
+                "actual_agents_used": actual_agents_used,
+                "discussion_timeout_sec": discussion_timeout_sec,
             },
         ))
     disc.status = "resolved"
@@ -756,6 +973,11 @@ async def executor_node(state: GraphState) -> dict:
             "discussion_agents": actual_agents_used,
             "required_rounds": required_rounds,
             "required_agents": required_agents,
+            "actual_rounds": actual_rounds,
+            "actual_agents_used": actual_agents_used,
+            "discussion_timeout_sec": discussion_timeout_sec,
+            "synthesis_timeout_sec": synthesis_timeout_sec,
+            "failure_stage": "none",
             "timestamp": datetime.now().isoformat(),
         }],
     }

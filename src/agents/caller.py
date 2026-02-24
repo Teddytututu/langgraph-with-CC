@@ -218,6 +218,9 @@ class SubagentCaller:
             "仅执行系统自检、缺陷定位、bug 修复与修复验证，禁止新增功能或需求外扩展。\n"
             "优先使用 Python 生态执行实现、测试、脚本与验证。\n"
             "每个 major task 完成时必须输出终端摘要，并落盘 reports/{subtask_id}.md 与 reports/{subtask_id}.json。\n"
+            "Markdown 报告必须包含 Reproduction Commands、Verification Commands & Results、Evidence Anchors (keyword/command/path)。\n"
+            "复现与验证必须提供可直接执行命令及对应结果，不能只写条件描述。\n"
+            "证据锚点必须使用关键词/检索命令/文件路径，禁止仅依赖固定行号。\n"
             f"任务上下文：{task_description[:200]}"
         )
 

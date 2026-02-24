@@ -1,5 +1,6 @@
 """src/graph/nodes/reviewer.py — 质量审查节点"""
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -19,6 +20,7 @@ _FAKE_PATTERNS = [
     "placeholder",
 ]
 _MIN_RESULT_LEN = 50   # 结果少于 50 字符认为空白
+_FAST_PASS_MIN_LEN = 300
 
 
 async def reviewer_node(state: GraphState) -> dict:
@@ -50,10 +52,11 @@ async def reviewer_node(state: GraphState) -> dict:
     # 本地快速验证：先做本地检查，通过且内容充分则直接 PASS，无需调用 subagent
     local_issues = _validate_result_locally(current)
     result_len = len((current.result or "").strip())
+    reproducible_locally = _has_local_reproducibility_structure(current.result or "")
 
-    if not local_issues and result_len >= 300:
-        # 内容充分、本地验证通过 → 直接 PASS，跳过 subagent reviewer（避免误判）
-        logger.info("[reviewer] 本地快速通过 %s（%d 字符，无问题）", current.id, result_len)
+    if not local_issues and result_len >= _FAST_PASS_MIN_LEN and reproducible_locally:
+        # 内容充分、本地验证通过且可复核结构齐备 → 直接 PASS，跳过 subagent reviewer（避免误判）
+        logger.info("[reviewer] 本地快速通过 %s（%d 字符，结构完整）", current.id, result_len)
         review = {"verdict": "PASS", "score": 8, "issues": [], "suggestions": []}
     else:
         # 内容不足或本地发现问题 → 调用 reviewer subagent 深度审查
@@ -145,11 +148,59 @@ def _validate_result_locally(task: SubTask) -> list[str]:
             issues.append(f"结果包含伪造模式：'{pat}'，需要重新执行")
             break
 
-    # 3. 验收标准检查（交由 subagent 摈判） — 此处仅做基础模式检测
+    # 3. 验收标准检查（交由 subagent 评判） — 此处仅做基础模式检测
     if not result or result.strip() == f"任务 {task.title} 执行完成":
         issues.append("结果是默认占位符，实际未执行")
 
+    # 4. 可执行复现入口：至少一个命令代码块
+    if not re.search(r"```(?:bash|sh|shell|zsh|cmd|powershell)?\n[\s\S]*?```", result, re.IGNORECASE):
+        issues.append("缺少可执行命令块（Reproduction/Verification 命令不可复现）")
+
+    # 5. 复现步骤 + 预期/实际结果成对出现
+    has_steps = bool(re.search(r"\b(步骤|step\s*\d+|repro(duction)?\s+steps?)\b", result, re.IGNORECASE))
+    has_expected_actual = bool(re.search(r"\b(预期|expected)\b", result, re.IGNORECASE)) and bool(
+        re.search(r"\b(实际|actual)\b", result, re.IGNORECASE)
+    )
+    if not (has_steps and has_expected_actual):
+        issues.append("缺少“复现步骤 + 预期/实际结果”配对描述")
+
+    # 6. 稳定证据锚点（关键词/检索命令/路径），禁止仅固定行号
+    if not _has_stable_evidence_anchor(result):
+        issues.append("证据锚点不稳定：需要关键词/检索命令/路径，不能仅依赖固定行号")
+
     return issues
+
+
+def _has_local_reproducibility_structure(result: str) -> bool:
+    """快速判定是否具备最小可复核结构（供 fast-pass 使用）。"""
+    if not result or len(result.strip()) < _MIN_RESULT_LEN:
+        return False
+
+    has_exec_block = bool(re.search(r"```(?:bash|sh|shell|zsh|cmd|powershell)?\n[\s\S]*?```", result, re.IGNORECASE))
+    has_step_or_pair = (
+        bool(re.search(r"\b(步骤|step\s*\d+|repro(duction)?\s+steps?)\b", result, re.IGNORECASE))
+        and bool(re.search(r"\b(预期|expected|实际|actual|结果|result)\b", result, re.IGNORECASE))
+    )
+    has_stable_anchor = _has_stable_evidence_anchor(result)
+
+    return has_exec_block and has_step_or_pair and has_stable_anchor
+
+
+def _has_stable_evidence_anchor(result: str) -> bool:
+    """检查是否存在稳定证据锚点：关键词 / 检索命令 / 文件路径。"""
+    lower = result.lower()
+    has_keyword_anchor = any(k in lower for k in ["keyword", "关键词", "anchor"])
+    has_search_cmd = bool(re.search(r"\b(grep|rg|findstr|ripgrep|python\s+-c)\b", lower))
+    has_path_anchor = bool(re.search(r"(?:^|\s)(?:[A-Za-z]:/|/)?[\w./-]+\.[a-z0-9]+", result))
+
+    # 若仅含行号锚点且无关键词/命令/路径，不算稳定
+    only_line_anchor = bool(re.search(r"\bline\s*\d+\b|\bL\d+\b|:\d+\b", result, re.IGNORECASE)) and not (
+        has_keyword_anchor or has_search_cmd or has_path_anchor
+    )
+    if only_line_anchor:
+        return False
+
+    return has_keyword_anchor or has_search_cmd or has_path_anchor
 
 
 def _parse_review_result(call_result: dict) -> dict:

@@ -269,12 +269,15 @@ async def planner_node(state: GraphState) -> dict:
             ok, reason = _validate_subtasks(subtasks, policy)
             if not ok and policy.strict_enforcement:
                 import logging as _logging
-                fallback_reason = f"planner_subagent_validation_failed:{reason}"
+                fallback_reason = f"planner_output_invalid:{reason}"
                 _logging.getLogger(__name__).warning(
                     "[planner] strict validation failed after subagent output (%s), fallback to local template",
                     reason,
                 )
                 subtasks = []
+
+    if not subtasks and planner_call_error and not fallback_reason:
+        fallback_reason = "planner_call_failure_fallback"
 
     # 如果 subagent 未返回有效结果，生成严格模式可通过的 12 节点 DAG（并行+汇聚+验证闭环）
     # 预算控制：单节点默认 4~8 分钟，避免轮询超时
