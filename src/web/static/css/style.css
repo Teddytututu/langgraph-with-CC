@@ -62,6 +62,7 @@ body {
     min-height: 100vh;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
 }
 
 /* ========== 装饰背景 ========== */
@@ -351,6 +352,13 @@ body {
     margin: 0 auto;
     min-height: calc(100vh - 56px);
     align-items: start;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* 防止 grid 子项因内容最小宽度撑破布局并触发页面向右漂移 */
+.layout > * {
+    min-width: 0;
 }
 
 /* ========== 卡片 ========== */
@@ -519,7 +527,7 @@ body {
 
 .past-output-list {
     min-height: auto;
-    max-height: 280px;
+    max-height: 260px;
     overflow-y: auto;
 }
 
@@ -542,64 +550,59 @@ body {
 .task-list::-webkit-scrollbar-thumb { background: var(--bg-muted); border-radius: 3px; }
 
 .task-item {
-    padding: 14px;
+    padding: 12px 13px;
     background: var(--bg-elevated);
-    border: 1px solid transparent;
+    border: 1px solid var(--border);
     border-radius: var(--r-md);
     cursor: pointer;
     transition: all 0.2s var(--ease);
     position: relative;
 }
 
-.task-item::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 3px;
-    height: 0;
-    background: var(--gradient);
-    border-radius: 2px;
-    transition: height 0.2s var(--ease);
-}
-
-/* 任务项右下角装饰 */
-.task-item::after {
-    content: '';
-    position: absolute;
-    bottom: 8px;
-    right: 12px;
-    width: 6px;
-    height: 6px;
-    border: 1px solid var(--border-2);
-    border-radius: 50%;
-    opacity: 0;
-    transition: opacity 0.2s;
-}
-
-.task-item:hover::after {
-    opacity: 1;
-}
-
-.task-item:hover {
-    background: var(--bg-surface);
-    border-color: var(--border);
-    box-shadow: var(--shadow-sm);
-}
-
-.task-item.active {
-    background: var(--violet-bg);
-    border-color: #DDD6FE;
-}
-
-.task-item.active::before { height: 60%; }
-
+.task-item-header,
 .task-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 6px;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.task-item::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 8px;
+    bottom: 8px;
+    width: 3px;
+    background: var(--gradient);
+    border-radius: 2px;
+    opacity: 0;
+    transform: scaleY(0.4);
+    transform-origin: center;
+    transition: opacity 0.2s var(--ease), transform 0.2s var(--ease);
+}
+
+/* 任务项右下角装饰 */
+.task-item::after {
+    content: none;
+}
+
+.task-item:hover {
+    background: var(--bg-surface);
+    border-color: var(--border-2);
+    box-shadow: var(--shadow-sm);
+}
+
+.task-item.active {
+    background: #f3f0ff;
+    border-color: #c4b5fd;
+    box-shadow: 0 1px 0 rgba(124,58,237,0.08), 0 6px 14px rgba(124,58,237,0.08);
+}
+
+.task-item.active::before {
+    opacity: 1;
+    transform: scaleY(1);
 }
 
 .task-status {
@@ -611,27 +614,26 @@ body {
     color: var(--text-3);
     text-transform: uppercase;
     letter-spacing: 0.04em;
+    line-height: 1.2;
 }
 
-.task-status.running { background: var(--warning-bg); color: #92400E; }
-.task-status.completed { background: var(--success-bg); color: #065F46; }
-.task-status.failed { background: var(--error-bg); color: #991B1B; }
-
 .task-meta {
-    font-size: 0.625rem;
+    font-size: 0.7rem;
     color: var(--text-4);
     font-variant-numeric: tabular-nums;
+    line-height: 1.2;
 }
 
 .task-desc {
-    font-size: 0.875rem;
+    font-size: 0.82rem;
     color: var(--text-2);
-    line-height: 1.5;
+    line-height: 1.45;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     word-break: break-word;
-    display: block;
-    max-height: calc(1.5em * 2);
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
     overflow: hidden;
 }
 
@@ -662,9 +664,9 @@ body {
 }
 
 .task-item.active .task-desc {
-    -webkit-line-clamp: unset;
-    overflow: visible;
-    display: block;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+    display: -webkit-box;
 }
 
 /* ========== 按钮 ========== */
@@ -789,6 +791,7 @@ body {
     line-height: 1.75;
     white-space: pre-wrap;
     word-break: break-word;
+    overflow-wrap: anywhere;
     margin: 0 0 10px;
 }
 
@@ -823,12 +826,12 @@ body {
 .task-detail-desc.markdown h6 { font-size: 0.95rem; }
 
 .task-detail-desc.markdown p {
-    margin: 0 0 8px;
+    margin: 0 0 10px;
 }
 
 .task-detail-desc.markdown ul,
 .task-detail-desc.markdown ol {
-    margin: 0 0 8px 18px;
+    margin: 0 0 10px 20px;
     padding: 0;
 }
 
@@ -846,7 +849,7 @@ body {
 }
 
 .task-detail-desc.markdown pre {
-    margin: 8px 0;
+    margin: 10px 0;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
@@ -861,8 +864,8 @@ body {
 }
 
 .task-detail-desc.markdown blockquote {
-    margin: 8px 0;
-    padding: 4px 10px;
+    margin: 10px 0;
+    padding: 5px 10px;
     border-left: 3px solid var(--violet-light);
     color: var(--text-3);
 }
@@ -1628,7 +1631,22 @@ body {
     opacity: 0.3;
 }
 
+.composer-targets {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.composer-target-label {
+    font-size: 0.75rem;
+    color: var(--text-3);
+}
+
 .composer-select {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
     padding: 8px 12px;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
@@ -1636,6 +1654,13 @@ body {
     font-size: 0.75rem;
     color: var(--text-1);
     cursor: pointer;
+}
+
+.composer-targets .status-chip {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .composer-row { display: flex; gap: 10px; }

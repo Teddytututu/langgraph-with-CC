@@ -582,10 +582,16 @@
                         </div>
                         <div class="composer">
                             <div class="composer-targets" v-if="selectedSubtask?.assigned_agents?.length">
-                                <span class="status-chip">to: {{ selectedSubtask.assigned_agents.join(', ') }}</span>
+                                <label for="discussion-target" class="composer-target-label">Target</label>
+                                <select id="discussion-target" class="composer-select" v-model="discussionTarget">
+                                    <option v-for="opt in discussionTargetOptions" :key="opt.value" :value="opt.value">
+                                        {{ opt.label }}
+                                    </option>
+                                </select>
+                                <span class="status-chip" v-if="lastDiscussionTargetLabel">sent to: {{ lastDiscussionTargetLabel }}</span>
                             </div>
                             <div class="composer-row">
-                                <input v-model="newMessage.content" @keyup.enter="sendMessage" placeholder="Message to all assigned agents..." class="composer-input">
+                                <input v-model="newMessage.content" @keyup.enter="sendMessage" placeholder="Message to selected assigned agent(s)..." class="composer-input">
                                 <button class="composer-btn" @click="sendMessage">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                                         <line x1="22" y1="2" x2="11" y2="13"/>
