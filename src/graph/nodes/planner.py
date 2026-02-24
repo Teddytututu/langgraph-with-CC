@@ -234,6 +234,8 @@ async def planner_node(state: GraphState) -> dict:
     planner_task = user_task + _policy_prompt(policy)
 
     # 直接调用 planner subagent（最多等 120s）
+    planner_call_error = ""
+    fallback_reason = ""
     try:
         call_result = await asyncio.wait_for(
             caller.call_planner(task=planner_task, time_budget=time_budget_info),
@@ -241,30 +243,21 @@ async def planner_node(state: GraphState) -> dict:
         )
     except asyncio.TimeoutError:
         import logging as _logging
-        _logging.getLogger(__name__).warning("[planner] SDK call timed out (120s)")
-        if policy.strict_enforcement:
-            raise RuntimeError("[POLICY_VIOLATION] planner_timeout_under_strict_mode")
-        call_result = {"success": False, "error": "planner SDK timeout"}
+        planner_call_error = "planner_call_failed: planner SDK timeout"
+        _logging.getLogger(__name__).warning("[planner] %s", planner_call_error)
+        call_result = {"success": False, "error": planner_call_error}
     except Exception as _pe:
         import logging as _logging
-        _logging.getLogger(__name__).warning("[planner] SDK call failed: %s", _pe)
-        if policy.strict_enforcement:
-            raise RuntimeError(f"[POLICY_VIOLATION] planner_error_under_strict_mode: {_pe}")
-        call_result = {"success": False, "error": str(_pe)}
+        planner_call_error = f"planner_call_failed: {_pe}"
+        _logging.getLogger(__name__).warning("[planner] %s", planner_call_error)
+        call_result = {"success": False, "error": planner_call_error}
 
-    # 非严格模式保留原有降级逻辑
-    if not call_result.get("success") and not policy.strict_enforcement:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "[planner] subagent 调用失败，启用默认四阶段子任务: %s",
-            call_result.get('error')
-        )
-        call_result = {"success": True, "result": None}
-    elif not call_result.get("success") and policy.strict_enforcement:
-        raise RuntimeError(f"[POLICY_VIOLATION] planner_call_failed: {call_result.get('error', 'unknown')}")
+    if not call_result.get("success") and not planner_call_error:
+        planner_call_error = f"planner_call_failed: {call_result.get('error') or 'unknown_error'}"
 
-    # 解析子任务
+    # 解析子任务（subagent 调用失败时不伪装 success）
     subtasks = _parse_subtasks_from_result(call_result.get("result"), budget)
+
 
     # 严格模式下，先规范化一次
     if subtasks:
@@ -275,119 +268,181 @@ async def planner_node(state: GraphState) -> dict:
             subtasks = _normalize_domains(subtasks, max(1, policy.min_agents_per_node))
             ok, reason = _validate_subtasks(subtasks, policy)
             if not ok and policy.strict_enforcement:
-                raise RuntimeError(f"[POLICY_VIOLATION] planner_output_invalid: {reason}")
+                import logging as _logging
+                fallback_reason = f"planner_subagent_validation_failed:{reason}"
+                _logging.getLogger(__name__).warning(
+                    "[planner] strict validation failed after subagent output (%s), fallback to local template",
+                    reason,
+                )
+                subtasks = []
 
-    # 如果 subagent 未返回有效结果，生成 7 个子任务（并行+汇聚+报告）
-    # 预算: 7 任务 × ~5 min/任务 = 35 min + 10 min 开销 ≈ 45 min < 90 min poll deadline
+    # 如果 subagent 未返回有效结果，生成严格模式可通过的 12 节点 DAG（并行+汇聚+验证闭环）
+    # 预算控制：单节点默认 4~8 分钟，避免轮询超时
     if not subtasks:
         base_mins = budget.total_minutes if budget else 60
         task_preview = user_task[:200]
-        t_diag = max(7.0, base_mins * 0.10)   # 诊断类任务
-        t_fix = max(8.0, base_mins * 0.12)   # 修复类任务
-        t_rpt = max(4.0, base_mins * 0.08)   # 报告类任务
+        t_diag = max(4.0, base_mins * 0.06)
+        t_fix = max(5.0, base_mins * 0.08)
+        t_verify = max(4.0, base_mins * 0.06)
+        t_rpt = max(3.0, base_mins * 0.05)
         subtasks = [
-            # ── Phase 1: 并行诊断（菱形展开） ──
             SubTask(
                 id="task-001",
-                title="代码与流程诊断",
-                description=(
-                    f"检查代码质量、架构健康、模块耦合、API接口可用性、调度流程。\n原始任务：{task_preview}"
-                ),
+                title="静态检查与结构盘点",
+                description=f"对代码进行静态检查与模块结构盘点，限定在缺陷定位范围。原始任务：{task_preview}",
                 agent_type="analyst",
                 dependencies=[],
                 priority=1,
                 estimated_minutes=t_diag,
-                knowledge_domains=["python", "architecture", "api_testing", "workflow"],
-                completion_criteria=["列出代码缺陷与API异常", "识别高风险模块", "调度流程瓶颈定位"],
+                knowledge_domains=["python", "architecture", "debugging"],
+                completion_criteria=["输出静态问题清单", "标注高风险模块"],
             ),
             SubTask(
                 id="task-002",
-                title="运行时与讨论机制诊断",
-                description="检查 subagent 执行效率、多层超时配置、讨论机制健康度、WebSocket 稳定性。",
+                title="运行日志与异常聚类",
+                description="分析运行日志与异常类型，形成可复现问题分组。",
                 agent_type="researcher",
                 dependencies=[],
                 priority=1,
                 estimated_minutes=t_diag,
-                knowledge_domains=["performance", "monitoring", "collaboration", "networking"],
-                completion_criteria=["subagent 执行过程可观测", "讨论轮次及共识质量确认", "常见超时场景定义"],
+                knowledge_domains=["logging", "observability", "reliability"],
+                completion_criteria=["异常按类型聚类", "给出复现入口"],
             ),
-            # ── Phase 2: 汇聚分析（菱形聚合） ──
             SubTask(
                 id="task-003",
-                title="问题汇聚与修复方案",
-                description="汇总 task-001/002 的诊断结果，交叉分析根因，按严重度排序，制定具体可执行的修复方案。",
+                title="接口与状态流诊断",
+                description="检查 API 与状态机流转，定位错误传播路径。",
+                agent_type="analyst",
+                dependencies=[],
+                priority=1,
+                estimated_minutes=t_diag,
+                knowledge_domains=["api_testing", "state_machine", "workflow"],
+                completion_criteria=["识别错误链路", "输出影响范围"],
+            ),
+            SubTask(
+                id="task-004",
+                title="根因汇聚分析 A",
+                description="汇聚 task-001 与 task-002 结果，抽取共同根因。",
                 agent_type="analyst",
                 dependencies=["task-001", "task-002"],
                 priority=2,
                 estimated_minutes=t_diag,
-                knowledge_domains=["root_cause_analysis", "planning", "risk_assessment", "architecture"],
-                completion_criteria=["问题按 P0/P1/P2 分级", "每个问题有具体修复方案", "修复风险评估完成"],
-            ),
-            # ── Phase 3: 修复实施（并行分支） ──
-            SubTask(
-                id="task-004",
-                title="P0/P1 缺陷修复实施",
-                description="根据 task-003 方案修复 P0、P1 级代码缺陷和配置问题，每个改动配套单元测试。",
-                agent_type="coder",
-                dependencies=["task-003"],
-                priority=3,
-                estimated_minutes=t_fix,
-                knowledge_domains=["python", "debugging", "testing", "api_design"],
-                completion_criteria=["P0 缺陷全部修复", "P1 主要缺陷修复", "修复代码有测试覆盖"],
+                knowledge_domains=["root_cause_analysis", "architecture", "testing"],
+                completion_criteria=["形成根因假设 A", "列出证据链"],
             ),
             SubTask(
                 id="task-005",
-                title="并行修复分支：稳定性与性能",
-                description="基于 task-003 的问题清单并行修复稳定性与性能相关问题，形成与 task-004 并行分支。",
-                agent_type="coder",
-                dependencies=["task-003"],
-                priority=3,
-                estimated_minutes=t_fix,
-                knowledge_domains=["performance", "stability", "profiling", "python"],
-                completion_criteria=["关键性能问题已修复", "稳定性缺陷已修复", "修复内容可验证"],
+                title="根因汇聚分析 B",
+                description="汇聚 task-002 与 task-003 结果，抽取共同根因。",
+                agent_type="analyst",
+                dependencies=["task-002", "task-003"],
+                priority=2,
+                estimated_minutes=t_diag,
+                knowledge_domains=["root_cause_analysis", "performance", "reliability"],
+                completion_criteria=["形成根因假设 B", "列出证据链"],
             ),
-            # ── Phase 4: 验证闭环 ──
             SubTask(
                 id="task-006",
-                title="回归验证与集成测试",
-                description="对 task-004 / task-005 的修复项进行全面回归：重跑 Phase1 诊断项，确认修复生效且无新回归。",
+                title="修复方案汇总与排序",
+                description="合并根因 A/B，按风险与可验证性排序修复计划。",
                 agent_type="analyst",
                 dependencies=["task-004", "task-005"],
-                priority=4,
+                priority=3,
                 estimated_minutes=t_diag,
-                knowledge_domains=["testing", "regression", "validation", "quality_assurance"],
-                completion_criteria=["已修复项 100% 验证通过", "无新引入回归", "验证结果已记录"],
+                knowledge_domains=["planning", "risk_assessment", "maintainability"],
+                completion_criteria=["形成优先级列表", "每项有验证路径"],
             ),
-            # ── Phase 5: 报告 ──
             SubTask(
                 id="task-007",
-                title="修复前后对比报告",
-                description="生成结构化报告：诊断发现→修复方案→验证结果。保存到 reports/ 。",
-                agent_type="writer",
+                title="修复分支一：核心逻辑",
+                description="实施核心逻辑缺陷修复，控制变更范围。",
+                agent_type="coder",
                 dependencies=["task-006"],
+                priority=4,
+                estimated_minutes=t_fix,
+                knowledge_domains=["python", "debugging", "code_quality"],
+                completion_criteria=["核心缺陷修复", "变更可回溯"],
+            ),
+            SubTask(
+                id="task-008",
+                title="修复分支二：状态一致性",
+                description="实施状态一致性相关修复，避免死循环与错误分支。",
+                agent_type="coder",
+                dependencies=["task-006"],
+                priority=4,
+                estimated_minutes=t_fix,
+                knowledge_domains=["state_machine", "reliability", "python"],
+                completion_criteria=["状态流正确", "异常分支受控"],
+            ),
+            SubTask(
+                id="task-009",
+                title="修复分支三：交互链路",
+                description="实施 API/前后端交互链路缺陷修复。",
+                agent_type="coder",
+                dependencies=["task-006"],
+                priority=4,
+                estimated_minutes=t_fix,
+                knowledge_domains=["api_design", "frontend", "integration_testing"],
+                completion_criteria=["交互链路恢复", "关键接口可用"],
+            ),
+            SubTask(
+                id="task-010",
+                title="并行回归验证",
+                description="对三个修复分支做并行回归验证，确认无新增回归。",
+                agent_type="analyst",
+                dependencies=["task-007", "task-008", "task-009"],
                 priority=5,
+                estimated_minutes=t_verify,
+                knowledge_domains=["regression", "quality_assurance", "testing"],
+                completion_criteria=["回归通过", "记录失败用例"],
+            ),
+            SubTask(
+                id="task-011",
+                title="失败回路复检",
+                description="若验证失败，聚焦失败项做复检并给出最小修复建议。",
+                agent_type="analyst",
+                dependencies=["task-010"],
+                priority=6,
+                estimated_minutes=t_verify,
+                knowledge_domains=["debugging", "root_cause_analysis", "testing"],
+                completion_criteria=["失败项根因明确", "给出最小修复路径"],
+            ),
+            SubTask(
+                id="task-012",
+                title="结果汇总与证据输出",
+                description="输出终端摘要并保存 reports/*.md 与 reports/*.json 证据。",
+                agent_type="writer",
+                dependencies=["task-010", "task-011"],
+                priority=7,
                 estimated_minutes=t_rpt,
-                knowledge_domains=["documentation", "reporting", "analysis", "architecture"],
-                completion_criteria=["包含修复前后对比数据", "报告已保存到 reports/", "包含后续建议"],
+                knowledge_domains=["documentation", "reporting", "analysis"],
+                completion_criteria=["摘要完整", "报告文件已落盘"],
             ),
         ]
 
     # 最终校验：严格模式不允许静默降级
     ok, reason = _validate_subtasks(subtasks, policy)
     if not ok and policy.strict_enforcement:
-        raise RuntimeError(f"[POLICY_VIOLATION] planner_final_validation_failed: {reason}")
+        source = planner_call_error or fallback_reason or "planner_validation"
+        raise RuntimeError(f"[POLICY_VIOLATION] planner_final_validation_failed: {reason} | source={source}")
+
+    planning_meta = {
+        "event": "planning_complete",
+        "timestamp": datetime.now().isoformat(),
+        "subtask_count": len(subtasks),
+        "subagent_called": "planner",
+        "policy_strict": policy.strict_enforcement,
+        "policy_force_complex_graph": policy.force_complex_graph,
+    }
+    if planner_call_error:
+        planning_meta["planner_call_error"] = planner_call_error
+    if fallback_reason:
+        planning_meta["fallback_reason"] = fallback_reason
 
     return {
         "subtasks": subtasks,
         "phase": "budgeting",
-        "execution_log": [{
-            "event": "planning_complete",
-            "timestamp": datetime.now().isoformat(),
-            "subtask_count": len(subtasks),
-            "subagent_called": "planner",
-            "policy_strict": policy.strict_enforcement,
-            "policy_force_complex_graph": policy.force_complex_graph,
-        }],
+        "execution_log": [planning_meta],
     }
 
 

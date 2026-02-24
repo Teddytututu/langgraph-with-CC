@@ -1031,6 +1031,18 @@ createApp({
             }
         };
 
+        const extractApiErrorMessage = async (res, fallback = '') => {
+            let detail = '';
+            try {
+                const err = await res.json();
+                const d = err?.detail;
+                if (typeof d === 'string') detail = d;
+                else if (d && typeof d === 'object') detail = d.message || JSON.stringify(d);
+                if (!detail && typeof err?.message === 'string') detail = err.message;
+            } catch (_) {}
+            return detail || fallback || `HTTP ${res.status}`;
+        };
+
         const createTask = async () => {
             if (!newTask.value.task.trim()) return;
             const res = await fetch('/api/tasks', {
@@ -1039,7 +1051,8 @@ createApp({
                 body: JSON.stringify(newTask.value)
             });
             if (!res.ok) {
-                const msg = `创建任务失败: HTTP ${res.status}`;
+                const detail = await extractApiErrorMessage(res, `HTTP ${res.status}`);
+                const msg = `创建任务失败: ${detail}`;
                 termLog(`✗ ${msg}`, 'error');
                 alert(msg);
                 return;
@@ -1368,11 +1381,7 @@ createApp({
                 body: JSON.stringify({ instruction })
             });
             if (!res.ok) {
-                let msg = `Intervene failed (${res.status})`;
-                try {
-                    const err = await res.json();
-                    msg = err.detail || msg;
-                } catch (_) {}
+                const msg = await extractApiErrorMessage(res, `Intervene failed (${res.status})`);
 
                 addTimelineItem({
                     id: `intervene_rejected|${taskId}|${res.status}|${msg}`,
@@ -1413,7 +1422,8 @@ createApp({
             if (!text) return '';
             try {
                 const normalized = normalizeTaskText(text);
-                return marked.parse(escapeHtml(normalized), { breaks: true, gfm: true });
+                const safeMarkdown = escapeHtml(normalized);
+                return marked.parse(safeMarkdown, { breaks: true, gfm: true });
             } catch (e) {
                 return escapeHtml(text);
             }
@@ -1423,8 +1433,31 @@ createApp({
             if (!text) return '';
             try {
                 const normalized = normalizeTaskText(text);
-                const safe = escapeHtml(normalized);
-                return safe.replace(/\n+/g, '<br>');
+                const safeMarkdown = escapeHtml(normalized);
+                const tokens = marked.lexer(safeMarkdown, { gfm: true });
+                const lines = [];
+
+                const pushLine = (line) => {
+                    const clean = String(line || '').replace(/\s+/g, ' ').trim();
+                    if (clean) lines.push(clean);
+                };
+
+                for (const token of tokens) {
+                    if (!token) continue;
+                    if (token.type === 'heading') {
+                        pushLine(`# ${token.text || ''}`);
+                    } else if (token.type === 'list' && Array.isArray(token.items)) {
+                        for (const item of token.items) {
+                            pushLine(`- ${item?.text || ''}`);
+                        }
+                    } else if (token.type === 'paragraph') {
+                        pushLine(token.text || '');
+                    }
+                    if (lines.length >= 6) break;
+                }
+
+                const preview = lines.length ? lines.join('\n') : normalized;
+                return escapeHtml(preview).replace(/\n+/g, '<br>');
             } catch (e) {
                 return escapeHtml(text);
             }

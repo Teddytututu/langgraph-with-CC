@@ -64,6 +64,35 @@ def _log(msg: str) -> None:
     print(f"[marathon {_ts()}] {msg}", flush=True)
 
 
+def _infer_failure_category(detail: str) -> str:
+    text = (detail or "").lower()
+    if "planner_call_failed" in text:
+        return "planner_call_failed"
+    if "policy_violation" in text or "planner_final_validation_failed" in text:
+        return "planner_validation_failed"
+    if "timeout" in text:
+        return "timeout"
+    if "http" in text:
+        return "http_error"
+    return "task_failed"
+
+
+def _stderr_failure_summary(round_num: int, task_id: str | None, detail: str) -> None:
+    category = _infer_failure_category(detail)
+    summary = (detail or "").replace("\n", " ").strip()
+    if len(summary) > 280:
+        summary = summary[:280] + "..."
+    print(
+        (
+            f"[marathon {_ts()}] round={round_num} task_id={task_id or '-'} "
+            f"category={category} summary={summary or 'no_error_detail'} "
+            "(see marathon.log for full context)"
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _api(method: str, path: str, body: dict | None = None) -> dict:
     url = BASE_URL + path
     data = json.dumps(body).encode("utf-8") if body else None
@@ -432,6 +461,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
             round_verification = "task failed"
             _log(f"✗ 第 {round_num} 轮 FAILED（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  错误: {detail[:200]}")
+            _stderr_failure_summary(round_num, task_id, detail)
             results.append({
                 "round": round_num,
                 "task_id": task_id,
@@ -454,6 +484,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
                 round_fix_triggers += 1
                 round_verification = "recheck failed"
                 _log(f"  复核结论: hard failed -> {recheck_detail[:200]}")
+                _stderr_failure_summary(round_num, task_id, recheck_detail)
                 results.append({
                     "round": round_num,
                     "task_id": task_id,
