@@ -599,15 +599,12 @@ def register_routes(app: FastAPI):
 
         try:
             executor = get_executor()
-            result = await asyncio.wait_for(
-                executor.execute(
-                    agent_id="task_input_normalizer",
-                    system_prompt=system_prompt,
-                    context={"task": prompt},
-                    tools=[],
-                    max_turns=4,
-                ),
-                timeout=8,
+            result = await executor.execute(
+                agent_id="task_input_normalizer",
+                system_prompt=system_prompt,
+                context={"task": prompt},
+                tools=[],
+                max_turns=4,
             )
 
             if not result.success:
@@ -1280,21 +1277,176 @@ def register_routes(app: FastAPI):
             "reproducibility_pass": reproducibility_pass,
         }
 
-    def _build_task_export_payload(task_id: str) -> dict[str, Any]:
-        task = app_state.tasks.get(task_id, {})
-        subtasks_payload = []
-        for st in task.get("subtasks", []):
+    def _truncate_for_export(text: str, max_len: int = 300) -> str:
+        s = str(text or "").strip()
+        if len(s) <= max_len:
+            return s
+        cut = s[:max_len]
+        split_at = max(cut.rfind("\n"), cut.rfind(" "), cut.rfind("\t"))
+        if split_at >= int(max_len * 0.6):
+            cut = cut[:split_at]
+        return cut.rstrip() + "…"
+
+    def _collect_marker_hits(text: str, limit: int = 5) -> list[str]:
+        if not text:
+            return []
+
+        marker_patterns = [
+            re.compile(r"specialist_call_timeout", re.IGNORECASE),
+            re.compile(r"\btimeout\b", re.IGNORECASE),
+            re.compile(r"\bdegraded\b|\b降级\b", re.IGNORECASE),
+            re.compile(r"^\s*##\s*Round\b", re.IGNORECASE),
+            re.compile(r"\[[^\]]+failed:\s*[^\]]+\]", re.IGNORECASE),
+        ]
+
+        hits: list[str] = []
+        for line in str(text).splitlines():
+            compact = re.sub(r"\s+", " ", line).strip()
+            if not compact:
+                continue
+            if any(p.search(compact) for p in marker_patterns):
+                hits.append(compact)
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def _sanitize_export_text(text: str) -> str:
+        cleaned_lines: list[str] = []
+        for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                if cleaned_lines and cleaned_lines[-1] != "":
+                    cleaned_lines.append("")
+                continue
+            if re.match(r"^\s*##\s*Round\b", stripped, flags=re.IGNORECASE):
+                continue
+            if "[DISCUSSION]" in stripped:
+                continue
+            cleaned_lines.append(stripped)
+
+        while cleaned_lines and cleaned_lines[-1] == "":
+            cleaned_lines.pop()
+
+        return "\n".join(cleaned_lines).strip()
+
+    def _is_noisy_transcript(text: str) -> bool:
+        if not text:
+            return False
+        source = str(text)
+        timeout_hits = len(re.findall(r"specialist_call_timeout", source, flags=re.IGNORECASE))
+        round_hits = len(re.findall(r"^\s*##\s*Round\b", source, flags=re.IGNORECASE | re.MULTILINE))
+        failed_hits = len(re.findall(r"\[[^\]]+failed:\s*[^\]]+\]", source, flags=re.IGNORECASE))
+        marker_hits = timeout_hits + round_hits + failed_hits
+        return bool(round_hits >= 2 or timeout_hits >= 2 or marker_hits >= 4)
+
+    def _build_subtasks_export_payload(task: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int], list[str], int, int]:
+        subtasks_payload: list[dict[str, Any]] = []
+        status_counts = {
+            "done": 0,
+            "failed": 0,
+            "running": 0,
+            "pending": 0,
+            "other": 0,
+        }
+        all_marker_hits: list[str] = []
+        timeout_marker_count = 0
+        degraded_marker_count = 0
+
+        for st in _normalize_subtasks_for_api(task.get("subtasks") or []):
+            status = str(st.get("status") or "pending").strip().lower()
+            if status in status_counts:
+                status_counts[status] += 1
+            else:
+                status_counts["other"] += 1
+
+            raw_result = str(st.get("result") or "")
+            marker_hits = _collect_marker_hits(raw_result, limit=3)
+            has_timeout_marker = any("timeout" in hit.lower() for hit in marker_hits)
+            has_degraded_marker = any(("degraded" in hit.lower()) or ("降级" in hit) for hit in marker_hits)
+
+            timeout_marker_count += sum(1 for hit in marker_hits if "timeout" in hit.lower())
+            degraded_marker_count += sum(1 for hit in marker_hits if ("degraded" in hit.lower()) or ("降级" in hit))
+            all_marker_hits.extend(marker_hits)
+
+            sanitized_summary = _sanitize_export_text(raw_result)
             subtasks_payload.append({
                 "id": st.get("id"),
                 "title": st.get("title"),
                 "status": st.get("status"),
                 "agent_type": st.get("agent_type"),
-                "result_summary": (st.get("result") or "")[:300],
+                "has_degraded_marker": has_degraded_marker,
+                "has_timeout_marker": has_timeout_marker,
+                "marker_hits": marker_hits,
+                "result_summary": _truncate_for_export(sanitized_summary, max_len=300),
             })
 
-        result = task.get("result")
-        if not result:
-            result = task.get("error") or ""
+        dedup_hits: list[str] = []
+        for hit in all_marker_hits:
+            if hit not in dedup_hits:
+                dedup_hits.append(hit)
+
+        return subtasks_payload, status_counts, dedup_hits, timeout_marker_count, degraded_marker_count
+
+    def _select_export_result(
+        task: dict[str, Any],
+        status_counts: dict[str, int],
+        marker_hits: list[str],
+        timeout_marker_count: int,
+        degraded_marker_count: int,
+    ) -> tuple[str, bool, str]:
+        candidates = [
+            ("final_output", str(task.get("final_output") or "").strip()),
+            ("result", str(task.get("result") or "").strip()),
+            ("error", str(task.get("error") or "").strip()),
+        ]
+
+        for source, candidate in candidates:
+            if not candidate:
+                continue
+            sanitized = _sanitize_export_text(candidate)
+            if sanitized and not _is_noisy_transcript(candidate):
+                return sanitized, False, source
+
+        total_subtasks = sum(status_counts.values())
+        done_count = status_counts.get("done", 0)
+        failed_count = status_counts.get("failed", 0)
+        summary_lines = [
+            "Export result was downgraded to a structured summary because raw output looked like noisy transcript.",
+            f"- subtasks: total={total_subtasks}, done={done_count}, failed={failed_count}, running={status_counts.get('running', 0)}, pending={status_counts.get('pending', 0)}",
+            f"- marker_counts: timeout={timeout_marker_count}, degraded={degraded_marker_count}, evidence={len(marker_hits)}",
+        ]
+        if marker_hits:
+            summary_lines.append(f"- top_evidence: {marker_hits[0]}")
+        return "\n".join(summary_lines), True, "summary_fallback"
+
+    def _build_task_export_payload(task_id: str) -> dict[str, Any]:
+        task = app_state.tasks.get(task_id, {})
+
+        (
+            subtasks_payload,
+            status_counts,
+            marker_hits,
+            timeout_marker_count,
+            degraded_marker_count,
+        ) = _build_subtasks_export_payload(task)
+
+        result, result_sanitized, result_source = _select_export_result(
+            task,
+            status_counts,
+            marker_hits,
+            timeout_marker_count,
+            degraded_marker_count,
+        )
+
+        outcome_summary = {
+            "total_subtasks": sum(status_counts.values()),
+            "status_counts": status_counts,
+            "timeout_marker_count": timeout_marker_count,
+            "degraded_marker_count": degraded_marker_count,
+            "marker_count": len(marker_hits),
+            "result_sanitized": result_sanitized,
+            "result_source": result_source,
+        }
 
         return {
             "task_id": task_id,
@@ -1304,6 +1456,8 @@ def register_routes(app: FastAPI):
             "finished_at": task.get("finished_at"),
             "result": result,
             "subtasks": subtasks_payload,
+            "outcome_summary": outcome_summary,
+            "offending_evidence": marker_hits[:10],
             "reports_manifest": _collect_reports_manifest(),
             "reproducibility_summary": _build_reproducibility_summary(),
             "exported_at": datetime.now().isoformat(),
@@ -1323,8 +1477,37 @@ def register_routes(app: FastAPI):
             "## Result",
             payload.get("result", "") or "",
             "",
-            "## Subtasks",
+            "## Outcome Summary",
         ]
+
+        outcome_summary = payload.get("outcome_summary", {}) or {}
+        status_counts = outcome_summary.get("status_counts", {}) or {}
+        lines.append(f"- total_subtasks: {outcome_summary.get('total_subtasks', 0)}")
+        lines.append(
+            "- status_counts: "
+            f"done={status_counts.get('done', 0)}, "
+            f"failed={status_counts.get('failed', 0)}, "
+            f"running={status_counts.get('running', 0)}, "
+            f"pending={status_counts.get('pending', 0)}, "
+            f"other={status_counts.get('other', 0)}"
+        )
+        lines.append(f"- marker_count: {outcome_summary.get('marker_count', 0)}")
+        lines.append(f"- timeout_marker_count: {outcome_summary.get('timeout_marker_count', 0)}")
+        lines.append(f"- degraded_marker_count: {outcome_summary.get('degraded_marker_count', 0)}")
+        lines.append(f"- result_sanitized: {bool(outcome_summary.get('result_sanitized', False))}")
+        lines.append(f"- result_source: {outcome_summary.get('result_source', '')}")
+
+        lines.append("")
+        lines.append("## Offending Evidence (Top N)")
+        evidence = payload.get("offending_evidence", []) or []
+        if not evidence:
+            lines.append("- (none)")
+        else:
+            for hit in evidence[:10]:
+                lines.append(f"- {_truncate_for_export(str(hit), max_len=240)}")
+
+        lines.append("")
+        lines.append("## Subtasks")
 
         subtasks = payload.get("subtasks", []) or []
         if not subtasks:
@@ -1334,6 +1517,14 @@ def register_routes(app: FastAPI):
                 lines.append(
                     f"- {st.get('id', '')} | {st.get('title', '')} | {st.get('status', '')} | {st.get('agent_type', '')}"
                 )
+                lines.append(
+                    "  - markers: "
+                    f"timeout={bool(st.get('has_timeout_marker', False))}, "
+                    f"degraded={bool(st.get('has_degraded_marker', False))}"
+                )
+                marker_hits = st.get("marker_hits", []) or []
+                if marker_hits:
+                    lines.append(f"  - marker_hits: {', '.join([_truncate_for_export(str(x), 100) for x in marker_hits])}")
                 summary = st.get("result_summary", "") or ""
                 if summary:
                     lines.append(f"  - summary: {summary}")
@@ -1357,6 +1548,7 @@ def register_routes(app: FastAPI):
         lines.append("")
         lines.append(f"_exported_at: {payload.get('exported_at', '')}_")
         return "\n".join(lines).strip() + "\n"
+
 
     async def _export_task_result(task_id: str, retries: int = 3) -> bool:
         last_error = ""
