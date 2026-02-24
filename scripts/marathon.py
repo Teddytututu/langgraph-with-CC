@@ -1,19 +1,12 @@
 """
-scripts/marathon.py — 持续自检执行循环（马拉松模式）
+scripts/marathon.py — 极简持续自修复循环
 
-行为：
-  每一轮：
-    1. 向 http://127.0.0.1:8001/api/tasks 提交自检任务（含 subagent + 讨论）
-    2. 每 15 秒轮询任务状态，直到 completed / failed
-    3. completed → 等待冷却（默认 30s），进入下一轮
-    4. failed    → 写 fix_request.json，等 Claude Code 修复后重试本轮
-    5. 服务器无响应 → 写 fix_request.json，等修复后继续
-    6. 到达总时长限制（默认 10 小时）→ 退出
+三阶段状态机：
+1) RUN_ROUND   : 提交任务并轮询到 completed / failed / timeout
+2) REPAIR_WAIT : 任意失败统一写 fix_request.json，等待其被删除
+3) COOLDOWN    : 冷却 + 失败退避后继续下一轮
 
-用法：
-  .venv/Scripts/python.exe scripts/marathon.py
-  .venv/Scripts/python.exe scripts/marathon.py --hours 5 --task "系统性能压力测试与自检"
-  .venv/Scripts/python.exe scripts/marathon.py --hours 10 --cooldown 60
+默认 forever 运行；除用户中断外不主动退出。
 """
 
 from __future__ import annotations
@@ -21,129 +14,65 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
-import urllib.error
 import urllib.request
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-# ── 常量 ──────────────────────────────────────────────────────────────
-REPO_ROOT     = Path(__file__).resolve().parent.parent
-BASE_URL      = "http://127.0.0.1:8001"
-FIX_REQUEST   = REPO_ROOT / "fix_request.json"
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BASE_URL = "http://127.0.0.1:8001"
+FIX_REQUEST = REPO_ROOT / "fix_request.json"
 MARATHON_LOCK = REPO_ROOT / "marathon.lock.json"
-POLL_INTERVAL = int(float(os.getenv("MARATHON_POLL_INTERVAL_SEC", "15") or 15))      # 秒：轮询任务状态间隔
-WAIT_POLL     = int(float(os.getenv("MARATHON_WAIT_POLL_SEC", "5") or 5))            # 秒：等待修复时轮询间隔
-WAIT_TIMEOUT  = int(float(os.getenv("MARATHON_WAIT_TIMEOUT_SEC", "3600") or 3600))   # 秒：等 Claude Code 修复最长时间
-IDLE_STABLE_SAMPLES = int(float(os.getenv("MARATHON_IDLE_STABLE_SAMPLES", "3") or 3))
-TRANSIENT_RECHECKS = int(float(os.getenv("MARATHON_TRANSIENT_RECHECKS", "6") or 6))   # 瞬态异常复核次数
-DEFAULT_HOURS = 10
-DEFAULT_MINUTES_PER_ROUND = float(os.getenv("MARATHON_MINUTES_PER_ROUND", "30") or 30)
-DEFAULT_COOLDOWN = int(float(os.getenv("MARATHON_COOLDOWN_SEC", "30") or 30))
-DEFAULT_TASK  = (
-    "执行 10h 自我修复闭环：仅允许自检系统、定位缺陷、修复 bug、验证修复，不得新增任何功能或做需求外扩展。"
-    "每轮必须将任务分解为不少于 12 个子任务节点，且依赖图必须包含并行分支与汇合节点，禁止线性清单式拆分。"
-    "每个节点至少 3 个 subagents 参与，且每个节点至少进行 10 轮讨论。"
-    "每个 major task 完成后必须输出终端摘要（修复内容与验证结论）并落盘证据到 reports/*.md 与 reports/*.json。"
-    "发现失败后必须进入 fix_request 修复路径，修复后重新验证再继续下一轮。"
+TASK_EXPORTS_DIR = REPO_ROOT / "exports" / "tasks"
+
+OFFENDING_COMPLETION_MARKERS = (
+    "[DEGRADED_CONTINUE]",
+    "specialist_call_timeout",
+    "discussion_total_timeout",
+    "discussion_synthesis_timeout",
+    "[POLICY_VIOLATION]",
 )
 
-IDLE_TIMEOUT_FACTOR = 1.2   # 提交前等待系统空闲窗口（相对每轮预算）
-POLL_DEADLINE_FACTOR = 1.5  # 提交后轮询等待窗口（相对每轮预算）
-DEFAULT_EXECUTION_POLICY = {
-    "force_complex_graph": True,
-    "min_agents_per_node": 3,
-    "min_discussion_rounds": 10,
-    "strict_enforcement": True,
-}
+DEFAULT_TASK = (
+    "执行持续自检与自修复闭环：仅允许自检系统、定位缺陷、修复 bug、验证修复，"
+    "不得新增需求外功能。任意失败进入 fix_request 修复握手，修复后继续下一轮。"
+)
 
 
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def _log(msg: str) -> None:
-    print(f"[marathon {_ts()}] {msg}", flush=True)
+def _emit(event: str, **fields: object) -> None:
+    payload = {"event": event, "ts": _now_iso()}
+    payload.update(fields)
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def _extract_policy_shortfall(detail: str) -> str:
-    text = detail or ""
-    pairs = []
-    for key in ("actual_rounds", "required_rounds", "actual_agents", "required_agents"):
-        m = re.search(rf"{key}=([0-9]+)", text, re.IGNORECASE)
-        if m:
-            pairs.append(f"{key}={m.group(1)}")
-    return " ".join(pairs)
-
-
-def _infer_failure_category(detail: str) -> str:
-    text = (detail or "").lower()
-    if "planner_call_failed" in text:
-        return "planner_call_failed"
-    if "policy_violation" in text or "planner_final_validation_failed" in text:
-        shortfall = _extract_policy_shortfall(detail)
-        if "actual_rounds=" in shortfall and "required_rounds=" in shortfall:
-            return "discussion_policy_rounds_insufficient"
-        return "planner_validation_failed"
-    if "timeout" in text:
-        return "timeout"
-    if "http" in text:
-        return "http_error"
-    return "task_failed"
-
-
-def _stderr_failure_summary(round_num: int, task_id: str | None, detail: str) -> None:
-    category = _infer_failure_category(detail)
-    summary = (detail or "").replace("\n", " ").strip()
-    if len(summary) > 280:
-        summary = summary[:280] + "..."
-    shortfall = _extract_policy_shortfall(detail)
-    shortfall_suffix = f" shortfall={shortfall}" if shortfall else ""
-    print(
-        (
-            f"[marathon {_ts()}] round={round_num} task_id={task_id or '-'} "
-            f"category={category}{shortfall_suffix} summary={summary or 'no_error_detail'} "
-            "(see marathon.log for full context)"
-        ),
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-def _api(method: str, path: str, body: dict | None = None) -> dict:
+def _api(method: str, path: str, body: dict | None = None, timeout: int = 10) -> dict:
     url = BASE_URL + path
-    data = json.dumps(body).encode("utf-8") if body else None
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers={"Content-Type": "application/json"} if data is not None else {},
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _server_ok() -> bool:
-    try:
-        _api("GET", "/api/system/status")
-        return True
-    except Exception:
-        return False
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
 
 
 def _acquire_singleton_lock() -> bool:
-    """确保仅一个 marathon 实例运行。
-
-    若已存在存活实例：立即退出当前新实例（不影响已有任务）。
-    采用原子创建锁文件，避免并发启动竞态。
-    """
     current_pid = os.getpid()
-    payload = json.dumps({
-        "pid": current_pid,
-        "created_at": datetime.now().isoformat(),
-    }, ensure_ascii=False)
+    payload = json.dumps(
+        {
+            "pid": current_pid,
+            "created_at": _now_iso(),
+        },
+        ensure_ascii=False,
+    )
 
     while True:
         try:
@@ -154,7 +83,6 @@ def _acquire_singleton_lock() -> bool:
                 os.close(fd)
             return True
         except FileExistsError:
-            # 已有锁：判断是否为存活进程
             try:
                 lock_data = json.loads(MARATHON_LOCK.read_text(encoding="utf-8"))
                 old_pid = int(lock_data.get("pid", 0))
@@ -163,638 +91,351 @@ def _acquire_singleton_lock() -> bool:
 
             if old_pid and old_pid != current_pid:
                 try:
-                    os.kill(old_pid, 0)  # 存活检测
-                    _log(f"检测到已有 marathon 实例在运行 (pid={old_pid})，当前实例退出")
+                    os.kill(old_pid, 0)
+                    _emit("marathon_lock_conflict", pid=old_pid)
                     return False
                 except OSError:
-                    # 僵尸锁，删除后重试获取
                     MARATHON_LOCK.unlink(missing_ok=True)
                     continue
 
-            # 锁损坏或无效 PID，尝试清理并重试
             MARATHON_LOCK.unlink(missing_ok=True)
 
 
 def _release_singleton_lock() -> None:
-    """释放 marathon 单实例锁（仅释放自己创建的锁）。"""
     try:
         if not MARATHON_LOCK.exists():
             return
-        data = json.loads(MARATHON_LOCK.read_text(encoding="utf-8"))
-        if int(data.get("pid", -1)) == os.getpid():
+        lock_data = json.loads(MARATHON_LOCK.read_text(encoding="utf-8"))
+        if int(lock_data.get("pid", -1)) == os.getpid():
             MARATHON_LOCK.unlink(missing_ok=True)
     except Exception:
         pass
 
 
-def _is_hard_failure(detail: str) -> bool:
-    """可靠性模式：策略/质量短板不触发硬失败，只有运行时/传输层故障才触发。"""
-    text = (detail or "").lower()
-    runtime_markers = [
-        "traceback",
-        "crash",
-        "runtimeerror",
-        "exception",
-        "connection refused",
-        "connectionreseterror",
-        "connection reset",
-        "http error",
-        "httperror",
-        "500 internal server error",
-    ]
-    return any(marker in text for marker in runtime_markers)
-
-
-def _wait_for_fix(
-    reason: str,
-    attempt: int,
-    detail: str,
-    *,
-    wait_timeout: int = WAIT_TIMEOUT,
-    wait_poll: int = WAIT_POLL,
-) -> None:
-    """写 fix_request.json，阻塞等待 Claude Code 修复后删除它。"""
+def _write_fix_request(task_text: str, round_no: int, reason: str, detail: str) -> None:
     req = {
-        "type":        "fix_request",
-        "goal":        f"marathon 自检循环第 {attempt} 轮正常完成",
-        "failure":     detail[-4000:],
-        "ts":          datetime.now().isoformat(),
+        "type": "fix_request",
+        "goal": f"marathon 第 {round_no} 轮恢复并完成：{task_text}",
+        "failure": (detail or reason)[-4000:],
+        "ts": _now_iso(),
         "instruction": (
-            f"marathon 循环在第 {attempt} 轮遇到错误：{reason}。\n"
-            "请根据 failure 中的错误信息定位并修复代码，"
-            "修复完成后删除本文件（fix_request.json）以继续循环。\n"
-            "只修复导致本轮失败的问题，不要添加额外功能。"
+            "marathon 本轮失败。请根据 failure 中错误信息定位并修复代码，"
+            "修复完成后删除 fix_request.json。"
+            "只修复导致失败的问题，不要添加额外功能。"
         ),
     }
     FIX_REQUEST.write_text(json.dumps(req, indent=2, ensure_ascii=False), encoding="utf-8")
-    _log(f"已写 fix_request.json，等待 Claude Code 修复...")
-    _log(f"原因: {reason}")
+    _emit("fix_request_written", round=round_no, reason=reason)
 
-    deadline = time.monotonic() + wait_timeout
-    ticks = 0
+
+def _wait_for_fix(wait_poll: int, wait_timeout: int) -> None:
+    started = time.monotonic()
     while FIX_REQUEST.exists():
-        if time.monotonic() > deadline:
-            _log(f"等待修复超时 {wait_timeout}s，强制进入下一轮")
-            FIX_REQUEST.unlink(missing_ok=True)
-            return
-        if ticks % 12 == 0:
-            elapsed = int(time.monotonic() - (deadline - wait_timeout))
-            print(f"  ... 等待修复 ({elapsed}s)", flush=True)
-        ticks += 1
+        elapsed = int(time.monotonic() - started)
+        if wait_timeout > 0 and elapsed >= wait_timeout:
+            _emit("repair_waiting", elapsed_sec=elapsed, timed_out=True)
+            started = time.monotonic()
+        else:
+            _emit("repair_waiting", elapsed_sec=elapsed)
         time.sleep(wait_poll)
 
-    _log("修复完成（fix_request.json 已删除）")
+
+def _submit_task(task_text: str) -> str:
+    resp = _api("POST", "/api/tasks", {"task": task_text})
+    task_id = resp.get("id")
+    if not task_id:
+        raise RuntimeError(f"POST /api/tasks 返回缺少 id: {resp}")
+    return str(task_id)
 
 
-def _wait_for_idle(timeout: int = 600, stable_samples: int = IDLE_STABLE_SAMPLES) -> bool:
-    """等待系统彻底空闲（无 running/created/queued 任务），需连续稳定若干次。"""
-    deadline = time.monotonic() + timeout
-    ticks = 0
-    stable_hits = 0
-    while time.monotonic() < deadline:
-        try:
-            sys_resp = _api("GET", "/api/system/status")
-            tasks_resp = _api("GET", "/api/tasks")
-            sys_status = sys_resp.get("status", "idle")
-            tasks = tasks_resp.get("tasks", [])
-            active = [t for t in tasks if t.get("status") in ("running", "created", "queued")]
-            idle_now = sys_status not in ("running",) and not active
-            if idle_now:
-                stable_hits += 1
-                if stable_hits >= stable_samples:
-                    return True
-            else:
-                stable_hits = 0
+def _poll_until_terminal(task_id: str, poll_interval: int, round_timeout: int) -> tuple[str, str]:
+    started = time.monotonic()
+    while True:
+        if round_timeout > 0 and (time.monotonic() - started) >= round_timeout:
+            return "timeout", f"task {task_id} exceeded round_timeout={round_timeout}s"
 
-            if ticks % 4 == 0:
-                elapsed = int(time.monotonic() - (deadline - timeout))
-                reasons = []
-                if sys_status == "running":
-                    reasons.append(f"system={sys_status}")
-                if active:
-                    reasons.append(f"active_tasks={len(active)}")
-                if idle_now:
-                    reasons.append(f"stable={stable_hits}/{stable_samples}")
-                _log(f"  等待系统空闲... ({elapsed}s) [{', '.join(reasons) if reasons else 'checking'}]")
-        except Exception:
-            stable_hits = 0
-        ticks += 1
-        time.sleep(WAIT_POLL)
-    return False
+        task = _api("GET", f"/api/tasks/{task_id}")
+        status = str(task.get("status", ""))
 
+        if status == "completed":
+            return "completed", ""
+        if status in ("failed", "cancelled"):
+            detail = task.get("error") or task.get("final_output") or json.dumps(task, ensure_ascii=False)
+            return "failed", str(detail)
 
-def _submit_task(
-    task_text: str,
-    execution_policy: dict | None,
-    idle_timeout: int = 600,
-) -> tuple[str | None, str]:
-    """提交任务，返回 (task_id, reason)。
-
-    reason 取值：
-    - ok
-    - wait_idle_timeout
-    - post_error:...
-    """
-    # 确保系统空闲再提交，避免多任务并发
-    if not _wait_for_idle(timeout=idle_timeout):
-        _log(f"等待系统空闲超时（{idle_timeout}s），暂不提交新任务")
-        return None, "wait_idle_timeout"
-    try:
-        payload = {"task": task_text}
-        if execution_policy is not None:
-            payload["execution_policy"] = execution_policy
-        resp = _api("POST", "/api/tasks", payload)
-        return resp.get("id"), "ok"
-    except Exception as e:
-        _log(f"提交任务失败: {e}")
-        return None, f"post_error:{e}"
-
-
-def _check_transient_task_status(
-    task_id: str,
-    retries: int = TRANSIENT_RECHECKS,
-    *,
-    poll_interval: int = POLL_INTERVAL,
-) -> tuple[str, str]:
-    """复核 timeout/unknown 场景，避免把瞬态误判为失败。"""
-    last_detail = ""
-    for i in range(retries):
-        try:
-            task_resp = _api("GET", f"/api/tasks/{task_id}")
-            status = task_resp.get("status", "")
-            if status == "completed":
-                return "completed", "recheck: task completed"
-            if status in ("failed", "cancelled"):
-                err = task_resp.get("error") or task_resp.get("final_output") or str(task_resp)
-                return "failed", str(err)
-            last_detail = f"recheck#{i + 1}: task status={status or 'unknown'}"
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                try:
-                    sys_status = _api("GET", "/api/system/status").get("status", "idle")
-                    tasks = _api("GET", "/api/tasks").get("tasks", [])
-                    active = [x for x in tasks if x.get("status") in ("running", "created", "queued")]
-                    if sys_status != "running" and not active:
-                        return "completed", "recheck: task record gone after terminal state"
-                    last_detail = f"recheck#{i + 1}: task 404 but system={sys_status}, active={len(active)}"
-                except Exception as inner_e:
-                    last_detail = f"recheck#{i + 1}: task 404 + status probe failed: {inner_e}"
-            else:
-                last_detail = f"recheck#{i + 1}: HTTPError {e.code}"
-        except Exception as e:
-            last_detail = f"recheck#{i + 1}: {e}"
-        time.sleep(min(poll_interval, 5))
-
-    return "transient", last_detail or "transient status unresolved"
-
-
-def _poll_task(
-    task_id: str,
-    deadline: float,
-    *,
-    poll_interval: int = POLL_INTERVAL,
-) -> tuple[str, str]:
-    """
-    轮询任务状态直到终态或超时。
-    返回 (status, error_detail)，status ∈ {completed, failed, timeout, transient}
-    """
-    last_node = ""
-    while time.monotonic() < deadline:
-        try:
-            t = _api("GET", f"/api/tasks/{task_id}")
-            status = t.get("status", "")
-            node = t.get("current_node") or ""
-            if node and node != last_node:
-                _log(f"  → 节点: {node}")
-                last_node = node
-            if status == "completed":
-                return "completed", ""
-            if status == "failed":
-                err = t.get("error") or t.get("final_output") or str(t)
-                return "failed", str(err)
-            if status == "cancelled":
-                err = t.get("error") or "task cancelled"
-                return "failed", str(err)
-            if status and status not in ("created", "queued", "running"):
-                return "transient", f"unexpected task status: {status}"
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                try:
-                    sys_status = _api("GET", "/api/system/status").get("status", "idle")
-                    tasks = _api("GET", "/api/tasks").get("tasks", [])
-                    active = [x for x in tasks if x.get("status") in ("running", "created", "queued")]
-                    if sys_status != "running" and not active:
-                        _log(f"  任务 {task_id} 不可见，但系统空闲，按已终态处理")
-                        return "completed", "task record cleaned by auto init"
-                except Exception as inner_e:
-                    _log(f"  404 兜底判定异常: {inner_e}")
-            _log(f"  轮询 HTTP 异常: {e}")
-        except Exception as e:
-            _log(f"  轮询异常: {e}")
         time.sleep(poll_interval)
-    return "timeout", f"任务 {task_id} 超时未完成"
 
 
-def _clear_old_tasks() -> None:
-    """清空所有已结束的旧任务（completed/failed/cancelled），避免堆积。"""
+def _contains_offending_marker(value: object) -> str | None:
+    text = str(value or "")
+    text_lower = text.lower()
+    for marker in OFFENDING_COMPLETION_MARKERS:
+        if marker.lower() in text_lower:
+            return marker
+    return None
+
+
+def _extract_offending_subtasks(subtasks: list[dict]) -> list[dict[str, str]]:
+    offenders: list[dict[str, str]] = []
+    for st in subtasks:
+        st_id = str(st.get("id") or "")
+        st_status = str(st.get("status") or "")
+        if st_status == "failed":
+            offenders.append(
+                {
+                    "subtask_id": st_id,
+                    "marker": "status=failed",
+                    "status": st_status,
+                    "evidence": str(st.get("result") or st.get("result_summary") or "")[:400],
+                }
+            )
+            continue
+
+        for field in ("result", "result_summary", "error"):
+            marker = _contains_offending_marker(st.get(field))
+            if marker:
+                offenders.append(
+                    {
+                        "subtask_id": st_id,
+                        "marker": marker,
+                        "status": st_status,
+                        "evidence": str(st.get(field) or "")[:400],
+                    }
+                )
+                break
+    return offenders
+
+
+def _read_export_task_payload(task_id: str) -> dict | None:
+    json_path = TASK_EXPORTS_DIR / f"{task_id}.json"
+    if not json_path.exists():
+        return None
     try:
-        tasks = _api("GET", "/api/tasks").get("tasks", [])
-        running = [t for t in tasks if t.get("status") in ("running", "created", "queued")]
-        if running:
-            _log(f"  跳过清空：仍有 {len(running)} 个活跃任务")
-            return
-        if tasks:
-            _api("DELETE", "/api/tasks")
-            _log(f"  已清空 {len(tasks)} 个旧任务")
+        raw = json_path.read_text(encoding="utf-8")
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _evaluate_completed_task_truth(task_id: str) -> dict:
+    payload = None
+    evidence_source = "api"
+    fetch_error = ""
+
+    try:
+        payload = _api("GET", f"/api/tasks/{task_id}")
     except Exception as e:
-        _log(f"  清空旧任务失败: {e}")
+        fetch_error = f"{type(e).__name__}: {e}"
+
+    if not isinstance(payload, dict) or not payload.get("subtasks"):
+        export_payload = _read_export_task_payload(task_id)
+        if export_payload:
+            payload = export_payload
+            evidence_source = "export"
+
+    if not isinstance(payload, dict):
+        reason = "missing_task_detail"
+        if fetch_error:
+            reason = f"{reason}: {fetch_error}"
+        return {
+            "truthful": False,
+            "reason": reason,
+            "evidence": [
+                {
+                    "subtask_id": task_id,
+                    "marker": "task_detail_unavailable",
+                    "status": "unknown",
+                    "evidence": "unable to load /api/tasks/{id} and exports/tasks/{id}.json",
+                }
+            ],
+            "source": "none",
+        }
+
+    subtasks = payload.get("subtasks") or []
+    if not isinstance(subtasks, list) or not subtasks:
+        return {
+            "truthful": False,
+            "reason": "missing_subtasks",
+            "evidence": [
+                {
+                    "subtask_id": task_id,
+                    "marker": "subtasks_missing",
+                    "status": "unknown",
+                    "evidence": "completed task payload has no subtasks",
+                }
+            ],
+            "source": evidence_source,
+        }
+
+    offenders = _extract_offending_subtasks(subtasks)
+    if offenders:
+        markers = sorted({item["marker"] for item in offenders if item.get("marker")})
+        return {
+            "truthful": False,
+            "reason": f"completed_with_degraded_evidence:{'|'.join(markers)}",
+            "evidence": offenders,
+            "source": evidence_source,
+        }
+
+    return {
+        "truthful": True,
+        "reason": "clean_completed",
+        "evidence": [],
+        "source": evidence_source,
+    }
+
+
+def _backoff_seconds(consecutive_failures: int, base: int, cap: int) -> int:
+    if consecutive_failures <= 0:
+        return 0
+    return min(cap, base * (2 ** (consecutive_failures - 1)))
 
 
 def run(
     task_text: str,
-    hours: float,
-    minutes_per_round: float,
+    poll_interval: int,
+    wait_poll: int,
+    wait_timeout: int,
     cooldown: int,
-    execution_policy: dict | None,
-    *,
-    poll_interval: int = POLL_INTERVAL,
-    wait_poll: int = WAIT_POLL,
-    wait_timeout: int = WAIT_TIMEOUT,
-    transient_rechecks: int = TRANSIENT_RECHECKS,
-    forever: bool = False,
-    fail_open: bool = False,
+    backoff_base: int,
+    backoff_max: int,
+    round_timeout: int,
 ) -> None:
-    total_seconds = hours * 3600
-    end_time = datetime.now() + timedelta(seconds=total_seconds)
-    round_num = 0
-    results: list[dict] = []
+    phase = "RUN_ROUND"
+    round_no = 0
+    consecutive_failures = 0
+    current_task_id: str | None = None
 
-    if forever:
-        _log("马拉松启动：forever 模式（无结束时间）")
-    else:
-        _log(f"马拉松启动：计划运行 {hours}h，约 {int(hours * 60 / minutes_per_round)} 轮")
-        _log(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    _log(f"任务: {task_text[:80]}...")
-    _log(f"失败策略: {'fail-open(继续运行)' if fail_open else 'normal(硬失败触发修复)'}")
-    _log("─" * 60)
-
+    _emit("marathon_started")
     FIX_REQUEST.unlink(missing_ok=True)
 
-    while forever or datetime.now() < end_time:
-        round_num += 1
-        if forever:
-            remaining_h_text = "∞"
-        else:
-            remaining_h_text = f"{(end_time - datetime.now()).total_seconds() / 3600:.1f}"
-        round_fix_triggers = 0
-        round_failure_reason = ""
-        round_verification = ""
-        _log(f"")
-        _log(f"═══ 第 {round_num} 轮 | 剩余 {remaining_h_text}h ═══")
-        if execution_policy:
-            _log(f"执行策略: {json.dumps(execution_policy, ensure_ascii=False)}")
+    while True:
+        if phase == "RUN_ROUND":
+            round_no += 1
+            current_task_id = None
+            round_started = time.monotonic()
+            _emit("round_started", round=round_no, consecutive_failures=consecutive_failures)
 
-        # ── 确保服务器在线 ──
-        retries = 0
-        while not _server_ok():
-            retries += 1
-            detail = f"第 {round_num} 轮开始时服务器无响应（尝试 {retries} 次）"
-            _log(detail)
-            round_failure_reason = detail
-            round_fix_triggers += 1
-            _wait_for_fix(
-                "服务器无响应",
-                round_num,
-                detail,
-                wait_timeout=wait_timeout,
-                wait_poll=wait_poll,
-            )
+            try:
+                current_task_id = _submit_task(task_text)
+                _emit("task_submitted", round=round_no, task_id=current_task_id)
 
-        # ── 清理旧任务 ──
-        _clear_old_tasks()
-
-        # ── 提交任务 ──
-        task_id = None
-        while task_id is None:
-            task_id, submit_reason = _submit_task(
-                task_text,
-                execution_policy,
-                idle_timeout=max(600, int(minutes_per_round * 60 * IDLE_TIMEOUT_FACTOR)),
-            )
-            if task_id is None:
-                # 系统仍在运行旧任务时，不应误判为 POST 失败
-                if submit_reason == "wait_idle_timeout":
-                    active_running = 0
-                    active_total = 0
-                    try:
-                        tasks_resp = _api("GET", "/api/tasks")
-                        active = [
-                            t for t in tasks_resp.get("tasks", [])
-                            if t.get("status") in ("running", "created", "queued")
-                        ]
-                        active_total = len(active)
-                        active_running = len([t for t in active if t.get("status") == "running"])
-                    except Exception:
-                        pass
-
-                    detail = (
-                        f"等待系统空闲超时（active={active_total}, running={active_running}），"
-                        "保留现有运行任务继续推进，不触发 fix_request"
-                    )
-                    round_failure_reason = detail
-                    _log(f"提交延后: {detail}")
-                    time.sleep(min(poll_interval, 10))
-                    continue
-
-                round_failure_reason = "POST /api/tasks 返回错误"
-                round_fix_triggers += 1
-                _wait_for_fix(
-                    "任务提交失败",
-                    round_num,
-                    f"POST /api/tasks 返回错误: {submit_reason}",
-                    wait_timeout=wait_timeout,
-                    wait_poll=wait_poll,
+                status, detail = _poll_until_terminal(
+                    current_task_id,
+                    poll_interval=max(1, poll_interval),
+                    round_timeout=max(0, round_timeout),
                 )
 
-        round_start = time.monotonic()
-        _log(f"任务已提交: {task_id}，时间预算 {minutes_per_round} 分钟")
-
-        # ── 轮询等待完成 ──
-        # 最多等待 round 时间 × POLL_DEADLINE_FACTOR 的宽余（与提交前空闲等待窗口分离）
-        poll_deadline = time.monotonic() + minutes_per_round * 60 * POLL_DEADLINE_FACTOR
-        status, detail = _poll_task(task_id, poll_deadline, poll_interval=poll_interval)
-        elapsed_min = (time.monotonic() - round_start) / 60
-
-        if status == "completed":
-            round_verification = "task completed"
-            _log(f"✓ 第 {round_num} 轮完成（耗时 {elapsed_min:.1f} 分钟）")
-            results.append({
-                "round": round_num,
-                "task_id": task_id,
-                "status": "ok",
-                "minutes": f"{elapsed_min:.1f}",
-                "fix_triggers": round_fix_triggers,
-                "failure_reason": round_failure_reason,
-                "verification": round_verification,
-            })
-
-        elif status == "failed":
-            round_failure_reason = detail[:500]
-            round_verification = "task failed"
-            hard_failed = _is_hard_failure(detail)
-            _log(f"✗ 第 {round_num} 轮 FAILED（耗时 {elapsed_min:.1f} 分钟）")
-            _log(f"  错误: {detail[:200]}")
-            _stderr_failure_summary(round_num, task_id, detail)
-            results.append({
-                "round": round_num,
-                "task_id": task_id,
-                "status": "failed" if hard_failed else "ok",
-                "minutes": f"{elapsed_min:.1f}",
-                "fix_triggers": round_fix_triggers + (1 if hard_failed else 0),
-                "failure_reason": round_failure_reason,
-                "verification": "hard_failed" if hard_failed else "deferred_failed_continue",
-            })
-            if hard_failed:
-                round_fix_triggers += 1
-                if fail_open:
-                    _log("  hard failed, fail-open 模式：记录后继续下一轮")
-                else:
-                    _wait_for_fix(
-                        f"轮次 {round_num} 任务执行失败",
-                        round_num,
-                        detail,
-                        wait_timeout=wait_timeout,
-                        wait_poll=wait_poll,
-                    )
-            else:
-                _log("  失败被判定为可恢复（deferred），继续下一轮")
-
-        elif status in ("timeout", "transient"):
-            # timeout/transient 先复核，不直接触发 fix_request
-            round_failure_reason = detail[:500]
-            _log(f"⚠ 第 {round_num} 轮 {status}（耗时 {elapsed_min:.1f} 分钟）")
-            _log(f"  初始详情: {detail[:200]}")
-            recheck_status, recheck_detail = _check_transient_task_status(
-                task_id,
-                retries=transient_rechecks,
-                poll_interval=poll_interval,
-            )
-            if recheck_status == "failed":
-                round_failure_reason = recheck_detail[:500]
-                hard_failed = _is_hard_failure(recheck_detail)
-                round_verification = "recheck failed"
-                _log(f"  复核结论: {'hard failed' if hard_failed else 'deferred failed'} -> {recheck_detail[:200]}")
-                _stderr_failure_summary(round_num, task_id, recheck_detail)
-                results.append({
-                    "round": round_num,
-                    "task_id": task_id,
-                    "status": "failed" if hard_failed else "ok",
-                    "minutes": f"{elapsed_min:.1f}",
-                    "fix_triggers": round_fix_triggers + (1 if hard_failed else 0),
-                    "failure_reason": round_failure_reason,
-                    "verification": "recheck_hard_failed" if hard_failed else "recheck_deferred_continue",
-                })
-                if hard_failed:
-                    round_fix_triggers += 1
-                    if fail_open:
-                        _log("  recheck hard failed, fail-open 模式：记录后继续下一轮")
-                    else:
-                        _wait_for_fix(
-                            f"轮次 {round_num} 任务执行失败(复核)",
-                            round_num,
-                            recheck_detail,
-                            wait_timeout=wait_timeout,
-                            wait_poll=wait_poll,
+                if status == "completed":
+                    completion_truth = _evaluate_completed_task_truth(current_task_id)
+                    if completion_truth.get("truthful"):
+                        elapsed = int(time.monotonic() - round_started)
+                        _emit(
+                            "task_completed",
+                            round=round_no,
+                            task_id=current_task_id,
+                            elapsed_sec=elapsed,
+                            completion_source=completion_truth.get("source"),
                         )
-            elif recheck_status == "completed":
-                round_verification = "recheck completed"
-                _log("  复核结论: 已完成（瞬态切换窗口）")
-                results.append({
-                    "round": round_num,
-                    "task_id": task_id,
-                    "status": "ok",
-                    "minutes": f"{elapsed_min:.1f}",
-                    "fix_triggers": round_fix_triggers,
-                    "failure_reason": round_failure_reason,
-                    "verification": round_verification,
-                })
-            else:
-                round_failure_reason = recheck_detail[:500] if recheck_detail else round_failure_reason
-                round_fix_triggers += 1
-                round_verification = "recheck unresolved -> fix_request"
-                _log(f"  复核结论: unresolved，触发修复闭环 -> {recheck_detail[:200]}")
-                _stderr_failure_summary(round_num, task_id, recheck_detail or detail)
-                results.append({
-                    "round": round_num,
-                    "task_id": task_id,
-                    "status": "failed" if not fail_open else "ok",
-                    "minutes": f"{elapsed_min:.1f}",
-                    "fix_triggers": round_fix_triggers,
-                    "failure_reason": round_failure_reason,
-                    "verification": "recheck_unresolved_continue" if fail_open else round_verification,
-                })
-                if fail_open:
-                    _log("  unresolved, fail-open 模式：记录后继续下一轮")
-                else:
-                    _wait_for_fix(
-                        f"轮次 {round_num} 任务状态复核仍未收敛",
-                        round_num,
-                        recheck_detail or detail or "transient status unresolved after recheck",
-                        wait_timeout=wait_timeout,
-                        wait_poll=wait_poll,
+                        consecutive_failures = 0
+                        phase = "COOLDOWN"
+                        continue
+
+                    reason = "completed_untruthful"
+                    evidence = completion_truth.get("evidence") or []
+                    detail_payload = {
+                        "reason": completion_truth.get("reason"),
+                        "source": completion_truth.get("source"),
+                        "evidence": evidence,
+                    }
+                    _emit(
+                        "completed_rejected",
+                        round=round_no,
+                        task_id=current_task_id,
+                        reason=completion_truth.get("reason"),
+                        source=completion_truth.get("source"),
+                        evidence_count=len(evidence),
                     )
+                    detail_text = json.dumps(detail_payload, ensure_ascii=False)
+                else:
+                    reason = "task_failed" if status == "failed" else "task_timeout"
+                    detail_text = detail
 
-        round_result = results[-1]
-        _log(
-            "轮次结果 | "
-            f"round={round_result['round']} "
-            f"task_id={round_result['task_id']} "
-            f"status={round_result['status']} "
-            f"fix_triggers={round_result['fix_triggers']} "
-            f"verification={round_result['verification']} "
-            f"failure_reason={round_result['failure_reason'][:120]}"
-        )
+            except Exception as e:
+                reason = "runtime_error"
+                detail_text = f"{type(e).__name__}: {e}"
 
-        # ── 冷却 ──
-        if (forever or datetime.now() < end_time) and cooldown > 0:
-            _log(f"冷却 {cooldown}s 后开始下一轮...")
-            time.sleep(cooldown)
+            consecutive_failures += 1
+            elapsed = int(time.monotonic() - round_started)
+            _emit(
+                "round_failed",
+                round=round_no,
+                task_id=current_task_id,
+                reason=reason,
+                elapsed_sec=elapsed,
+                consecutive_failures=consecutive_failures,
+            )
+            _write_fix_request(task_text, round_no, reason, detail_text)
+            phase = "REPAIR_WAIT"
+            continue
 
-    # ── 总结 ──
-    _log("")
-    _log("═" * 60)
-    _log(f"马拉松结束，共完成 {round_num} 轮")
-    ok = sum(1 for r in results if r["status"] == "ok")
-    fail = round_num - ok
-    total_fix_triggers = sum(int(r.get("fix_triggers", 0)) for r in results)
+        if phase == "REPAIR_WAIT":
+            _wait_for_fix(wait_poll=max(1, wait_poll), wait_timeout=max(0, wait_timeout))
+            _emit("repair_cleared", round=round_no, consecutive_failures=consecutive_failures)
+            phase = "COOLDOWN"
+            continue
 
-    longest_success_streak = 0
-    current_streak = 0
-    last_failure_reason = ""
-    for r in results:
-        if r.get("status") == "ok":
-            current_streak += 1
-            if current_streak > longest_success_streak:
-                longest_success_streak = current_streak
-        else:
-            current_streak = 0
-            if r.get("failure_reason"):
-                last_failure_reason = r["failure_reason"]
+        if phase == "COOLDOWN":
+            backoff_sec = _backoff_seconds(consecutive_failures, max(1, backoff_base), max(1, backoff_max))
+            if backoff_sec > 0:
+                _emit(
+                    "backoff_sleep",
+                    round=round_no,
+                    seconds=backoff_sec,
+                    consecutive_failures=consecutive_failures,
+                )
+                time.sleep(backoff_sec)
 
-    _log(f"成功: {ok}  失败/超时: {fail}")
-    _log(
-        "最终统计 | "
-        f"total_rounds={round_num} "
-        f"success_rounds={ok} "
-        f"fix_triggers={total_fix_triggers} "
-        f"longest_success_streak={longest_success_streak} "
-        f"last_failure_reason={last_failure_reason[:200]}"
-    )
+            if cooldown > 0:
+                _emit("cooldown_sleep", round=round_no, seconds=cooldown)
+                time.sleep(cooldown)
 
-    for r in results:
-        icon = "✓" if r["status"] == "ok" else "✗"
-        print(
-            f"  {icon} 第 {r['round']:2d} 轮  {r['status']:8s}  {r['minutes']} min"
-            f"  task={r.get('task_id', '')}"
-            f"  fix={r.get('fix_triggers', 0)}"
-            f"  verify={r.get('verification', '')}",
-            flush=True,
-        )
+            phase = "RUN_ROUND"
+            continue
 
 
-def _build_execution_policy(
-    *,
-    strict_enabled: bool,
-    force_complex_graph: bool,
-    min_agents_per_node: int,
-    min_discussion_rounds: int,
-) -> dict | None:
-    """构建执行策略；严格模式参数不合法时抛出 ValueError。"""
-    if not strict_enabled:
-        return None
-
-    if not force_complex_graph:
-        raise ValueError("strict 模式要求 force_complex_graph=true")
-    if min_agents_per_node < 3:
-        raise ValueError("strict 模式要求 min_agents_per_node>=3")
-
-    return {
-        "force_complex_graph": force_complex_graph,
-        "min_agents_per_node": min_agents_per_node,
-        "min_discussion_rounds": min_discussion_rounds,
-        "strict_enforcement": True,
-    }
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="极简持续自修复 marathon")
+    parser.add_argument("--task", default=DEFAULT_TASK, help="每轮提交任务文本")
+    parser.add_argument("--poll-interval", type=int, default=15, help="任务轮询间隔秒")
+    parser.add_argument("--wait-poll", type=int, default=5, help="修复等待轮询间隔秒")
+    parser.add_argument("--wait-timeout", type=int, default=0, help="修复等待超时秒，0=仅打点不跳出")
+    parser.add_argument("--cooldown", type=int, default=30, help="每轮冷却秒")
+    parser.add_argument("--backoff-base", type=int, default=10, help="失败退避基数秒")
+    parser.add_argument("--backoff-max", type=int, default=300, help="失败退避上限秒")
+    parser.add_argument("--round-timeout", type=int, default=1800, help="单轮任务超时秒，0=不超时")
+    return parser
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="持续自检执行循环（马拉松模式）")
-    parser.add_argument("--hours",     type=float, default=DEFAULT_HOURS,
-                        help=f"总运行时长（小时），默认 {DEFAULT_HOURS}")
-    parser.add_argument("--task",      default=DEFAULT_TASK,
-                        help="每轮提交的任务描述")
-    parser.add_argument("--minutes",   type=float, default=DEFAULT_MINUTES_PER_ROUND,
-                        help=f"每轮时间预算（分钟），默认 {DEFAULT_MINUTES_PER_ROUND}")
-    parser.add_argument("--strict", action="store_true", default=True,
-                        help="启用严格执行策略（默认开启）")
-    parser.add_argument("--non-strict", action="store_true",
-                        help="关闭严格执行策略，按旧行为提交")
-    parser.add_argument("--force-complex-graph", action="store_true", default=True,
-                        help="强制复杂依赖图（默认开启）")
-    parser.add_argument("--allow-linear-graph", action="store_true",
-                        help="允许线性图（将 force_complex_graph 设为 false）")
-    parser.add_argument("--min-agents-per-node", type=int, default=3,
-                        help="每个节点最少 agent 数（默认 3）")
-    parser.add_argument("--min-discussion-rounds", type=int, default=10,
-                        help="每个节点最少讨论轮次（默认 10）")
-    parser.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN,
-                        help=f"每轮结束后冷却秒数（默认 {DEFAULT_COOLDOWN}）")
-    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL,
-                        help=f"任务轮询间隔秒（默认 {POLL_INTERVAL}）")
-    parser.add_argument("--wait-poll", type=int, default=WAIT_POLL,
-                        help=f"fix_request 等待轮询秒（默认 {WAIT_POLL}）")
-    parser.add_argument("--wait-timeout", type=int, default=WAIT_TIMEOUT,
-                        help=f"fix_request 等待超时秒（默认 {WAIT_TIMEOUT}）")
-    parser.add_argument("--transient-rechecks", type=int, default=TRANSIENT_RECHECKS,
-                        help=f"瞬态复核次数（默认 {TRANSIENT_RECHECKS}）")
-    parser.add_argument("--forever", action=argparse.BooleanOptionalAction, default=True,
-                        help="是否无限轮次运行（默认开启，可用 --no-forever 关闭）")
-    parser.add_argument("--fail-open", action=argparse.BooleanOptionalAction, default=True,
-                        help="硬失败是否继续下一轮（默认开启，可用 --no-fail-open 关闭）")
+    parser = _build_parser()
     args = parser.parse_args()
 
     if not _acquire_singleton_lock():
-        sys.exit(0)
-
-    strict_enabled = args.strict and not args.non_strict
-    force_complex_graph = args.force_complex_graph and not args.allow_linear_graph
-    try:
-        execution_policy = _build_execution_policy(
-            strict_enabled=strict_enabled,
-            force_complex_graph=force_complex_graph,
-            min_agents_per_node=args.min_agents_per_node,
-            min_discussion_rounds=args.min_discussion_rounds,
-        )
-    except ValueError as e:
-        _log(f"参数错误: {e}")
-        sys.exit(2)
+        raise SystemExit(0)
 
     try:
         run(
             task_text=args.task,
-            hours=args.hours,
-            minutes_per_round=args.minutes,
+            poll_interval=args.poll_interval,
+            wait_poll=args.wait_poll,
+            wait_timeout=args.wait_timeout,
             cooldown=args.cooldown,
-            execution_policy=execution_policy,
-            poll_interval=max(1, int(args.poll_interval)),
-            wait_poll=max(1, int(args.wait_poll)),
-            wait_timeout=max(30, int(args.wait_timeout)),
-            transient_rechecks=max(1, int(args.transient_rechecks)),
-            forever=bool(args.forever),
-            fail_open=bool(args.fail_open),
+            backoff_base=args.backoff_base,
+            backoff_max=args.backoff_max,
+            round_timeout=args.round_timeout,
         )
     except KeyboardInterrupt:
-        _log("用户中断")
-        FIX_REQUEST.unlink(missing_ok=True)
-        sys.exit(0)
+        _emit("marathon_stopped", reason="keyboard_interrupt")
     finally:
         _release_singleton_lock()

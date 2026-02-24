@@ -16,7 +16,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-async def test_planner_v2():
+async def smoke_planner_v2():
     """测试多 Agent 规划"""
     print("\n" + "="*60)
     print("测试 Planner V2 — 多专家并行规划")
