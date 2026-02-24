@@ -41,3 +41,9 @@ reports/inspections/*.json
 
 # Gap reports (local research artifacts)
 gap/
+
+# 任务导出目录（运行时生成）
+exports/
+
+# 临时可视化文件
+*.svg
