@@ -119,28 +119,78 @@ def _derive_failure_stage(error: str | None) -> str:
     return "unknown"
 
 
-def _is_legacy_partial_rounds_policy_error(error: str | None) -> bool:
-    """兼容历史严格模式：轮次不足曾用 POLICY_VIOLATION 表达。"""
-    if not error:
-        return False
+def _build_policy_violation(
+    *,
+    violation_type: str,
+    required_rounds: int,
+    actual_rounds: int,
+    required_agents: int,
+    actual_agents: int,
+    actual_domains: int | None = None,
+    required_domains: int | None = None,
+    detail: str | None = None,
+) -> dict:
+    payload = {
+        "violation_type": violation_type,
+        "actual_rounds": int(actual_rounds),
+        "required_rounds": int(required_rounds),
+        "actual_agents": int(actual_agents),
+        "required_agents": int(required_agents),
+    }
+    if actual_domains is not None:
+        payload["actual_domains"] = int(actual_domains)
+    if required_domains is not None:
+        payload["required_domains"] = int(required_domains)
+    if detail:
+        payload["detail"] = str(detail)
 
-    err = str(error).lower()
-    if "[policy_violation]" not in err:
-        return False
-    if "rounds<" not in err:
-        return False
-    if "zero_rounds_completed" in err:
-        return False
-
-    hard_policy_markers = (
-        "domains<",
-        "available_agents<",
-        "round_",
+    ordered_keys = [
+        "violation_type",
+        "actual_rounds",
+        "required_rounds",
         "actual_agents",
-        "declared_domains<",
-    )
-    return not any(marker in err for marker in hard_policy_markers)
+        "required_agents",
+        "actual_domains",
+        "required_domains",
+        "detail",
+    ]
+    kv = [f"{k}={payload[k]}" for k in ordered_keys if k in payload]
+    payload["error"] = f"[POLICY_VIOLATION] {' '.join(kv)}"
+    return payload
 
+
+def _format_policy_shortfall_detail(
+    *,
+    actual_rounds: int,
+    required_rounds: int,
+    actual_agents: int,
+    required_agents: int,
+    violation_type: str | None = None,
+) -> str:
+    shortfalls: list[str] = []
+
+    include_agents = violation_type in (None, "", "agents_insufficient")
+    include_rounds = violation_type in (None, "", "rounds_insufficient")
+
+    if include_agents and actual_agents < required_agents:
+        shortfalls.append(f"actual_agents={actual_agents}<{required_agents}")
+    if include_rounds and actual_rounds < required_rounds:
+        shortfalls.append(f"actual_rounds={actual_rounds}<{required_rounds}")
+
+    if not shortfalls:
+        if actual_agents < required_agents:
+            shortfalls.append(f"actual_agents={actual_agents}<{required_agents}")
+        if actual_rounds < required_rounds:
+            shortfalls.append(f"actual_rounds={actual_rounds}<{required_rounds}")
+
+    return " or ".join(shortfalls) if shortfalls else "post_discussion_policy_check_failed"
+
+
+def _coerce_non_negative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except Exception:
+        return int(default)
 
 def _is_transient_policy_shortage(error: str | None) -> bool:
     if not error:
@@ -148,15 +198,8 @@ def _is_transient_policy_shortage(error: str | None) -> bool:
     err = str(error).lower()
     if "[policy_violation]" not in err:
         return False
-    shortage_markers = (
-        "declared_domains<",
-        "available_agents<",
-        "round_",
-        "rounds<",
-        "actual_agents=",
-        "actual_rounds=",
-    )
-    return any(marker in err for marker in shortage_markers)
+    # 严格策略违规统一视为显性失败，避免被误判为可忽略瞬态。
+    return False
 
 
 def _is_terminal_failure(*, strict: bool, failure_stage: str, failure_error: str | None) -> bool:
@@ -227,15 +270,20 @@ def _compute_discussion_timeout_sec(
     rounds = max(1, int(required_rounds or 1))
     agents = max(1, int(required_agents or 1))
 
-    round_floor_per_round = 30.0 + 5.0 * min(agents, 6)
+    if strict:
+        round_floor_per_round = 42.0 + 6.0 * min(agents, 6)
+        baseline = 420.0
+    else:
+        round_floor_per_round = 30.0 + 5.0 * min(agents, 6)
+        baseline = 180.0
+
     round_floor_total = rounds * round_floor_per_round
 
     estimate_window = 0.0
     if estimated_minutes > 0:
-        estimate_multiplier = 1.8 if strict else 1.2
+        estimate_multiplier = 2.0 if strict else 1.2
         estimate_window = estimated_minutes * 60.0 * estimate_multiplier
 
-    baseline = 240.0 if strict else 180.0
     timeout = max(baseline, round_floor_total, estimate_window)
     return min(7200.0, timeout)
 
@@ -345,10 +393,21 @@ async def _execute_multi_agent_discussion(
 
     unique_domains = list(dict.fromkeys(domains))
     if len(unique_domains) < min_agents and strict:
+        pv = _build_policy_violation(
+            violation_type="domains_insufficient",
+            required_rounds=min_rounds,
+            actual_rounds=0,
+            required_agents=min_agents,
+            actual_agents=0,
+            actual_domains=len(unique_domains),
+            required_domains=min_agents,
+            detail="declared_domains_below_min_agents",
+        )
         return (
             {
                 "success": False,
-                "error": f"[POLICY_VIOLATION] domains<{min_agents}",
+                "error": pv["error"],
+                "policy_violation": pv,
                 "result": None,
                 "specialist_id": None,
                 "assigned_agents": [],
@@ -380,10 +439,21 @@ async def _execute_multi_agent_discussion(
 
     unique_specialist_ids = list(dict.fromkeys([s["id"] for s in specialists]))
     if strict and len(unique_specialist_ids) < min_agents:
+        pv = _build_policy_violation(
+            violation_type="agents_insufficient",
+            required_rounds=min_rounds,
+            actual_rounds=0,
+            required_agents=min_agents,
+            actual_agents=len(unique_specialist_ids),
+            actual_domains=len(unique_domains),
+            required_domains=min_agents,
+            detail="available_agents_below_min_agents",
+        )
         return (
             {
                 "success": False,
-                "error": f"[POLICY_VIOLATION] available_agents<{min_agents}",
+                "error": pv["error"],
+                "policy_violation": pv,
                 "result": None,
                 "specialist_id": None,
                 "actual_agents_used": len(unique_specialist_ids),
@@ -432,7 +502,7 @@ async def _execute_multi_agent_discussion(
     rounds_executed = 0
     successful_agent_ids: list[str] = []
     discussion_started_monotonic = _time.monotonic()
-
+    deadline_reached = False
     async def _call_round_specialist(spec: dict, round_idx: int, prior_round_digest: str) -> dict:
         prompt = (
             f"You are a senior {spec['domain']} specialist in a multi-agent discussion.\n"
@@ -511,9 +581,18 @@ async def _execute_multi_agent_discussion(
 
     prior_digest = "No prior round yet."
     for round_idx in range(1, min_rounds + 1):
-        # 预算截止检查：超时则用已完成轮次做部分合成，不直接 fail
+        # 预算截止检查：超时立即收敛为 strict 轮次不足失败（fail-closed）
         if deadline and _time.monotonic() > deadline:
-            logger.warning("[discussion] deadline reached before round %d/%d, proceeding to synthesis", round_idx, min_rounds)
+            elapsed_seconds = _time.monotonic() - discussion_started_monotonic
+            logger.warning(
+                "[discussion] deadline reached before round %d/%d | rounds_executed=%d | discussion_timeout_sec=%.1f | elapsed_seconds=%.1f",
+                round_idx,
+                min_rounds,
+                rounds_executed,
+                float(discussion_timeout_sec or 0.0),
+                elapsed_seconds,
+            )
+            deadline_reached = True
             break
         batch = await asyncio.gather(
             *[_call_round_specialist(spec, round_idx, prior_digest) for spec in specialists],
@@ -593,18 +672,23 @@ async def _execute_multi_agent_discussion(
 
         active_agents = len(responded_agent_ids)
         if strict and active_agents < min_agents:
-            return (
-                {
-                    "success": False,
-                    "error": f"[POLICY_VIOLATION] round_{round_idx}_agents<{min_agents}",
-                    "result": None,
-                    "specialist_id": None,
-                    "assigned_agents": [],
-                    "actual_agents_used": active_agents,
-                    "actual_discussion_rounds": rounds_executed,
-                },
-                discussion_log,
+            logger.warning(
+                "[discussion] round agents below minimum | round=%d/%d | active_agents=%d | required_agents=%d",
+                round_idx,
+                min_rounds,
+                active_agents,
+                min_agents,
             )
+            discussion_log.append({
+                "agent": "policy_guard",
+                "domain": "policy",
+                "round": round_idx,
+                "content": (
+                    "[policy_warning] round_agents_below_min_agents "
+                    f"actual_agents={active_agents} required_agents={min_agents}"
+                ),
+                "type": "policy_warning",
+            })
 
 
         rounds_executed = round_idx
@@ -619,22 +703,40 @@ async def _execute_multi_agent_discussion(
             digest_lines.append(f"- {e['domain']}({e['agent']}): {e['content'][:240]}")
         prior_digest = "\n".join(digest_lines) or "No substantial updates."
 
-    # 严格模式轮次不足：仅在 0 轮完成时才 fail；>=1 轮允许降级继续合成
-    if strict and rounds_executed == 0:
+    # 严格模式轮次不足：必须 fail-closed（包括 1..N-1）
+    if strict and rounds_executed < min_rounds:
+        elapsed_seconds = _time.monotonic() - discussion_started_monotonic
+        logger.warning(
+            "[discussion] partial rounds under strict policy | required_rounds=%d | rounds_executed=%d | discussion_timeout_sec=%.1f | elapsed_seconds=%.1f | deadline_reached=%s",
+            min_rounds,
+            rounds_executed,
+            float(discussion_timeout_sec or 0.0),
+            elapsed_seconds,
+            deadline_reached,
+        )
+        pv = _build_policy_violation(
+            violation_type="rounds_insufficient",
+            required_rounds=min_rounds,
+            actual_rounds=rounds_executed,
+            required_agents=min_agents,
+            actual_agents=len(successful_agent_ids),
+            actual_domains=len(unique_domains),
+            required_domains=min_agents,
+            detail="discussion_rounds_below_minimum",
+        )
         return (
             {
                 "success": False,
-                "error": f"[POLICY_VIOLATION] rounds<{min_rounds} (zero_rounds_completed)",
+                "error": pv["error"],
+                "policy_violation": pv,
                 "result": None,
                 "specialist_id": None,
                 "assigned_agents": successful_agent_ids,
                 "actual_agents_used": len(unique_specialist_ids),
-                "actual_discussion_rounds": 0,
+                "actual_discussion_rounds": rounds_executed,
             },
             discussion_log,
         )
-    if strict and rounds_executed < min_rounds:
-        logger.warning("[discussion] partial rounds=%d/%d, proceeding to synthesis", rounds_executed, min_rounds)
 
     transcript = []
     for r in range(1, rounds_executed + 1):
@@ -905,56 +1007,96 @@ async def executor_node(state: GraphState) -> dict:
 
     specialist_id = call_result.get("specialist_id")
     assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
-    actual_agents_used = int(call_result.get("actual_agents_used") or 0)
-    actual_rounds = int(call_result.get("actual_discussion_rounds") or 0)
+    actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), 0)
+    actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), 0)
     synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or 0.0)
 
-    strict_unmet = (
-        policy.strict_enforcement
-        and (actual_agents_used < required_agents or actual_rounds < required_rounds)
-    )
+    agents_shortfall = actual_agents_used < required_agents
+    rounds_shortfall = actual_rounds < required_rounds
+    strict_unmet = policy.strict_enforcement and (agents_shortfall or rounds_shortfall)
 
-    if strict_unmet and call_result.get("success"):
+    if strict_unmet:
+        violation_type = "agents_insufficient" if agents_shortfall else "rounds_insufficient"
+        existing_violation = call_result.get("policy_violation") or {}
+        shortfall_detail = _format_policy_shortfall_detail(
+            actual_rounds=actual_rounds,
+            required_rounds=required_rounds,
+            actual_agents=actual_agents_used,
+            required_agents=required_agents,
+            violation_type=violation_type,
+        )
+        if not existing_violation:
+            pv = _build_policy_violation(
+                violation_type=violation_type,
+                required_rounds=required_rounds,
+                actual_rounds=actual_rounds,
+                required_agents=required_agents,
+                actual_agents=actual_agents_used,
+                actual_domains=len(declared_domains),
+                required_domains=required_agents,
+                detail=shortfall_detail,
+            )
+        else:
+            pv = dict(existing_violation)
+            pv["violation_type"] = violation_type
+            pv["actual_rounds"] = actual_rounds
+            pv["required_rounds"] = required_rounds
+            pv["actual_agents"] = actual_agents_used
+            pv["required_agents"] = required_agents
+            pv["actual_domains"] = _coerce_non_negative_int(pv.get("actual_domains"), len(declared_domains))
+            pv["required_domains"] = _coerce_non_negative_int(pv.get("required_domains"), required_agents)
+            pv["detail"] = shortfall_detail
+            pv["error"] = _build_policy_violation(
+                violation_type=str(pv.get("violation_type")),
+                required_rounds=required_rounds,
+                actual_rounds=actual_rounds,
+                required_agents=required_agents,
+                actual_agents=actual_agents_used,
+                actual_domains=_coerce_non_negative_int(pv.get("actual_domains"), len(declared_domains)),
+                required_domains=_coerce_non_negative_int(pv.get("required_domains"), required_agents),
+                detail=str(pv.get("detail", shortfall_detail)),
+            )["error"]
+
         call_result = {
             "success": False,
-            "error": (
-                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents} "
-                f"or actual_rounds={actual_rounds}<{required_rounds}"
-            ),
+            "error": pv["error"],
+            "policy_violation": pv,
             "result": None,
             "specialist_id": specialist_id,
             "assigned_agents": assigned_agents,
             "actual_agents_used": actual_agents_used,
             "actual_discussion_rounds": actual_rounds,
+            "original_error": call_result.get("error"),
         }
+    else:
+        maybe_policy_error = str(call_result.get("error") or "")
+        if "[policy_violation]" in maybe_policy_error.lower():
+            sanitized_error = call_result.get("original_error") or "discussion_round_failure:policy_violation_without_shortfall"
+            call_result = {
+                **call_result,
+                "error": sanitized_error,
+                "original_error": call_result.get("original_error") or maybe_policy_error,
+                "policy_violation": None,
+            }
 
     failure_error = call_result.get("error")
     fallback_reason = None
     if policy.strict_enforcement and not call_result.get("success"):
         err = str(failure_error or "").lower()
-        partial_rounds = 0 < actual_rounds < required_rounds
-        agents_sufficient = actual_agents_used >= required_agents
+        failure_stage = _derive_failure_stage(failure_error)
+        hard_policy_violation = strict_unmet
 
-        hard_policy_violation = False
-        if "[policy_violation]" in err and not _is_legacy_partial_rounds_policy_error(failure_error):
-            hard_policy_violation = True
-        if any(marker in err for marker in ("domains<", "available_agents<", "round_", "actual_agents", "declared_domains<")):
-            hard_policy_violation = True
-
-        fallback_candidates = (
-            "discussion_total_timeout" in err
-            or "deadline" in err
-            or "discussion_synthesis_timeout" in err
-            or "synthesis_empty" in err
-            or _is_legacy_partial_rounds_policy_error(failure_error)
+        synthesis_or_tail_failure = (
+            actual_agents_used >= required_agents
+            and actual_rounds >= required_rounds
+            and not hard_policy_violation
+            and (
+                "synthesis_empty" in err
+                or failure_stage == "discussion_synthesis_timeout"
+            )
         )
 
-        if agents_sufficient and partial_rounds and fallback_candidates and not hard_policy_violation:
-            fallback_reason = "strict_partial_rounds_timeout"
-        elif agents_sufficient and actual_rounds > 0 and (
-            "synthesis_empty" in err
-            or "discussion_synthesis_timeout" in err
-        ) and not hard_policy_violation:
+        if synthesis_or_tail_failure:
             fallback_reason = "strict_synthesis_empty_or_timeout"
 
         if fallback_reason:
@@ -970,15 +1112,21 @@ async def executor_node(state: GraphState) -> dict:
             )
             specialist_id = call_result.get("specialist_id")
             assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
-            actual_agents_used = int(call_result.get("actual_agents_used") or actual_agents_used)
-            actual_rounds = int(call_result.get("actual_discussion_rounds") or actual_rounds)
+            actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), actual_agents_used)
+            actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), actual_rounds)
             synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or synthesis_timeout_sec)
 
     if not call_result.get("success"):
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
         failure_error = call_result.get("error")
         failure_stage = _derive_failure_stage(failure_error)
-        terminal_failure = _is_terminal_failure(
+        policy_violation = call_result.get("policy_violation") or {}
+        hard_terminal = (
+            policy.strict_enforcement
+            and not bool(call_result.get("fallback_applied"))
+            and strict_unmet
+        )
+        terminal_failure = hard_terminal or _is_terminal_failure(
             strict=policy.strict_enforcement,
             failure_stage=failure_stage,
             failure_error=failure_error,
@@ -1005,6 +1153,7 @@ async def executor_node(state: GraphState) -> dict:
                 "task_id": next_task.id,
                 "error": failure_error,
                 "failure_stage": failure_stage,
+                "violation_type": policy_violation.get("violation_type"),
                 "terminal": terminal_failure,
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
@@ -1135,6 +1284,7 @@ async def executor_node(state: GraphState) -> dict:
             "discussion_timeout_sec": discussion_timeout_sec,
             "synthesis_timeout_sec": synthesis_timeout_sec,
             "failure_stage": _derive_failure_stage(call_result.get("original_error") or call_result.get("error")),
+            "violation_type": (call_result.get("policy_violation") or {}).get("violation_type"),
             "fallback_applied": bool(call_result.get("fallback_applied")),
             "fallback_reason": call_result.get("fallback_reason"),
             "original_error": call_result.get("original_error") or call_result.get("error"),
