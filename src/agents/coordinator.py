@@ -189,14 +189,27 @@ class CoordinatorAgent:
         # 构建依赖图
         task_deps: dict[str, set[str]] = {}
         task_to_agent: dict[str, str] = {}
+        task_to_priority: dict[str, float] = {}
+
+        def _subtask_get(st: Any, key: str, default: Any = None):
+            if isinstance(st, dict):
+                return st.get(key, default)
+            return getattr(st, key, default)
 
         for i, subtask in enumerate(subtasks):
-            task_id = subtask.id if hasattr(subtask, 'id') else subtask.get('id', f'task_{i}')
+            task_id = _subtask_get(subtask, 'id', f'task_{i}')
+            task_id = str(task_id)
             agent = agents[i] if i < len(agents) else agents[-1]
             task_to_agent[task_id] = agent
 
-            deps = subtask.dependencies if hasattr(subtask, 'dependencies') else subtask.get('dependencies', [])
-            task_deps[task_id] = set(deps) if deps else set()
+            deps = _subtask_get(subtask, 'dependencies', []) or []
+            task_deps[task_id] = {str(d) for d in deps}
+
+            raw_priority = _subtask_get(subtask, 'priority', None)
+            if isinstance(raw_priority, (int, float)):
+                task_to_priority[task_id] = float(raw_priority)
+            else:
+                task_to_priority[task_id] = 0.0
 
         # Kahn 算法拓扑排序
         in_degree = {t: 0 for t in task_deps}
@@ -211,10 +224,7 @@ class CoordinatorAgent:
 
         while queue:
             # 按优先级排序（高优先级先执行）
-            queue.sort(key=lambda t: (
-                -subtasks[[s.id if hasattr(s, 'id') else s.get('id') for s in subtasks].index(t)].priority
-                if hasattr(subtasks[0], 'priority') else 0
-            ))
+            queue.sort(key=lambda t: -task_to_priority.get(t, 0.0))
             current = queue.pop(0)
             ordered_tasks.append(current)
 

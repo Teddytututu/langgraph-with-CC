@@ -183,6 +183,12 @@ class SDKExecutor:
 
             _log = logging.getLogger("sdk_executor")
 
+            # 防止在 Claude Code 会话内再次启动 Claude Code（nested session）
+            _cc_env_backup: dict[str, str] = {}
+            for _k in ("CLAUDECODE", "CLAUDE_CODE"):
+                if _k in os.environ:
+                    _cc_env_backup[_k] = os.environ.pop(_k)
+
             try:
                 async for message in query(prompt=task_prompt, options=options):
                     if message is None:
@@ -224,6 +230,9 @@ class SDKExecutor:
                 if not got_result_message and not messages:
                     raise stream_err
                 # 否则已有足够数据，继续
+            finally:
+                for _k, _v in _cc_env_backup.items():
+                    os.environ[_k] = _v
 
             # 优先使用 ResultMessage.result，其次是流式收集的内容
             if result_message_content:
@@ -264,6 +273,8 @@ class SDKExecutor:
                 completed_at=datetime.now().isoformat(),
             )
 
+
+
         except Exception as e:
             return SubagentResult(
                 success=False,
@@ -284,6 +295,8 @@ class SDKExecutor:
         parts.append("- 严禁新增功能、需求外扩展、与修复目标无关的改造")
         parts.append("- 优先使用 Python 生态完成实现、测试、脚本与验证命令")
         parts.append("- 输出必须可验证：说明修复动作、验证命令、验证结果与证据路径")
+        parts.append("- 复现入口必须提供可直接执行命令，不得仅提供条件描述")
+        parts.append("- 证据锚点必须采用关键词/检索命令/文件路径；禁止仅用固定行号")
         parts.append("")
 
         # 子任务信息
@@ -343,9 +356,20 @@ class SDKExecutor:
         subtask_id = context.get("subtask", {}).get("id", "task")
         parts.append("## ║ 输出要求")
         parts.append(f"1. 将详细的工作成果写入文件 `reports/{subtask_id}.md`，使用标准 Markdown 格式")
-        parts.append("2. 文件必须包含：执行摘要、修复内容、验证步骤与结果、交付物路径")
-        parts.append("3. 在最终一条回复中输出 major task 摘要（修复内容 + 验证结论 + 报告路径）")
-        parts.append(f"4. 同步写入结构化产物 `reports/{subtask_id}.json`，字段至少包含 summary、verification、artifacts")
+        parts.append("2. Markdown 必须包含以下章节（缺一不可）：")
+        parts.append("   - Reproduction Commands")
+        parts.append("   - Verification Commands & Results")
+        parts.append("   - Evidence Anchors (keyword/command/path)")
+        parts.append("3. Reproduction/Verification 章节必须包含可直接复制执行的命令块与对应结果")
+        parts.append("4. Evidence Anchors 必须提供关键词 + 检索命令 + 文件路径，禁止仅固定行号锚点")
+        parts.append("5. 在最终一条回复中输出 major task 摘要（修复内容 + 验证结论 + 报告路径）")
+        parts.append("6. 同步写入结构化产物 `reports/{subtask_id}.json`，字段至少包含：")
+        parts.append("   - summary")
+        parts.append("   - verification")
+        parts.append("   - artifacts")
+        parts.append("   - reproduction.commands[]")
+        parts.append("   - verification.commands[]")
+        parts.append("   - evidence_anchors[]")
 
         return "\n".join(parts)
 

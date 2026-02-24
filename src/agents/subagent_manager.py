@@ -66,14 +66,14 @@ class SubagentManager:
                 state=SubagentState.READY  # 独立 subagent 始终为 ready
             )
 
-        # 初始化编号池（agent_01 ~ agent_40）
-        for i in range(1, 41):
+        # 初始化编号池（agent_01 ~ agent_60）
+        for i in range(1, 61):
             agent_id = f"agent_{i:02d}"
             self.states[agent_id] = SubagentInfo(agent_id=agent_id)
 
     def get_next_empty(self) -> Optional[str]:
         """获取下一个空槽位（编号池）"""
-        for i in range(1, 41):
+        for i in range(1, 61):
             agent_id = f"agent_{i:02d}"
             if self.states[agent_id].state == SubagentState.EMPTY:
                 return agent_id
@@ -90,7 +90,7 @@ class SubagentManager:
             可用的 agent_id 或 None
         """
         # 首先查找编号池中 ready 状态的
-        for i in range(1, 41):
+        for i in range(1, 61):
             agent_id = f"agent_{i:02d}"
             info = self.states[agent_id]
             if info.state == SubagentState.READY:
