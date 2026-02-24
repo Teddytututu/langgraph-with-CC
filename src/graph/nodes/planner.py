@@ -449,6 +449,24 @@ async def planner_node(state: GraphState) -> dict:
     }
 
 
+def _coerce_list_of_str(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def _parse_subtasks_from_result(result_data, budget) -> list[SubTask]:
     """从 subagent 结果中解析子任务"""
     import re as _re
@@ -490,11 +508,11 @@ def _parse_subtasks_from_result(result_data, budget) -> list[SubTask]:
                 title=task_data.get("title", "未命名任务"),
                 description=task_data.get("description", ""),
                 agent_type=task_data.get("agent_type", "coder"),
-                dependencies=task_data.get("dependencies", []),
+                dependencies=_coerce_list_of_str(task_data.get("dependencies", [])),
                 priority=task_data.get("priority", 1),
                 estimated_minutes=task_data.get("estimated_minutes", 10),
-                knowledge_domains=task_data.get("knowledge_domains", []),
-                completion_criteria=task_data.get("completion_criteria", []),
+                knowledge_domains=_coerce_list_of_str(task_data.get("knowledge_domains", [])),
+                completion_criteria=_coerce_list_of_str(task_data.get("completion_criteria", [])),
             ))
 
     return subtasks

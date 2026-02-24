@@ -119,6 +119,104 @@ def _derive_failure_stage(error: str | None) -> str:
     return "unknown"
 
 
+def _is_legacy_partial_rounds_policy_error(error: str | None) -> bool:
+    """兼容历史严格模式：轮次不足曾用 POLICY_VIOLATION 表达。"""
+    if not error:
+        return False
+
+    err = str(error).lower()
+    if "[policy_violation]" not in err:
+        return False
+    if "rounds<" not in err:
+        return False
+    if "zero_rounds_completed" in err:
+        return False
+
+    hard_policy_markers = (
+        "domains<",
+        "available_agents<",
+        "round_",
+        "actual_agents",
+        "declared_domains<",
+    )
+    return not any(marker in err for marker in hard_policy_markers)
+
+
+def _is_transient_policy_shortage(error: str | None) -> bool:
+    if not error:
+        return False
+    err = str(error).lower()
+    if "[policy_violation]" not in err:
+        return False
+    shortage_markers = (
+        "declared_domains<",
+        "available_agents<",
+        "round_",
+        "rounds<",
+        "actual_agents=",
+        "actual_rounds=",
+    )
+    return any(marker in err for marker in shortage_markers)
+
+
+def _is_terminal_failure(*, strict: bool, failure_stage: str, failure_error: str | None) -> bool:
+    if failure_stage == "policy_violation":
+        return not _is_transient_policy_shortage(failure_error)
+    if not strict:
+        return False
+    transient_stages = {
+        "discussion_total_timeout",
+        "discussion_synthesis_timeout",
+        "discussion_round_call_timeout",
+        "discussion_round_failure",
+        "specialist_init_failure",
+    }
+    if failure_stage in transient_stages:
+        return False
+    return True
+
+
+def _build_discussion_fallback_result(
+    *,
+    task: SubTask,
+    call_result: dict,
+    required_rounds: int,
+    actual_rounds: int,
+    required_agents: int,
+    actual_agents_used: int,
+    fallback_reason: str,
+    original_error: str | None,
+) -> dict:
+    """将可接受的严格模式部分失败降级为可观测的成功结果。"""
+    summary = (
+        f"[DISCUSSION_FALLBACK] task={task.id}; "
+        f"rounds={actual_rounds}/{required_rounds}; "
+        f"agents={actual_agents_used}/{required_agents}; "
+        f"reason={fallback_reason}; "
+        f"original_error={original_error or 'none'}"
+    )
+
+    result_text = str(call_result.get("result") or "").strip()
+    if not result_text:
+        result_text = summary
+    elif "[DISCUSSION_FALLBACK]" not in result_text:
+        result_text = f"{summary}\n\n{result_text}"
+
+    return {
+        "success": True,
+        "result": result_text,
+        "specialist_id": call_result.get("specialist_id"),
+        "assigned_agents": call_result.get("assigned_agents") or [],
+        "error": None,
+        "original_error": original_error,
+        "fallback_applied": True,
+        "fallback_reason": fallback_reason,
+        "actual_agents_used": actual_agents_used,
+        "actual_discussion_rounds": actual_rounds,
+        "synthesis_timeout_sec": float(call_result.get("synthesis_timeout_sec") or 0.0),
+    }
+
+
 def _compute_discussion_timeout_sec(
     *,
     estimated_minutes: float,
@@ -176,18 +274,32 @@ def _find_next_task(state: GraphState) -> Optional[SubTask]:
 
 
 def _unrecoverable_dependency_reason(task: SubTask, subtasks: list[SubTask]) -> Optional[str]:
-    status_by_id = {t.id: t.status for t in subtasks}
+    by_id = {t.id: t for t in subtasks}
 
-    failed_or_missing = []
+    terminal_failed_or_missing = []
+    transient_blocked = []
     for dep in task.dependencies:
-        dep_status = status_by_id.get(dep)
-        if dep_status is None:
-            failed_or_missing.append(f"{dep}(missing)")
-        elif dep_status == "failed":
-            failed_or_missing.append(dep)
+        dep_task = by_id.get(dep)
+        if dep_task is None:
+            terminal_failed_or_missing.append(f"{dep}(missing)")
+            continue
+        if dep_task.status == "failed":
+            dep_result = str(dep_task.result or "")
+            dep_stage = _derive_failure_stage(dep_result)
+            dep_is_terminal = _is_terminal_failure(
+                strict=True,
+                failure_stage=dep_stage,
+                failure_error=dep_result,
+            )
+            if dep_is_terminal:
+                terminal_failed_or_missing.append(dep)
+            else:
+                transient_blocked.append(dep)
 
-    if failed_or_missing:
-        return f"Dependency failed: {', '.join(failed_or_missing)}"
+    if terminal_failed_or_missing:
+        return f"Dependency failed: {', '.join(terminal_failed_or_missing)}"
+    if transient_blocked:
+        return None
     return None
 
 
@@ -720,33 +832,20 @@ async def executor_node(state: GraphState) -> dict:
     required_rounds = max(1, policy.min_discussion_rounds)
 
     declared_domains = list(dict.fromkeys(next_task.knowledge_domains or [next_task.agent_type]))
-    if policy.strict_enforcement and len(declared_domains) < required_agents:
-        error = f"[POLICY_VIOLATION] declared_domains<{required_agents}"
-        fail_subtasks = [
-            t.model_copy(update={
-                "status": "failed",
-                "result": error,
-                "started_at": started_at,
-                "finished_at": datetime.now(),
-            }) if t.id == next_task.id else t
-            for t in subtasks
-        ]
-        return {
-            "subtasks": fail_subtasks,
-            "current_subtask_id": next_task.id,
-            "phase": "reviewing",
-            "artifacts": artifacts,
-            "execution_log": [{
-                "event": "policy_violation",
-                "task_id": next_task.id,
-                "error": error,
-                "required_agents": required_agents,
-                "declared_domains": len(declared_domains),
-                "timestamp": datetime.now().isoformat(),
-            }],
-        }
-
     domains = declared_domains if policy.strict_enforcement else _ensure_domains(next_task, min_count=max(3, required_agents))
+    preflight_log: list[dict] = []
+
+    if policy.strict_enforcement and len(declared_domains) < required_agents:
+        domains = _ensure_domains(next_task, min_count=required_agents)
+        preflight_log.append({
+            "event": "policy_preflight_adjusted",
+            "task_id": next_task.id,
+            "reason": "declared_domains_insufficient",
+            "required_agents": required_agents,
+            "declared_domains": len(declared_domains),
+            "adjusted_domains": len(domains),
+            "timestamp": datetime.now().isoformat(),
+        })
 
     logger.info(
         "[executor] Starting discussion | task=%s | domains=%s | required_agents=%d | required_rounds=%d | strict=%s",
@@ -812,14 +911,15 @@ async def executor_node(state: GraphState) -> dict:
 
     strict_unmet = (
         policy.strict_enforcement
-        and (actual_agents_used < required_agents)
+        and (actual_agents_used < required_agents or actual_rounds < required_rounds)
     )
 
     if strict_unmet and call_result.get("success"):
         call_result = {
             "success": False,
             "error": (
-                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents}"
+                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents} "
+                f"or actual_rounds={actual_rounds}<{required_rounds}"
             ),
             "result": None,
             "specialist_id": specialist_id,
@@ -828,29 +928,84 @@ async def executor_node(state: GraphState) -> dict:
             "actual_discussion_rounds": actual_rounds,
         }
 
+    failure_error = call_result.get("error")
+    fallback_reason = None
+    if policy.strict_enforcement and not call_result.get("success"):
+        err = str(failure_error or "").lower()
+        partial_rounds = 0 < actual_rounds < required_rounds
+        agents_sufficient = actual_agents_used >= required_agents
+
+        hard_policy_violation = False
+        if "[policy_violation]" in err and not _is_legacy_partial_rounds_policy_error(failure_error):
+            hard_policy_violation = True
+        if any(marker in err for marker in ("domains<", "available_agents<", "round_", "actual_agents", "declared_domains<")):
+            hard_policy_violation = True
+
+        fallback_candidates = (
+            "discussion_total_timeout" in err
+            or "deadline" in err
+            or "discussion_synthesis_timeout" in err
+            or "synthesis_empty" in err
+            or _is_legacy_partial_rounds_policy_error(failure_error)
+        )
+
+        if agents_sufficient and partial_rounds and fallback_candidates and not hard_policy_violation:
+            fallback_reason = "strict_partial_rounds_timeout"
+        elif agents_sufficient and actual_rounds > 0 and (
+            "synthesis_empty" in err
+            or "discussion_synthesis_timeout" in err
+        ) and not hard_policy_violation:
+            fallback_reason = "strict_synthesis_empty_or_timeout"
+
+        if fallback_reason:
+            call_result = _build_discussion_fallback_result(
+                task=next_task,
+                call_result=call_result,
+                required_rounds=required_rounds,
+                actual_rounds=actual_rounds,
+                required_agents=required_agents,
+                actual_agents_used=actual_agents_used,
+                fallback_reason=fallback_reason,
+                original_error=failure_error,
+            )
+            specialist_id = call_result.get("specialist_id")
+            assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
+            actual_agents_used = int(call_result.get("actual_agents_used") or actual_agents_used)
+            actual_rounds = int(call_result.get("actual_discussion_rounds") or actual_rounds)
+            synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or synthesis_timeout_sec)
+
     if not call_result.get("success"):
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
         failure_error = call_result.get("error")
         failure_stage = _derive_failure_stage(failure_error)
+        terminal_failure = _is_terminal_failure(
+            strict=policy.strict_enforcement,
+            failure_stage=failure_stage,
+            failure_error=failure_error,
+        )
+        next_status = "failed" if terminal_failure else "pending"
+        next_phase = "reviewing" if terminal_failure else "executing"
+        failure_prefix = "[AGENT_FAIL]" if terminal_failure else "[AGENT_RETRYABLE]"
         fail_subtasks = [
             t.model_copy(update={
-                "status": "failed",
-                "result": f"[AGENT_FAIL] {failure_error or 'unknown error'}",
+                "status": next_status,
+                "result": f"{failure_prefix} {failure_error or 'unknown error'}",
                 "started_at": started_at,
-                "finished_at": datetime.now(),
+                "finished_at": datetime.now() if terminal_failure else None,
             }) if t.id == next_task.id else t
             for t in subtasks
         ]
         return {
             "subtasks": fail_subtasks,
             "current_subtask_id": next_task.id,
-            "phase": "reviewing",
+            "phase": next_phase,
             "artifacts": artifacts,
             "execution_log": [{
-                "event": "task_failed",
+                "event": "task_failed" if terminal_failure else "task_deferred",
                 "task_id": next_task.id,
                 "error": failure_error,
                 "failure_stage": failure_stage,
+                "terminal": terminal_failure,
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
                 "required_rounds": required_rounds,
@@ -859,6 +1014,9 @@ async def executor_node(state: GraphState) -> dict:
                 "actual_agents_used": actual_agents_used,
                 "discussion_timeout_sec": discussion_timeout_sec,
                 "synthesis_timeout_sec": synthesis_timeout_sec,
+                "fallback_applied": False,
+                "fallback_reason": None,
+                "original_error": failure_error,
                 "timestamp": datetime.now().isoformat(),
             }],
         }
@@ -976,7 +1134,10 @@ async def executor_node(state: GraphState) -> dict:
             "actual_agents_used": actual_agents_used,
             "discussion_timeout_sec": discussion_timeout_sec,
             "synthesis_timeout_sec": synthesis_timeout_sec,
-            "failure_stage": "none",
+            "failure_stage": _derive_failure_stage(call_result.get("original_error") or call_result.get("error")),
+            "fallback_applied": bool(call_result.get("fallback_applied")),
+            "fallback_reason": call_result.get("fallback_reason"),
+            "original_error": call_result.get("original_error") or call_result.get("error"),
             "timestamp": datetime.now().isoformat(),
         }],
     }
