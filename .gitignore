@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 checkpoints.db
 .claude/output/
+.claude/worktrees/
 *.egg-info/
 dist/
 build/
@@ -18,6 +19,8 @@ decision_request.json
 decision_result.json
 stuck_report.json
 fix_request.json
+uvicorn_err.log
+*.log
 
 app_state.json
 sdk_debug.log
@@ -35,3 +38,6 @@ reports/*.json
 reports/inspections/*.md
 reports/inspections/*.json
 !reports/inspections/.gitkeep
+
+# Gap reports (local research artifacts)
+gap/
