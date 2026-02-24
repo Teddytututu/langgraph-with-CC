@@ -1711,7 +1711,7 @@ def register_routes(app: FastAPI):
                 "artifacts": {},
                 "phase": "init",
                 "iteration": 0,
-                "max_iterations": 3,
+                "max_iterations": 10,  # 给足重试和纠错空间
                 "stalled_event": None,
                 "error": None,
                 "final_output": None,

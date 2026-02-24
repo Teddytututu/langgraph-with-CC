@@ -169,11 +169,6 @@ class SDKExecutor:
 
             options = ClaudeAgentOptions(**options_kwargs)
 
-            # 执行前确保无 auth 冲突：ANTHROPIC_API_KEY 优先，临时移除 AUTH_TOKEN
-            _auth_token_backup = None
-            if os.getenv("ANTHROPIC_API_KEY") and os.getenv("ANTHROPIC_AUTH_TOKEN"):
-                _auth_token_backup = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
             # 执行，迭代完所有消息
             result_data: list[str] = []
             messages = []
@@ -182,12 +177,6 @@ class SDKExecutor:
             result_message_content: str | None = None
 
             _log = logging.getLogger("sdk_executor")
-
-            # 防止在 Claude Code 会话内再次启动 Claude Code（nested session）
-            _cc_env_backup: dict[str, str] = {}
-            for _k in ("CLAUDECODE", "CLAUDE_CODE"):
-                if _k in os.environ:
-                    _cc_env_backup[_k] = os.environ.pop(_k)
 
             try:
                 async for message in query(prompt=task_prompt, options=options):
@@ -230,35 +219,29 @@ class SDKExecutor:
                 if not got_result_message and not messages:
                     raise stream_err
                 # 否则已有足够数据，继续
-            finally:
-                for _k, _v in _cc_env_backup.items():
-                    os.environ[_k] = _v
 
             # 优先使用 ResultMessage.result，其次是流式收集的内容
             if result_message_content:
                 final_result = result_message_content
             elif result_data:
-                final_result = "\n".join(result_data)
+                final_result = “\n”.join(result_data)
             else:
                 # 从 messages 中找最后一条有实际内容的
                 final_result = None
                 for msg in reversed(messages):
-                    if msg.get("type") == "ResultMessage":
-                        v = msg.get("result") or msg.get("raw_result")
+                    if msg.get(“type”) == “ResultMessage”:
+                        v = msg.get(“result”) or msg.get(“raw_result”)
                         if v and str(v).strip():
                             final_result = str(v).strip()
                             break
                     else:
-                        v = msg.get("content")
-                        if v and str(v).strip() and not str(v).startswith("{'type':"):
+                        v = msg.get(“content”)
+                        if v and str(v).strip() and not str(v).startswith(“{'type':”):
                             final_result = str(v).strip()
                             break
-                _log.warning("All result sources empty for agent=%s turns=%d", agent_id, turns)
+                _log.warning(“All result sources empty for agent=%s turns=%d”, agent_id, turns)
 
-            if _auth_token_backup:
-                os.environ["ANTHROPIC_AUTH_TOKEN"] = _auth_token_backup
-
-            # 若没有任何可用结果，视为执行失败（避免上层误判为“秒完成”）
+            # 若没有任何可用结果，视为执行失败（避免上层误判为”秒完成”）
             if not final_result or not str(final_result).strip():
                 return SubagentResult(
                     success=False,

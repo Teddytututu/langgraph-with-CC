@@ -595,6 +595,18 @@ async def _execute_multi_agent_discussion(
 
     prior_digest = "No prior round yet."
     for round_idx in range(1, min_rounds + 1):
+        # === 实时抽取用户在 UI 敲入的干预指令 ===
+        try:
+            # 延迟导入避免循环依赖
+            from src.web.api import app_state
+            user_msgs = app_state.intervention_queues.pop(task.id, [])
+            if user_msgs:
+                user_text = "\n".join([f"[人类主管最高指令]: {m}" for m in user_msgs])
+                prior_digest += f"\n\n🚨 收到人类主管的紧急插入:\n{user_text}"
+                logger.info("[discussion] task=%s round=%d injected %d user interventions", task.id, round_idx, len(user_msgs))
+        except Exception as e:
+            logger.debug("[discussion] intervention queue check skipped: %s", e)
+
         batch = await asyncio.gather(
             *[_call_round_specialist(spec, round_idx, prior_digest) for spec in specialists],
             return_exceptions=True,
