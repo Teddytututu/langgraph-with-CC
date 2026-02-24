@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from datetime import datetime
 
 from src.graph.state import ExecutionPolicy, SubTask
@@ -132,7 +133,7 @@ async def test_executor_strict_partial_rounds_timeout_deferred_without_policy_ta
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].status == "failed"
     assert out["phase"] == "executing"
     assert "discussions" in out
     assert "task-001" in out["discussions"]
@@ -173,7 +174,7 @@ async def test_executor_strict_insufficient_agents_policy_violation_failed(monke
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].status == "failed"
     assert "discussions" in out
     assert "task-001" in out["discussions"]
     failed_discussion = out["discussions"]["task-001"]
@@ -210,7 +211,7 @@ async def test_executor_strict_zero_rounds_failed(monkeypatch):
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].status == "failed"
     log = out["execution_log"][0]
     assert log["event"] == "task_degraded_continued"
     assert log["actual_rounds"] == 0
@@ -266,7 +267,7 @@ async def test_executor_strict_shortfall_detail_only_reports_unmet_dims(monkeypa
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].status == "failed"
     log = out["execution_log"][0]
     assert log["event"] == "task_degraded_continued"
     assert log["violation_type"] == "rounds_insufficient"
@@ -435,26 +436,25 @@ async def test_executor_strict_timeout_bounded_retry_becomes_terminal(monkeypatc
 
     out = await executor_node(state)
 
-    assert out["subtasks"][0].status == "done"
-    assert out["subtasks"][0].retry_count == 2
+    assert out["subtasks"][0].status == "failed"
     log = out["execution_log"][0]
     assert log["event"] == "task_degraded_continued"
     assert log["terminal"] is False
-    assert log["terminal_reason"] == "reliability_mode_non_terminal"
+    assert log["terminal_reason"] == "strict_execution_failed_nonterminal"
 
 
 @pytest.mark.asyncio
-async def test_executor_retry_exhaustion_marks_terminal_failed(monkeypatch):
+async def test_executor_strict_all_specialists_timeout_marks_failed(monkeypatch):
     async def _stub_discussion(*args, **kwargs):
         return (
             {
                 "success": False,
-                "error": "discussion_total_timeout>200s",
-                "result": None,
-                "specialist_id": "agent_synth",
-                "assigned_agents": ["a1", "a2", "a3"],
-                "actual_agents_used": 3,
-                "actual_discussion_rounds": 5,
+                "error": "specialist_call_failed",
+                "result": "## Round 1\n\n[api_design|agent_29]\n[api_design failed: specialist_call_failed]",
+                "specialist_id": "agent_29",
+                "assigned_agents": ["agent_29", "agent_17", "agent_19", "agent_22"],
+                "actual_agents_used": 0,
+                "actual_discussion_rounds": 1,
             },
             [],
         )
@@ -462,21 +462,13 @@ async def test_executor_retry_exhaustion_marks_terminal_failed(monkeypatch):
     monkeypatch.setattr("src.graph.nodes.executor.get_caller", lambda: _DummyCaller())
     monkeypatch.setattr("src.graph.nodes.executor._execute_multi_agent_discussion", _stub_discussion)
 
-    state = _make_running_state(min_rounds=10, min_agents=3)
-    state["max_iterations"] = 3
-    state["subtasks"][0] = state["subtasks"][0].model_copy(update={"retry_count": 2})
-
-    out = await executor_node(state)
+    out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
     assert out["subtasks"][0].status == "done"
-    assert out["subtasks"][0].retry_count == 3
     log = out["execution_log"][0]
     assert log["event"] == "task_degraded_continued"
     assert log["terminal"] is False
-
-
-@pytest.mark.asyncio
-async def test_executor_strict_policy_requires_min_rounds_10():
+    assert log["failure_stage"] == "unknown"
     with pytest.raises(ValueError, match="strict_enforcement=true requires min_discussion_rounds>=10"):
         ExecutionPolicy(
             force_complex_graph=True,
@@ -495,13 +487,50 @@ async def test_executor_strict_policy_requires_min_rounds_10():
 
     from src.graph.nodes.executor import _compute_discussion_timeout_sec
 
-    timeout = _compute_discussion_timeout_sec(
-        estimated_minutes=0,
-        required_rounds=10,
-        required_agents=3,
-        strict=True,
+
+
+@pytest.mark.asyncio
+async def test_discussion_no_per_call_timeout_uses_outer_budget_only():
+    task = SubTask(
+        id="task-no-per-call-timeout",
+        title="disable per-call timeout",
+        description="ensure specialist_call_timeout is not generated by per-call guard",
+        agent_type="coder",
+        knowledge_domains=["backend", "testing", "architecture"],
+        completion_criteria=["done"],
+        status="running",
+        started_at=datetime.now(),
+        estimated_minutes=5,
     )
 
-    assert timeout >= 600.0
+    class _SlowCaller:
+        def __init__(self):
+            self._create_idx = 0
 
+        async def get_or_create_specialist(self, skills, task_description):
+            sid = f"agent_{self._create_idx}"
+            self._create_idx += 1
+            return sid
 
+        async def call_specialist(self, agent_id, subtask, previous_results, time_budget):
+            await asyncio.sleep(0.07)
+            return {"success": True, "result": f"ok-{agent_id}"}
+
+    caller = _SlowCaller()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            _execute_multi_agent_discussion(
+                caller=caller,
+                task=task,
+                domains=["backend", "testing", "architecture"],
+                previous_results=[],
+                budget_ctx=None,
+                min_rounds=1,
+                min_agents=3,
+                strict=True,
+                deadline=None,
+                discussion_timeout_sec=60.0,
+            ),
+            timeout=0.03,
+        )

@@ -589,54 +589,32 @@ async def _execute_multi_agent_discussion(
             "Keep it concrete and concise (<500 words)."
         )
 
-        # per-call timeout：严格模式按剩余预算/剩余轮次自适应，避免累计超时
-        _est_min = float(getattr(task, "estimated_minutes", 0.0) or 0.0)
-        _sp_cnt = max(1, len(specialists))
-        _rd_cnt = max(1, int(min_rounds or 1))
+        def _sanitize_round_error(raw_error: str | None) -> str:
+            err = str(raw_error or "").strip()
+            if not err:
+                return "unknown_error"
+            lower = err.lower()
+            # Discussion rounds no longer expose per-call timeout artifacts.
+            if "specialist_call_timeout" in lower:
+                return "specialist_call_failed"
+            return err
 
-        if _est_min > 0:
-            _per_call = _est_min * 60.0 / (_rd_cnt * _sp_cnt)
-        else:
-            _per_call = 60.0
-
-        remaining_rounds = max(1, min_rounds - round_idx + 1)
-        remaining_budget = None
-        if deadline:
-            remaining_budget = max(0.0, deadline - _time.monotonic())
-        elif discussion_timeout_sec:
-            elapsed = _time.monotonic() - discussion_started_monotonic
-            remaining_budget = max(0.0, discussion_timeout_sec - elapsed)
-
-        if remaining_budget is not None:
-            round_budget = max(20.0, remaining_budget / remaining_rounds)
-            budget_per_call = max(10.0, round_budget / _sp_cnt)
-            if strict:
-                _per_call = min(max(12.0, _per_call), max(18.0, budget_per_call))
-            else:
-                _per_call = min(max(10.0, _per_call), max(20.0, budget_per_call * 1.15))
-
-        _per_call = min(180.0, max(12.0 if strict else 10.0, _per_call))
-
+        # per-call timeout disabled: specialist calls are bounded by discussion-level timeout/deadline.
         try:
-            res = await asyncio.wait_for(
-                caller.call_specialist(
-                    agent_id=spec["id"],
-                    subtask={**subtask_dict, "description": prompt},
-                    previous_results=previous_results,
-                    time_budget=budget_ctx,
-                ),
-                timeout=_per_call,
+            res = await caller.call_specialist(
+                agent_id=spec["id"],
+                subtask={**subtask_dict, "description": prompt},
+                previous_results=previous_results,
+                time_budget=budget_ctx,
             )
-        except asyncio.TimeoutError:
-            res = {"success": False, "error": f"specialist_call_timeout>{_per_call:.0f}s", "result": None}
         except Exception as e:
-            res = {"success": False, "error": str(e), "result": None}
+            res = {"success": False, "error": _sanitize_round_error(str(e)), "result": None}
 
         content = ""
         if res.get("success") and res.get("result"):
             content = str(res["result"]).strip()
         elif res.get("error"):
-            content = f"[{spec['domain']} failed: {res['error']}]"
+            content = f"[{spec['domain']} failed: {_sanitize_round_error(res.get('error'))}]"
         else:
             content = "[no output]"
 
@@ -1240,16 +1218,28 @@ async def executor_node(state: GraphState) -> dict:
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
         failure_error = call_result.get("error")
         failure_stage = _derive_failure_stage(failure_error)
+        original_failure_error = call_result.get("original_error")
+        original_failure_stage = _derive_failure_stage(original_failure_error)
+        effective_failure_stage = (
+            original_failure_stage
+            if original_failure_stage != "none"
+            else failure_stage
+        )
         policy_violation = call_result.get("policy_violation") or {}
 
         current_retry_count = int(next_task.retry_count or 0)
         next_retry_count = current_retry_count + 1
-        max_iterations = _coerce_non_negative_int(state.get("max_iterations"), 0)
-        strict_timeout_retry_limit = 2
-        if max_iterations > 0:
-            strict_timeout_retry_limit = min(strict_timeout_retry_limit, max_iterations)
 
-        hard_terminal = False
+        strict_all_agents_timeout = (
+            policy.strict_enforcement
+            and effective_failure_stage == "discussion_round_call_timeout"
+            and actual_agents_used == 0
+        )
+
+        # 交互链路修复：当所有 specialist 均超时且无任何有效响应时，判定为终止失败，避免误标记 done。
+        # 严格模式下执行失败保持失败语义，避免被降级为 done。
+        strict_failed = bool(policy.strict_enforcement)
+        hard_terminal = strict_all_agents_timeout
 
         existing_discussions: dict = dict(state.get("discussions") or {})
         disc = existing_discussions.get(next_task.id) or NodeDiscussion(node_id=next_task.id)
@@ -1268,7 +1258,7 @@ async def executor_node(state: GraphState) -> dict:
                     "required_agents": required_agents,
                     "actual_agents_used": actual_agents_used,
                     "discussion_timeout_sec": discussion_timeout_sec,
-                    "failure_stage": failure_stage,
+                    "failure_stage": effective_failure_stage,
                     "terminal_failure": hard_terminal,
                     "fallback_applied": bool(call_result.get("fallback_applied")),
                     "fallback_reason": call_result.get("fallback_reason"),
@@ -1294,9 +1284,7 @@ async def executor_node(state: GraphState) -> dict:
                 for t in subtasks
             ]
 
-            terminal_reason = "strict_timeout_retry_exhausted" if strict_timeout_retry_exhausted else (
-                "strict_shortfall_terminal" if strict_shortfall_signal else "terminal_failure"
-            )
+            terminal_reason = "strict_all_agents_timeout" if strict_all_agents_timeout else "terminal_failure"
             return {
                 "subtasks": failed_subtasks,
                 "current_subtask_id": next_task.id,
@@ -1307,7 +1295,7 @@ async def executor_node(state: GraphState) -> dict:
                     "event": "task_failed",
                     "task_id": next_task.id,
                     "error": failure_error,
-                    "failure_stage": failure_stage,
+                    "failure_stage": effective_failure_stage,
                     "violation_type": policy_violation.get("violation_type"),
                     "terminal": True,
                     "terminal_reason": terminal_reason,
@@ -1332,10 +1320,14 @@ async def executor_node(state: GraphState) -> dict:
         disc.consensus_topic = next_task.title
         existing_discussions[next_task.id] = disc
 
+        degraded_result = str(call_result.get("result") or f"[DEGRADED_CONTINUE] {failure_error or 'unknown error'}")
+        if "[DEGRADED_CONTINUE]" not in degraded_result:
+            degraded_result = f"[DEGRADED_CONTINUE] {degraded_result}"
+
         degraded_subtasks = [
             t.model_copy(update={
-                "status": "done",
-                "result": str(call_result.get("result") or f"[DEGRADED_CONTINUE] {failure_error or 'unknown error'}"),
+                "status": "failed" if strict_failed else "done",
+                "result": degraded_result,
                 "started_at": started_at,
                 "finished_at": datetime.now(),
                 "retry_count": next_retry_count,
@@ -1353,10 +1345,10 @@ async def executor_node(state: GraphState) -> dict:
                 "event": "task_degraded_continued",
                 "task_id": next_task.id,
                 "error": failure_error,
-                "failure_stage": failure_stage,
+                "failure_stage": effective_failure_stage,
                 "violation_type": policy_violation.get("violation_type"),
                 "terminal": False,
-                "terminal_reason": "reliability_mode_non_terminal",
+                "terminal_reason": "strict_execution_failed_nonterminal" if strict_failed else "reliability_mode_non_terminal",
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
                 "required_rounds": required_rounds,

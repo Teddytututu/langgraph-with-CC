@@ -25,13 +25,36 @@ async def router_node(state: GraphState) -> dict:
 
     # 全部完成 → 汇总输出
     subtasks = state.get("subtasks", [])
-    if subtasks and all(
+    policy = state.get("execution_policy")
+    strict = bool(
+        getattr(policy, "strict_enforcement", False)
+        if policy is not None
+        else False
+    )
+    if isinstance(policy, dict):
+        strict = bool(policy.get("strict_enforcement", False))
+    all_terminal = bool(subtasks) and all(
         t.status in ("done", "skipped", "failed") for t in subtasks
-    ):
+    )
+    strict_blocked = strict and any(
+        str(getattr(t, "status", "") or "").strip() == "failed" for t in subtasks
+    )
+
+    if all_terminal and not strict_blocked:
         return {
             "phase": "complete",
             "final_output": _build_final_output(state, budget=budget),
             "time_budget": budget,
+        }
+
+    if all_terminal and strict_blocked:
+        return {
+            "phase": "reviewing",
+            "time_budget": budget,
+            "stalled_event": {
+                "event": "stalled",
+                "reason": "strict_execution_failed",
+            },
         }
 
     current_iteration = state.get("iteration", 0)

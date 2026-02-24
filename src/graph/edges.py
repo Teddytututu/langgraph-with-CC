@@ -34,7 +34,7 @@ def route_after_router(state: GraphState) -> str:
         return "executing"
     if phase == "reviewing":
         current = _get_current(state)
-        if current is not None:
+        if current is not None and current.status not in ("done", "failed", "skipped"):
             return "reviewing"
         if _all_terminal(subtasks):
             return "complete"
