@@ -566,7 +566,7 @@
 
                     <template v-if="selectedSubtask">
                         <div class="discussion-list">
-                            <div v-for="msg in discussionMessages" :key="msg.id" class="message" :class="msg.message_type">
+                            <div v-for="msg in discussionMessages" :key="msg.id" class="message" :class="[msg.message_type, msg.side]">
                                 <div class="message-avatar">{{ msg.from_agent?.charAt(0)?.toUpperCase() }}</div>
                                 <div class="message-body">
                                     <div class="message-header">

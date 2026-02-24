@@ -257,6 +257,32 @@ createApp({
             return [{ value: 'user', label: 'User' }, ...agents];
         });
 
+        const getDiscussionAssignedAgents = (subtask = selectedSubtask.value) => {
+            if (!subtask || !Array.isArray(subtask.assigned_agents)) return new Set();
+            return new Set(subtask.assigned_agents.filter(Boolean));
+        };
+
+        const resolveSubtaskByDiscussionContext = ({ taskId = '', subtaskId = '', nodeId = '' } = {}) => {
+            if (!selectedTask.value || selectedTask.value.id !== taskId) return null;
+            const subtasks = Array.isArray(selectedTask.value.subtasks) ? selectedTask.value.subtasks : [];
+            return subtasks.find(s => s?.id === subtaskId || s?.id === nodeId) || null;
+        };
+
+        const normalizeDiscussionMessage = (message, subtask = selectedSubtask.value) => {
+            if (!message || typeof message !== 'object') return message;
+            const fromAgent = String(message.from_agent || '').trim();
+            const assignedAgents = getDiscussionAssignedAgents(subtask);
+            const side = (
+                fromAgent === 'user' || (fromAgent && assignedAgents.has(fromAgent))
+            ) ? 'right' : 'left';
+            return { ...message, side };
+        };
+
+        const normalizeDiscussionMessages = (messages = [], subtask = selectedSubtask.value) => {
+            if (!Array.isArray(messages)) return [];
+            return messages.map(msg => normalizeDiscussionMessage(msg, subtask));
+        };
+
         const refreshDiscussionStatusFromSelection = () => {
             const sub = selectedSubtask.value;
             const task = selectedTask.value;
@@ -288,22 +314,25 @@ createApp({
             return merged;
         };
 
-        const upsertDiscussionCache = (taskId, nodeId, incomingMessage = null, participants = null) => {
+        const upsertDiscussionCache = (taskId, nodeId, incomingMessage = null, participants = null, subtaskHint = null) => {
             const key = discussionCacheKey(taskId, nodeId);
             const current = discussionCacheByNode.value[key] || { messages: [], participants: [] };
             const next = {
                 messages: current.messages.slice(),
                 participants: current.participants.slice(),
             };
+            const normalizedIncoming = incomingMessage
+                ? normalizeDiscussionMessage(incomingMessage, subtaskHint)
+                : null;
 
-            if (incomingMessage) {
-                if (!next.messages.find(m => m.id === incomingMessage.id)) {
-                    next.messages.push(incomingMessage);
+            if (normalizedIncoming) {
+                if (!next.messages.find(m => m.id === normalizedIncoming.id)) {
+                    next.messages.push(normalizedIncoming);
                 }
-                if (incomingMessage.from_agent && !next.participants.includes(incomingMessage.from_agent)) {
-                    next.participants.push(incomingMessage.from_agent);
+                if (normalizedIncoming.from_agent && !next.participants.includes(normalizedIncoming.from_agent)) {
+                    next.participants.push(normalizedIncoming.from_agent);
                 }
-                (incomingMessage.to_agents || []).forEach(agent => {
+                (normalizedIncoming.to_agents || []).forEach(agent => {
                     if (agent && !next.participants.includes(agent)) next.participants.push(agent);
                 });
             }
@@ -515,10 +544,17 @@ createApp({
                 case 'discussion_message': {
                     const eventSubtaskId = payload.subtask_id || '';
                     const eventNodeId = payload.node_id || eventSubtaskId;
+                    const contextSubtask = resolveSubtaskByDiscussionContext({
+                        taskId: payload.task_id,
+                        subtaskId: eventSubtaskId,
+                        nodeId: eventNodeId,
+                    });
                     const cache = upsertDiscussionCache(
                         payload.task_id,
                         eventSubtaskId || eventNodeId,
                         payload.message,
+                        null,
+                        contextSubtask,
                     );
 
                     const selectedId = selectedSubtask.value?.id;
@@ -533,8 +569,9 @@ createApp({
                         selectedTask.value?.id === payload.task_id &&
                         matchesSelected
                     ) {
-                        const exists = discussionMessages.value.find(m => m.id === payload.message?.id);
-                        if (!exists) discussionMessages.value.push(payload.message);
+                        const normalizedIncoming = normalizeDiscussionMessage(payload.message, selectedSubtask.value);
+                        const exists = discussionMessages.value.find(m => m.id === normalizedIncoming?.id);
+                        if (!exists && normalizedIncoming) discussionMessages.value.push(normalizedIncoming);
                         discussionParticipants.value = cache.participants.slice();
                         if (eventNodeId && selectedId) {
                             discussionNodeIdBySubtask.value[selectedId] = eventNodeId;
@@ -1247,10 +1284,10 @@ createApp({
                     const canonicalKey = discussionCacheKey(selectedTask.value.id, resolvedNodeId);
                     const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
                     const canonicalCached = discussionCacheByNode.value[canonicalKey] || { messages: [], participants: [] };
-                    const mergedMessages = mergeDiscussionMessages(
+                    const mergedMessages = normalizeDiscussionMessages(mergeDiscussionMessages(
                         data.messages || [],
                         mergeDiscussionMessages(cached.messages || [], canonicalCached.messages || []),
-                    );
+                    ), subtask);
                     discussionMessages.value = mergedMessages;
                     const mergedParticipants = Array.from(new Set([
                         ...(data.participants || []),
@@ -1277,7 +1314,10 @@ createApp({
                     const canonicalKey = discussionCacheKey(selectedTask.value.id, fallbackCanonical);
                     const cached = discussionCacheByNode.value[key] || { messages: [], participants: [] };
                     const canonicalCached = discussionCacheByNode.value[canonicalKey] || { messages: [], participants: [] };
-                    discussionMessages.value = mergeDiscussionMessages(cached.messages || [], canonicalCached.messages || []);
+                    discussionMessages.value = normalizeDiscussionMessages(
+                        mergeDiscussionMessages(cached.messages || [], canonicalCached.messages || []),
+                        subtask,
+                    );
                     discussionParticipants.value = Array.from(new Set([
                         ...(cached.participants || []),
                         ...(canonicalCached.participants || []),
@@ -1307,14 +1347,17 @@ createApp({
                     throw new Error(`HTTP ${res.status}`);
                 }
                 const saved = await res.json();
+                const normalizedSaved = normalizeDiscussionMessage(saved, selectedSubtask.value);
                 // Optimistically add to local list (WS event may also arrive)
-                if (saved?.id && !discussionMessages.value.find(m => m.id === saved.id)) {
-                    discussionMessages.value.push(saved);
+                if (normalizedSaved?.id && !discussionMessages.value.find(m => m.id === normalizedSaved.id)) {
+                    discussionMessages.value.push(normalizedSaved);
                 }
                 upsertDiscussionCache(
                     selectedTask.value?.id,
                     selectedSubtask.value?.id,
-                    saved,
+                    normalizedSaved,
+                    null,
+                    selectedSubtask.value,
                 );
                 refreshDiscussionStatusFromSelection();
                 addTimelineItem({

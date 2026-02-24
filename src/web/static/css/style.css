@@ -1501,6 +1501,15 @@ body {
     position: relative;
 }
 
+.message.left {
+    align-self: flex-start;
+}
+
+.message.right {
+    align-self: flex-end;
+    flex-direction: row-reverse;
+}
+
 @keyframes msgIn {
     from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
@@ -1521,6 +1530,10 @@ body {
     position: relative;
 }
 
+.message.right .message-avatar {
+    background: #5B21B6;
+}
+
 /* 头像装饰 */
 .message-avatar::after {
     content: '';
@@ -1537,12 +1550,36 @@ body {
     padding: 12px 14px;
     border-radius: var(--r-md);
     border-left: 3px solid var(--border-2);
+    max-width: 100%;
+}
+
+.message.right .message-body {
+    background: var(--violet);
+    color: #fff;
+    border-left-color: transparent;
+    border-right: 3px solid #5B21B6;
+    border-bottom-right-radius: 4px;
+}
+
+.message.right .message-sender,
+.message.right .message-time,
+.message.right .message-text {
+    color: #fff;
+}
+
+.message.right .message-header {
+    flex-direction: row-reverse;
 }
 
 .message.query .message-body { border-left-color: var(--blue); }
 .message.response .message-body { border-left-color: var(--success); }
 .message.consensus .message-body { border-left-color: var(--warning); }
 .message.conflict .message-body { border-left-color: var(--error); }
+
+.message.right.query .message-body { border-right-color: var(--blue); }
+.message.right.response .message-body { border-right-color: var(--success); }
+.message.right.consensus .message-body { border-right-color: var(--warning); }
+.message.right.conflict .message-body { border-right-color: var(--error); }
 
 .message-header {
     display: flex;
