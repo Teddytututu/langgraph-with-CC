@@ -64,6 +64,7 @@ def main(port: int = DEFAULT_PORT) -> None:
     seen: set[str] = set()         # 已报告过的信号文件（避免重复）
     server_was_up: bool | None = None
     last_heartbeat: float = 0.0
+    fix_cycle_active = False
 
     while True:
         now = time.monotonic()
@@ -74,6 +75,8 @@ def main(port: int = DEFAULT_PORT) -> None:
                 key = f"{sig_type}:{sig_path.stat().st_mtime}"
                 if key not in seen:
                     seen.add(key)
+                    if sig_type == "fix_request":
+                        fix_cycle_active = True
                     emit({
                         "event":   "signal",
                         "type":    sig_type,
@@ -84,17 +87,28 @@ def main(port: int = DEFAULT_PORT) -> None:
                 # 文件消失 → 清除已见记录，下次出现重新报告
                 to_remove = {k for k in seen if k.startswith(f"{sig_type}:")}
                 seen -= to_remove
+                if sig_type == "fix_request" and fix_cycle_active:
+                    fix_cycle_active = False
+                    emit({"event": "fix_cycle_cleared", "path": str(sig_path)})
 
         # ── 检查服务器健康 ────────────────────────────────────────────
         server_up = is_port_open(port=port)
         if server_up != server_was_up:
             event = "server_up" if server_up else "server_down"
-            emit({"event": event, "port": port})
+            if not (fix_cycle_active and event == "server_down"):
+                emit({"event": event, "port": port})
+            else:
+                emit({"event": "server_down_suppressed", "port": port, "reason": "fix_cycle_active"})
             server_was_up = server_up
 
         # ── 心跳 ──────────────────────────────────────────────────────
         if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-            emit({"event": "heartbeat", "server": "ok" if server_up else "down", "port": port})
+            emit({
+                "event": "heartbeat",
+                "server": "ok" if server_up else "down",
+                "port": port,
+                "fix_cycle_active": fix_cycle_active,
+            })
             last_heartbeat = now
 
         time.sleep(POLL_INTERVAL)

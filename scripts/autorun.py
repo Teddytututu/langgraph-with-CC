@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -40,6 +41,32 @@ FIX_REQUEST  = Path("fix_request.json")   # 写给 Claude Code 的修复请求
 WAIT_POLL    = 3.0    # 秒：等待修复时的轮询间隔
 WAIT_TIMEOUT = 600.0  # 秒：等 Claude Code 修复的最长时间（10 分钟）
 ROOT         = Path(__file__).parent.parent  # 项目根目录
+
+
+def _read_wait_timeout(default_value: float = WAIT_TIMEOUT) -> float:
+    raw = str(os.environ.get("AUTORUN_WAIT_TIMEOUT_SEC", "")).strip()
+    if not raw:
+        return default_value
+    try:
+        parsed = float(raw)
+        if parsed <= 0:
+            return default_value
+        return parsed
+    except Exception:
+        return default_value
+
+
+def _read_verify_timeout(default_value: int = 60) -> int:
+    raw = str(os.environ.get("AUTORUN_VERIFY_TIMEOUT_SEC", "")).strip()
+    if not raw:
+        return default_value
+    try:
+        parsed = int(float(raw))
+        if parsed <= 0:
+            return default_value
+        return parsed
+    except Exception:
+        return default_value
 
 
 def _ts() -> str:
@@ -106,31 +133,35 @@ def _write_fix_request(goal: str, attempt: int, failure: str) -> None:
     _log(f"失败摘要:\n{failure[-600:]}")
 
 
-def _wait_for_fix() -> None:
-    """阻塞直到 Claude Code 删除 fix_request.json，或超时后强制继续。"""
-    deadline = time.monotonic() + WAIT_TIMEOUT
+def _wait_for_fix(wait_timeout_sec: float) -> bool:
+    """阻塞直到 Claude Code 删除 fix_request.json；超时返回 False。"""
+    deadline = time.monotonic() + wait_timeout_sec
     ticks = 0
     while FIX_REQUEST.exists():
         if time.monotonic() > deadline:
-            _log(f"等待修复超时 {int(WAIT_TIMEOUT)}s，强制重试")
-            FIX_REQUEST.unlink(missing_ok=True)
-            return
+            _log(f"等待修复超时 {int(wait_timeout_sec)}s，保持 fix_request.json，等待下一轮")
+            return False
         if ticks % 10 == 0:
-            elapsed = int(time.monotonic() - (deadline - WAIT_TIMEOUT))
-            print(f"  ... 等待修复中 ({elapsed}s / {int(WAIT_TIMEOUT)}s)", flush=True)
+            elapsed = int(time.monotonic() - (deadline - wait_timeout_sec))
+            print(f"  ... 等待修复中 ({elapsed}s / {int(wait_timeout_sec)}s)", flush=True)
         ticks += 1
         time.sleep(WAIT_POLL)
     _log("fix_request.json 已消失 → 修复完成，重新验证")
+    return True
 
 
 def run_loop(goal: str, verify_cmd: str, run_cmd: str | None, max_attempts: int) -> None:
     attempt = 0
     proc: subprocess.Popen | None = None
+    verify_timeout_sec = _read_verify_timeout(60)
+    wait_timeout_sec = _read_wait_timeout(WAIT_TIMEOUT)
 
     FIX_REQUEST.unlink(missing_ok=True)   # 清理上次遗留
 
     _log(f"目标   : {goal}")
     _log(f"验证   : {verify_cmd}")
+    _log(f"验证超时: {verify_timeout_sec}s（可用 AUTORUN_VERIFY_TIMEOUT_SEC 覆盖）")
+    _log(f"等待修复: {int(wait_timeout_sec)}s（可用 AUTORUN_WAIT_TIMEOUT_SEC 覆盖）")
     if run_cmd:
         _log(f"启动   : {run_cmd}")
         proc = _start_background(run_cmd)
@@ -148,9 +179,9 @@ def run_loop(goal: str, verify_cmd: str, run_cmd: str | None, max_attempts: int)
             time.sleep(3)
 
         try:
-            code, output = _run(verify_cmd, timeout=60)
+            code, output = _run(verify_cmd, timeout=verify_timeout_sec)
         except subprocess.TimeoutExpired:
-            code, output = 1, "验证命令超时（60s）"
+            code, output = 1, f"验证命令超时（{verify_timeout_sec}s）"
         except Exception as e:
             code, output = 1, f"运行验证命令时异常: {e}"
 
@@ -162,7 +193,9 @@ def run_loop(goal: str, verify_cmd: str, run_cmd: str | None, max_attempts: int)
 
         # 验证失败 → 请求修复 → 等待
         _write_fix_request(goal, attempt, output)
-        _wait_for_fix()
+        if not _wait_for_fix(wait_timeout_sec):
+            _log("fix_request 仍存在，保持等待，不推进到下一次验证")
+            continue
 
     else:
         _log(f"已达到最大尝试次数 {max_attempts}，停止")
