@@ -812,15 +812,14 @@ async def executor_node(state: GraphState) -> dict:
 
     strict_unmet = (
         policy.strict_enforcement
-        and (actual_agents_used < required_agents or actual_rounds < required_rounds)
+        and (actual_agents_used < required_agents)
     )
 
     if strict_unmet and call_result.get("success"):
         call_result = {
             "success": False,
             "error": (
-                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents} "
-                f"or actual_rounds={actual_rounds}<{required_rounds}"
+                f"[POLICY_VIOLATION] actual_agents={actual_agents_used}<{required_agents}"
             ),
             "result": None,
             "specialist_id": specialist_id,

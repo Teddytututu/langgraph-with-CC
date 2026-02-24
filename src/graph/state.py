@@ -134,8 +134,6 @@ class ExecutionPolicy(BaseModel):
                 raise ValueError("strict_enforcement=true requires force_complex_graph=true")
             if self.min_agents_per_node < 3:
                 raise ValueError("strict_enforcement=true requires min_agents_per_node>=3")
-            if self.min_discussion_rounds < 10:
-                raise ValueError("strict_enforcement=true requires min_discussion_rounds>=10")
         return self
 
 

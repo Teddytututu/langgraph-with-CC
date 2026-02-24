@@ -157,9 +157,9 @@ def _validate_result_locally(task: SubTask) -> list[str]:
         issues.append("缺少可执行命令块（Reproduction/Verification 命令不可复现）")
 
     # 5. 复现步骤 + 预期/实际结果成对出现
-    has_steps = bool(re.search(r"\b(步骤|step\s*\d+|repro(duction)?\s+steps?)\b", result, re.IGNORECASE))
-    has_expected_actual = bool(re.search(r"\b(预期|expected)\b", result, re.IGNORECASE)) and bool(
-        re.search(r"\b(实际|actual)\b", result, re.IGNORECASE)
+    has_steps = bool(re.search(r"(步骤|step\s*\d+|repro(duction)?\s+steps?)", result, re.IGNORECASE))
+    has_expected_actual = bool(re.search(r"(预期|expected)", result, re.IGNORECASE)) and bool(
+        re.search(r"(实际|actual)", result, re.IGNORECASE)
     )
     if not (has_steps and has_expected_actual):
         issues.append("缺少“复现步骤 + 预期/实际结果”配对描述")
@@ -178,8 +178,8 @@ def _has_local_reproducibility_structure(result: str) -> bool:
 
     has_exec_block = bool(re.search(r"```(?:bash|sh|shell|zsh|cmd|powershell)?\n[\s\S]*?```", result, re.IGNORECASE))
     has_step_or_pair = (
-        bool(re.search(r"\b(步骤|step\s*\d+|repro(duction)?\s+steps?)\b", result, re.IGNORECASE))
-        and bool(re.search(r"\b(预期|expected|实际|actual|结果|result)\b", result, re.IGNORECASE))
+        bool(re.search(r"(步骤|step\s*\d+|repro(duction)?\s+steps?)", result, re.IGNORECASE))
+        and bool(re.search(r"(预期|expected|实际|actual|结果|result)", result, re.IGNORECASE))
     )
     has_stable_anchor = _has_stable_evidence_anchor(result)
 

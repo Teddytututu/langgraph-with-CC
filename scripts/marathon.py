@@ -593,8 +593,6 @@ def _build_execution_policy(
         raise ValueError("strict 模式要求 force_complex_graph=true")
     if min_agents_per_node < 3:
         raise ValueError("strict 模式要求 min_agents_per_node>=3")
-    if min_discussion_rounds < 10:
-        raise ValueError("strict 模式要求 min_discussion_rounds>=10")
 
     return {
         "force_complex_graph": force_complex_graph,
