@@ -10,7 +10,7 @@ def route_after_router(state: GraphState) -> str:
     """Router 之后的路由决策
 
     路由规则（按优先级）：
-    1. 超时 → timeout
+    1. 超时硬截止（hard stop）→ timeout
     2. phase == init → planning
     3. phase == budgeting → executing（等待预算管理完成）
     4. phase == executing/reviewing → 继续当前阶段
@@ -20,7 +20,7 @@ def route_after_router(state: GraphState) -> str:
     8. 默认 → executing
     """
     budget = state.get("time_budget")
-    if budget and budget.is_overtime:
+    if budget and budget.is_overtime and state.get("timeout_hard_stop"):
         return "timeout"
 
     phase = state.get("phase", "init")
@@ -56,18 +56,8 @@ def route_after_router(state: GraphState) -> str:
 
 
 def route_after_review(state: GraphState) -> str:
-    """Reviewer 之后的路由"""
-    current = _get_current(state)
-    # 空値防护：无当前任务时直接进入下一个执行循环
-    if current is None:
-        logger.debug("route_after_review: current is None → pass")
-        return "pass"
-    if current.status == "done":
-        return "pass"
-    max_iter = state.get("max_iterations", 3)
-    if current.retry_count >= max_iter:
-        return "pass"      # 强制通过，避免死循环
-    return "revise"
+    """Reviewer 之后的路由（advisory-only，不作为终止门）。"""
+    return "pass"
 
 
 def _task_dependencies(task) -> list[str]:
@@ -85,9 +75,10 @@ def _collect_ready_tasks(subtasks: list) -> list:
 
 
 def should_continue_or_timeout(state: GraphState) -> str:
-    """执行后判断：继续 / 审查 / 等待 / 超时"""
+    """执行后判断：继续 / 审查 / 等待"""
     if _check_timeout(state):
-        return "timeout"
+        # 预算超时不直接终止，回 router 做可恢复处理
+        return "wait"
 
     current = _get_current(state)
     subtasks = state.get("subtasks", [])

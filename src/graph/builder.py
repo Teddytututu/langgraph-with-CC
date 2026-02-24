@@ -61,7 +61,6 @@ def build_graph(checkpointer=None):
 
     g.add_conditional_edges("executor", should_continue_or_timeout, {
         "review":   "reviewer",
-        "timeout":  END,
         "continue": "executor",
         "wait":     "router",
     })

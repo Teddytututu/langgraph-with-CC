@@ -84,16 +84,23 @@ async def test_executor_strict_partial_rounds_timeout_fail_closed(monkeypatch):
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "failed"
+    assert "discussions" in out
+    assert "task-001" in out["discussions"]
+    discussion = out["discussions"]["task-001"]
+    assert discussion.node_id == "task-001"
+    assert discussion.consensus_reached is False
+    assert discussion.status == "active"
+    assert len(discussion.messages) >= 1
+
+    assert out["subtasks"][0].status == "done"
     log = out["execution_log"][0]
-    assert log["event"] == "task_failed"
+    assert log["event"] == "task_degraded_continued"
     assert log["fallback_applied"] is False
     assert log["violation_type"] == "rounds_insufficient"
     assert log["required_rounds"] == 10
     assert log["actual_rounds"] == 5
     assert log["required_agents"] == 3
     assert log["actual_agents_used"] == 3
-    assert "POLICY_VIOLATION" in (log["error"] or "")
 
 
 @pytest.mark.asyncio
@@ -125,10 +132,16 @@ async def test_executor_strict_partial_rounds_timeout_deferred_without_policy_ta
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "pending"
+    assert out["subtasks"][0].status == "done"
     assert out["phase"] == "executing"
+    assert "discussions" in out
+    assert "task-001" in out["discussions"]
+    deferred_discussion = out["discussions"]["task-001"]
+    assert deferred_discussion.node_id == "task-001"
+    assert deferred_discussion.status == "active"
+    assert deferred_discussion.consensus_reached is False
     log = out["execution_log"][0]
-    assert log["event"] == "task_deferred"
+    assert log["event"] == "task_degraded_continued"
     assert log["terminal"] is False
     assert log["error"] == "discussion_total_timeout>200s"
     assert "POLICY_VIOLATION" not in (log["error"] or "")
@@ -160,9 +173,15 @@ async def test_executor_strict_insufficient_agents_policy_violation_failed(monke
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "failed"
+    assert out["subtasks"][0].status == "done"
+    assert "discussions" in out
+    assert "task-001" in out["discussions"]
+    failed_discussion = out["discussions"]["task-001"]
+    assert failed_discussion.node_id == "task-001"
+    assert failed_discussion.status == "active"
+    assert failed_discussion.consensus_reached is False
     log = out["execution_log"][0]
-    assert log["event"] == "task_failed"
+    assert log["event"] == "task_degraded_continued"
     assert log["fallback_applied"] is False
     assert log["violation_type"] == "agents_insufficient"
     assert "POLICY_VIOLATION" in (log["error"] or "")
@@ -191,9 +210,9 @@ async def test_executor_strict_zero_rounds_failed(monkeypatch):
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "failed"
+    assert out["subtasks"][0].status == "done"
     log = out["execution_log"][0]
-    assert log["event"] == "task_failed"
+    assert log["event"] == "task_degraded_continued"
     assert log["actual_rounds"] == 0
 
 
@@ -247,12 +266,89 @@ async def test_executor_strict_shortfall_detail_only_reports_unmet_dims(monkeypa
 
     out = await executor_node(_make_running_state(min_rounds=10, min_agents=3))
 
-    assert out["subtasks"][0].status == "failed"
+    assert out["subtasks"][0].status == "done"
     log = out["execution_log"][0]
-    assert log["event"] == "task_failed"
+    assert log["event"] == "task_degraded_continued"
     assert log["violation_type"] == "rounds_insufficient"
     assert "actual_rounds=4<10" in (log["error"] or "")
     assert "actual_agents=3<3" not in (log["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_executor_strict_failure_allows_followup_task_start(monkeypatch):
+    async def _stub_discussion(*args, **kwargs):
+        return (
+            {
+                "success": False,
+                "error": "discussion_total_timeout>200s",
+                "result": None,
+                "specialist_id": "agent_synth",
+                "assigned_agents": ["a1", "a2", "a3"],
+                "actual_agents_used": 3,
+                "actual_discussion_rounds": 4,
+                "policy_violation": {
+                    "violation_type": "rounds_insufficient",
+                },
+            },
+            [],
+        )
+
+    monkeypatch.setattr("src.graph.nodes.executor.get_caller", lambda: _DummyCaller())
+    monkeypatch.setattr("src.graph.nodes.executor._execute_multi_agent_discussion", _stub_discussion)
+
+    task1 = SubTask(
+        id="task-001",
+        title="strict terminal failure",
+        description="should fail under strict policy",
+        agent_type="coder",
+        knowledge_domains=["backend", "testing", "architecture"],
+        completion_criteria=["done"],
+        status="running",
+        started_at=datetime.now(),
+        estimated_minutes=5,
+        priority=1,
+    )
+    task2 = SubTask(
+        id="task-002",
+        title="follow-up task",
+        description="should still be scheduled",
+        agent_type="coder",
+        knowledge_domains=["backend", "testing", "architecture"],
+        completion_criteria=["done"],
+        status="pending",
+        estimated_minutes=5,
+        priority=2,
+    )
+    policy = ExecutionPolicy(
+        force_complex_graph=True,
+        min_agents_per_node=3,
+        min_discussion_rounds=10,
+        strict_enforcement=True,
+    )
+
+    first = await executor_node({
+        "subtasks": [task1, task2],
+        "current_subtask_id": task1.id,
+        "execution_policy": policy,
+        "artifacts": {},
+    })
+
+    assert first["phase"] == "executing"
+    assert first["execution_log"][0]["event"] == "task_degraded_continued"
+    assert next(t for t in first["subtasks"] if t.id == "task-001").status == "done"
+    assert next(t for t in first["subtasks"] if t.id == "task-002").status == "pending"
+
+    second = await executor_node({
+        "subtasks": first["subtasks"],
+        "current_subtask_id": None,
+        "execution_policy": policy,
+        "artifacts": first.get("artifacts", {}),
+        "phase": "executing",
+    })
+
+    assert second["phase"] == "executing"
+    assert second["current_subtask_id"] == "task-002"
+    assert next(t for t in second["subtasks"] if t.id == "task-002").status == "running"
 
 
 @pytest.mark.asyncio
@@ -314,6 +410,69 @@ async def test_executor_strict_round_level_agent_shortage_does_not_fail_immediat
         entry.get("type") == "policy_warning" and "round_agents_below_min_agents" in entry.get("content", "")
         for entry in discussion_log
     )
+@pytest.mark.asyncio
+async def test_executor_strict_timeout_bounded_retry_becomes_terminal(monkeypatch):
+    async def _stub_discussion(*args, **kwargs):
+        return (
+            {
+                "success": False,
+                "error": "discussion_total_timeout>200s",
+                "result": None,
+                "specialist_id": "agent_synth",
+                "assigned_agents": ["a1", "a2", "a3"],
+                "actual_agents_used": 3,
+                "actual_discussion_rounds": 10,
+            },
+            [],
+        )
+
+    monkeypatch.setattr("src.graph.nodes.executor.get_caller", lambda: _DummyCaller())
+    monkeypatch.setattr("src.graph.nodes.executor._execute_multi_agent_discussion", _stub_discussion)
+
+    state = _make_running_state(min_rounds=10, min_agents=3)
+    state["max_iterations"] = 3
+    state["subtasks"][0] = state["subtasks"][0].model_copy(update={"retry_count": 1})
+
+    out = await executor_node(state)
+
+    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].retry_count == 2
+    log = out["execution_log"][0]
+    assert log["event"] == "task_degraded_continued"
+    assert log["terminal"] is False
+    assert log["terminal_reason"] == "reliability_mode_non_terminal"
+
+
+@pytest.mark.asyncio
+async def test_executor_retry_exhaustion_marks_terminal_failed(monkeypatch):
+    async def _stub_discussion(*args, **kwargs):
+        return (
+            {
+                "success": False,
+                "error": "discussion_total_timeout>200s",
+                "result": None,
+                "specialist_id": "agent_synth",
+                "assigned_agents": ["a1", "a2", "a3"],
+                "actual_agents_used": 3,
+                "actual_discussion_rounds": 5,
+            },
+            [],
+        )
+
+    monkeypatch.setattr("src.graph.nodes.executor.get_caller", lambda: _DummyCaller())
+    monkeypatch.setattr("src.graph.nodes.executor._execute_multi_agent_discussion", _stub_discussion)
+
+    state = _make_running_state(min_rounds=10, min_agents=3)
+    state["max_iterations"] = 3
+    state["subtasks"][0] = state["subtasks"][0].model_copy(update={"retry_count": 2})
+
+    out = await executor_node(state)
+
+    assert out["subtasks"][0].status == "done"
+    assert out["subtasks"][0].retry_count == 3
+    log = out["execution_log"][0]
+    assert log["event"] == "task_degraded_continued"
+    assert log["terminal"] is False
 
 
 @pytest.mark.asyncio

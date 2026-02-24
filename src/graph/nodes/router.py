@@ -34,16 +34,38 @@ async def router_node(state: GraphState) -> dict:
             "time_budget": budget,
         }
 
-    # 超时 → 交付已完成部分
+    current_iteration = state.get("iteration", 0)
+    overtime_hits = int(state.get("overtime_hits", 0) or 0)
+    timeout_hard_stop = bool(state.get("timeout_hard_stop", False))
+
+    # 超时默认走可恢复路径：继续执行并记录超时次数
     if budget and budget.is_overtime:
+        overtime_hits += 1
+        hard_stop_threshold = 6
+        timeout_hard_stop = overtime_hits >= hard_stop_threshold
+        if timeout_hard_stop:
+            return {
+                "phase": "timeout",
+                "final_output": _build_final_output(state, timeout=True, budget=budget),
+                "time_budget": budget,
+                "overtime_hits": overtime_hits,
+                "timeout_hard_stop": True,
+            }
         return {
-            "phase": "timeout",
-            "final_output": _build_final_output(state, timeout=True, budget=budget),
+            "phase": "executing" if subtasks else "init",
             "time_budget": budget,
+            "iteration": current_iteration + 1,
+            "overtime_hits": overtime_hits,
+            "timeout_hard_stop": False,
+            "stalled_event": {
+                "event": "stalled",
+                "reason": "budget_overtime",
+                "overtime_hits": overtime_hits,
+                "hard_stop_threshold": hard_stop_threshold,
+            },
         }
 
     # 迭代上限防护：超过 200 次循环强制超时交付
-    current_iteration = state.get("iteration", 0)
     if current_iteration > 200:
         import logging as _log
         _log.getLogger(__name__).error("[router] 迭代已达 %d 次，强制超时交付", current_iteration)
@@ -51,12 +73,15 @@ async def router_node(state: GraphState) -> dict:
             "phase": "timeout",
             "final_output": _build_final_output(state, timeout=True, budget=budget),
             "time_budget": budget,
+            "timeout_hard_stop": True,
         }
 
     return {
         "phase": state.get("phase", "init") if subtasks else "init",
         "time_budget": budget,
         "iteration": current_iteration + 1,
+        "overtime_hits": 0,
+        "timeout_hard_stop": False,
     }
 
 

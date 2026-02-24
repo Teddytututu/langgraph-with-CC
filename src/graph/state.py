@@ -165,6 +165,9 @@ class GraphState(TypedDict, total=False):
     ]
     iteration: int
     max_iterations: int
+    overtime_hits: int
+    timeout_hard_stop: bool
+    stalled_event: dict[str, Any] | None
     error: str | None
 
     # 最终输出

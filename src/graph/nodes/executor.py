@@ -202,6 +202,43 @@ def _is_transient_policy_shortage(error: str | None) -> bool:
     return False
 
 
+def _is_soft_timeout_stage(stage: str) -> bool:
+    return stage in {
+        "discussion_total_timeout",
+        "discussion_synthesis_timeout",
+        "discussion_round_call_timeout",
+    }
+
+
+def _has_strict_shortfall_signal(
+    *,
+    required_rounds: int,
+    actual_rounds: int,
+    required_agents: int,
+    actual_agents: int,
+    policy_violation: dict | None,
+    failure_error: str | None,
+) -> bool:
+    if actual_rounds < required_rounds or actual_agents < required_agents:
+        return True
+
+    pv = dict(policy_violation or {})
+    pv_actual_rounds = _coerce_non_negative_int(pv.get("actual_rounds"), actual_rounds)
+    pv_required_rounds = _coerce_non_negative_int(pv.get("required_rounds"), required_rounds)
+    pv_actual_agents = _coerce_non_negative_int(pv.get("actual_agents"), actual_agents)
+    pv_required_agents = _coerce_non_negative_int(pv.get("required_agents"), required_agents)
+    if pv_actual_rounds < pv_required_rounds or pv_actual_agents < pv_required_agents:
+        return True
+
+    err = str(failure_error or "").lower()
+    return any(token in err for token in (
+        "actual_rounds=<",
+        "actual_agents=<",
+        "actual_rounds=0<",
+        "actual_agents=0<",
+    ))
+
+
 def _is_terminal_failure(*, strict: bool, failure_stage: str, failure_error: str | None) -> bool:
     if failure_stage == "policy_violation":
         return not _is_transient_policy_shortage(failure_error)
@@ -229,8 +266,9 @@ def _build_discussion_fallback_result(
     actual_agents_used: int,
     fallback_reason: str,
     original_error: str | None,
+    violation_type: str | None = None,
 ) -> dict:
-    """将可接受的严格模式部分失败降级为可观测的成功结果。"""
+    """将部分/失败执行降级为可观测的非终止结果。"""
     summary = (
         f"[DISCUSSION_FALLBACK] task={task.id}; "
         f"rounds={actual_rounds}/{required_rounds}; "
@@ -254,10 +292,40 @@ def _build_discussion_fallback_result(
         "original_error": original_error,
         "fallback_applied": True,
         "fallback_reason": fallback_reason,
+        "violation_type": violation_type,
+        "terminal": False,
         "actual_agents_used": actual_agents_used,
         "actual_discussion_rounds": actual_rounds,
+        "required_agents": required_agents,
+        "required_rounds": required_rounds,
         "synthesis_timeout_sec": float(call_result.get("synthesis_timeout_sec") or 0.0),
     }
+
+
+def _build_reliability_degraded_result(
+    *,
+    task: SubTask,
+    call_result: dict,
+    required_rounds: int,
+    actual_rounds: int,
+    required_agents: int,
+    actual_agents_used: int,
+    fallback_reason: str,
+    original_error: str | None,
+    violation_type: str | None = None,
+) -> dict:
+    """Reliability mode: convert failures/shortfalls into degrade-and-continue success."""
+    return _build_discussion_fallback_result(
+        task=task,
+        call_result=call_result,
+        required_rounds=required_rounds,
+        actual_rounds=actual_rounds,
+        required_agents=required_agents,
+        actual_agents_used=actual_agents_used,
+        fallback_reason=fallback_reason,
+        original_error=original_error,
+        violation_type=violation_type,
+    )
 
 
 def _compute_discussion_timeout_sec(
@@ -271,8 +339,10 @@ def _compute_discussion_timeout_sec(
     agents = max(1, int(required_agents or 1))
 
     if strict:
-        round_floor_per_round = 42.0 + 6.0 * min(agents, 6)
-        baseline = 420.0
+        # Strict 模式下，单轮常见耗时会被慢 specialist 主导；
+        # 需要给足每轮时间，避免在第 6 轮左右被总超时提前截断。
+        round_floor_per_round = 72.0 + 8.0 * min(agents, 6)
+        baseline = 600.0
     else:
         round_floor_per_round = 30.0 + 5.0 * min(agents, 6)
         baseline = 180.0
@@ -301,7 +371,8 @@ def _is_ready(task: SubTask, done_ids: set[str]) -> bool:
 
 def _collect_ready_tasks(state: GraphState) -> list[SubTask]:
     subtasks = state.get("subtasks", [])
-    done_ids = {t.id for t in subtasks if t.status in ("done", "skipped")}
+    # Reliability mode: failed upstreams should not fail-close downstream scheduling.
+    done_ids = {t.id for t in subtasks if t.status in ("done", "skipped", "failed")}
     return [t for t in sorted(subtasks, key=lambda t: t.priority) if _is_ready(t, done_ids)]
 
 
@@ -831,41 +902,46 @@ async def executor_node(state: GraphState) -> dict:
             if pending:
                 updated_subtasks = []
                 changed = False
+                degraded_ids: list[str] = []
                 for t in subtasks:
                     if t.status == "pending":
                         reason = _unrecoverable_dependency_reason(t, subtasks)
                         if reason:
                             changed = True
+                            degraded_ids.append(t.id)
                             updated_subtasks.append(t.model_copy(update={
-                                "status": "failed",
-                                "result": reason,
-                                "finished_at": datetime.now(),
+                                "result": f"[DEPENDENCY_BLOCKED] {reason}",
                             }))
                             continue
                     updated_subtasks.append(t)
 
                 if changed:
                     return {
-                        "phase": "reviewing",
+                        "phase": "executing",
                         "current_subtask_id": None,
                         "subtasks": updated_subtasks,
                         "artifacts": artifacts,
                         "execution_log": [{
-                            "event": "pending_fail_closed",
-                            "reason": "unrecoverable_dependencies",
-                            "failed_count": sum(1 for t in updated_subtasks if t.status == "failed"),
+                            "event": "pending_degraded",
+                            "reason": "dependency_blocked_non_terminal",
+                            "task_ids": degraded_ids,
+                            "count": len(degraded_ids),
+                            "terminal": False,
+                            "fallback_applied": True,
+                            "fallback_reason": "dependency_blocked_non_terminal",
                             "timestamp": datetime.now().isoformat(),
                         }],
                     }
 
                 return {
-                    "phase": "reviewing",
+                    "phase": "executing",
                     "current_subtask_id": None,
                     "subtasks": updated_subtasks,
                     "artifacts": artifacts,
                     "execution_log": [{
                         "event": "no_ready_tasks",
                         "pending_count": len(pending),
+                        "terminal": False,
                         "timestamp": datetime.now().isoformat(),
                     }],
                 }
@@ -1014,6 +1090,7 @@ async def executor_node(state: GraphState) -> dict:
     agents_shortfall = actual_agents_used < required_agents
     rounds_shortfall = actual_rounds < required_rounds
     strict_unmet = policy.strict_enforcement and (agents_shortfall or rounds_shortfall)
+    violation_type = None
 
     if strict_unmet:
         violation_type = "agents_insufficient" if agents_shortfall else "rounds_insufficient"
@@ -1058,103 +1135,228 @@ async def executor_node(state: GraphState) -> dict:
             )["error"]
 
         call_result = {
+            **call_result,
             "success": False,
             "error": pv["error"],
+            "original_error": call_result.get("original_error") or call_result.get("error"),
             "policy_violation": pv,
-            "result": None,
-            "specialist_id": specialist_id,
-            "assigned_agents": assigned_agents,
-            "actual_agents_used": actual_agents_used,
-            "actual_discussion_rounds": actual_rounds,
-            "original_error": call_result.get("error"),
+            "fallback_applied": False,
+            "fallback_reason": None,
         }
     else:
         maybe_policy_error = str(call_result.get("error") or "")
         if "[policy_violation]" in maybe_policy_error.lower():
             sanitized_error = call_result.get("original_error") or "discussion_round_failure:policy_violation_without_shortfall"
+            retained_violation = call_result.get("policy_violation")
+            if policy.strict_enforcement and not retained_violation:
+                retained_violation = {"violation_type": "rounds_insufficient"}
             call_result = {
                 **call_result,
                 "error": sanitized_error,
                 "original_error": call_result.get("original_error") or maybe_policy_error,
-                "policy_violation": None,
+                "policy_violation": retained_violation,
             }
 
     failure_error = call_result.get("error")
-    fallback_reason = None
     if policy.strict_enforcement and not call_result.get("success"):
         err = str(failure_error or "").lower()
         failure_stage = _derive_failure_stage(failure_error)
-        hard_policy_violation = strict_unmet
-
-        synthesis_or_tail_failure = (
-            actual_agents_used >= required_agents
-            and actual_rounds >= required_rounds
-            and not hard_policy_violation
-            and (
-                "synthesis_empty" in err
-                or failure_stage == "discussion_synthesis_timeout"
-            )
+        allow_synthesis_tail_fallback = (
+            not strict_unmet
+            and ("synthesis_empty" in err or failure_stage == "discussion_synthesis_timeout")
         )
-
-        if synthesis_or_tail_failure:
-            fallback_reason = "strict_synthesis_empty_or_timeout"
-
-        if fallback_reason:
-            call_result = _build_discussion_fallback_result(
+        if allow_synthesis_tail_fallback:
+            call_result = _build_reliability_degraded_result(
                 task=next_task,
                 call_result=call_result,
                 required_rounds=required_rounds,
                 actual_rounds=actual_rounds,
                 required_agents=required_agents,
                 actual_agents_used=actual_agents_used,
-                fallback_reason=fallback_reason,
+                fallback_reason="strict_synthesis_empty_or_timeout",
                 original_error=failure_error,
+                violation_type=(call_result.get("policy_violation") or {}).get("violation_type") or violation_type,
             )
-            specialist_id = call_result.get("specialist_id")
-            assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
-            actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), actual_agents_used)
-            actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), actual_rounds)
-            synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or synthesis_timeout_sec)
+
+    specialist_id = call_result.get("specialist_id")
+    assigned_agents = list(dict.fromkeys(call_result.get("assigned_agents") or ([] if not specialist_id else [specialist_id])))
+    actual_agents_used = _coerce_non_negative_int(call_result.get("actual_agents_used"), actual_agents_used)
+    actual_rounds = _coerce_non_negative_int(call_result.get("actual_discussion_rounds"), actual_rounds)
+    synthesis_timeout_sec = float(call_result.get("synthesis_timeout_sec") or synthesis_timeout_sec)
+
+    def _normalize_discussion_message_type(raw_type: str | None) -> str:
+        allowed_types = {
+            "query",
+            "response",
+            "consensus",
+            "conflict",
+            "info",
+            "proposal",
+            "reflection",
+            "agreement",
+            "error",
+            "review_opinion",
+            "analysis",
+            "synthesis",
+            "disagreement_alert",
+        }
+        normalized = str(raw_type or "info").strip()
+        return normalized if normalized in allowed_types else "info"
+
+    normalized_discussion_log = list(discussion_log or [])
+
+    if not normalized_discussion_log:
+        if not call_result.get("success"):
+            failure_stage = _derive_failure_stage(call_result.get("error"))
+            policy_violation = call_result.get("policy_violation") or {}
+            unmet_parts: list[str] = []
+            if actual_agents_used < required_agents:
+                unmet_parts.append(f"agents {actual_agents_used}/{required_agents}")
+            if actual_rounds < required_rounds:
+                unmet_parts.append(f"rounds {actual_rounds}/{required_rounds}")
+            unmet_suffix = f" ({', '.join(unmet_parts)})" if unmet_parts else ""
+            violation_type = str(policy_violation.get("violation_type") or "").strip()
+            violation_suffix = f", violation={violation_type}" if violation_type else ""
+            normalized_discussion_log.append({
+                "agent": specialist_id or (assigned_agents[0] if assigned_agents else "executor"),
+                "type": "error",
+                "content": (
+                    f"Execution failed at {failure_stage}{unmet_suffix}{violation_suffix}: "
+                    f"{str(call_result.get('error') or 'unknown error')[:400]}"
+                ),
+                "round": actual_rounds,
+                "domain": "execution",
+            })
+        else:
+            normalized_discussion_log.append({
+                "agent": specialist_id or (assigned_agents[0] if assigned_agents else "executor"),
+                "type": "info",
+                "content": "Execution completed without captured inter-agent transcript; recorded synthesized result.",
+                "round": actual_rounds,
+                "domain": "execution",
+            })
 
     if not call_result.get("success"):
         logger.warning("[executor] task %s discussion failed: %s", next_task.id, call_result.get("error"))
         failure_error = call_result.get("error")
         failure_stage = _derive_failure_stage(failure_error)
         policy_violation = call_result.get("policy_violation") or {}
-        hard_terminal = (
-            policy.strict_enforcement
-            and not bool(call_result.get("fallback_applied"))
-            and strict_unmet
-        )
-        terminal_failure = hard_terminal or _is_terminal_failure(
-            strict=policy.strict_enforcement,
-            failure_stage=failure_stage,
-            failure_error=failure_error,
-        )
-        next_status = "failed" if terminal_failure else "pending"
-        next_phase = "reviewing" if terminal_failure else "executing"
-        failure_prefix = "[AGENT_FAIL]" if terminal_failure else "[AGENT_RETRYABLE]"
-        fail_subtasks = [
+
+        current_retry_count = int(next_task.retry_count or 0)
+        next_retry_count = current_retry_count + 1
+        max_iterations = _coerce_non_negative_int(state.get("max_iterations"), 0)
+        strict_timeout_retry_limit = 2
+        if max_iterations > 0:
+            strict_timeout_retry_limit = min(strict_timeout_retry_limit, max_iterations)
+
+        hard_terminal = False
+
+        existing_discussions: dict = dict(state.get("discussions") or {})
+        disc = existing_discussions.get(next_task.id) or NodeDiscussion(node_id=next_task.id)
+        for entry in normalized_discussion_log:
+            disc.add_message(DiscussionMessage(
+                node_id=next_task.id,
+                from_agent=entry["agent"],
+                content=entry["content"][:2000],
+                message_type=_normalize_discussion_message_type(entry.get("type")),
+                metadata={
+                    "round_index": entry.get("round", 0),
+                    "domain": entry.get("domain", ""),
+                    "task_title": next_task.title,
+                    "required_rounds": required_rounds,
+                    "actual_rounds": actual_rounds,
+                    "required_agents": required_agents,
+                    "actual_agents_used": actual_agents_used,
+                    "discussion_timeout_sec": discussion_timeout_sec,
+                    "failure_stage": failure_stage,
+                    "terminal_failure": hard_terminal,
+                    "fallback_applied": bool(call_result.get("fallback_applied")),
+                    "fallback_reason": call_result.get("fallback_reason"),
+                    "violation_type": policy_violation.get("violation_type"),
+                },
+            ))
+
+        if hard_terminal:
+            disc.status = "blocked"
+            disc.consensus_reached = False
+            disc.consensus_topic = next_task.title
+            existing_discussions[next_task.id] = disc
+
+            failed_subtasks = [
+                t.model_copy(update={
+                    "status": "failed",
+                    "result": str(failure_error or call_result.get("result") or "execution_failed"),
+                    "started_at": started_at,
+                    "finished_at": datetime.now(),
+                    "retry_count": next_retry_count,
+                    "assigned_agents": assigned_agents or list(dict.fromkeys([e["agent"] for e in normalized_discussion_log])),
+                }) if t.id == next_task.id else t
+                for t in subtasks
+            ]
+
+            terminal_reason = "strict_timeout_retry_exhausted" if strict_timeout_retry_exhausted else (
+                "strict_shortfall_terminal" if strict_shortfall_signal else "terminal_failure"
+            )
+            return {
+                "subtasks": failed_subtasks,
+                "current_subtask_id": next_task.id,
+                "phase": "reviewing",
+                "discussions": existing_discussions,
+                "artifacts": artifacts,
+                "execution_log": [{
+                    "event": "task_failed",
+                    "task_id": next_task.id,
+                    "error": failure_error,
+                    "failure_stage": failure_stage,
+                    "violation_type": policy_violation.get("violation_type"),
+                    "terminal": True,
+                    "terminal_reason": terminal_reason,
+                    "discussion_rounds": actual_rounds,
+                    "discussion_agents": actual_agents_used,
+                    "required_rounds": required_rounds,
+                    "required_agents": required_agents,
+                    "actual_rounds": actual_rounds,
+                    "actual_agents_used": actual_agents_used,
+                    "discussion_timeout_sec": discussion_timeout_sec,
+                    "synthesis_timeout_sec": synthesis_timeout_sec,
+                    "fallback_applied": False,
+                    "fallback_reason": None,
+                    "original_error": call_result.get("original_error") or failure_error,
+                    "retry_count": next_retry_count,
+                    "timestamp": datetime.now().isoformat(),
+                }],
+            }
+
+        disc.status = "active"
+        disc.consensus_reached = False
+        disc.consensus_topic = next_task.title
+        existing_discussions[next_task.id] = disc
+
+        degraded_subtasks = [
             t.model_copy(update={
-                "status": next_status,
-                "result": f"{failure_prefix} {failure_error or 'unknown error'}",
+                "status": "done",
+                "result": str(call_result.get("result") or f"[DEGRADED_CONTINUE] {failure_error or 'unknown error'}"),
                 "started_at": started_at,
-                "finished_at": datetime.now() if terminal_failure else None,
+                "finished_at": datetime.now(),
+                "retry_count": next_retry_count,
+                "assigned_agents": assigned_agents or list(dict.fromkeys([e["agent"] for e in normalized_discussion_log])),
             }) if t.id == next_task.id else t
             for t in subtasks
         ]
         return {
-            "subtasks": fail_subtasks,
+            "subtasks": degraded_subtasks,
             "current_subtask_id": next_task.id,
-            "phase": next_phase,
+            "phase": "executing",
+            "discussions": existing_discussions,
             "artifacts": artifacts,
             "execution_log": [{
-                "event": "task_failed" if terminal_failure else "task_deferred",
+                "event": "task_degraded_continued",
                 "task_id": next_task.id,
                 "error": failure_error,
                 "failure_stage": failure_stage,
                 "violation_type": policy_violation.get("violation_type"),
-                "terminal": terminal_failure,
+                "terminal": False,
+                "terminal_reason": "reliability_mode_non_terminal",
                 "discussion_rounds": actual_rounds,
                 "discussion_agents": actual_agents_used,
                 "required_rounds": required_rounds,
@@ -1163,9 +1365,10 @@ async def executor_node(state: GraphState) -> dict:
                 "actual_agents_used": actual_agents_used,
                 "discussion_timeout_sec": discussion_timeout_sec,
                 "synthesis_timeout_sec": synthesis_timeout_sec,
-                "fallback_applied": False,
-                "fallback_reason": None,
-                "original_error": failure_error,
+                "fallback_applied": bool(call_result.get("fallback_applied", True)),
+                "fallback_reason": call_result.get("fallback_reason") or "degraded_continue",
+                "original_error": call_result.get("original_error") or failure_error,
+                "retry_count": next_retry_count,
                 "timestamp": datetime.now().isoformat(),
             }],
         }
@@ -1226,7 +1429,7 @@ async def executor_node(state: GraphState) -> dict:
             node_id=next_task.id,
             from_agent=entry["agent"],
             content=entry["content"][:2000],
-            message_type=entry.get("type", "info"),
+            message_type=_normalize_discussion_message_type(entry.get("type")),
             metadata={
                 "round_index": entry.get("round", 0),
                 "domain": entry.get("domain", ""),
@@ -1249,7 +1452,7 @@ async def executor_node(state: GraphState) -> dict:
     updated_subtasks = []
     for t in subtasks:
         if t.id == next_task.id:
-            fallback_agents = list(dict.fromkeys([e["agent"] for e in discussion_log]))
+            fallback_agents = list(dict.fromkeys([e["agent"] for e in normalized_discussion_log]))
             final_assigned_agents = assigned_agents or fallback_agents
             updated_subtasks.append(t.model_copy(update={
                 "status": result["status"],

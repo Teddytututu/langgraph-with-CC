@@ -89,29 +89,10 @@ async def reviewer_node(state: GraphState) -> dict:
             review["issues"] = local_issues + review.get("issues", [])
             review["score"] = min(review.get("score", 7), 4)
 
-    # 纯函数式更新
-    max_iter = state.get("max_iterations", 3)
-    if review["verdict"] == "PASS":
-        new_status, new_retry = "done", current.retry_count
-    elif current.retry_count + 1 >= max_iter:
-        # 达到最大重试次数，标记为失败
-        new_status, new_retry = "failed", current.retry_count + 1
-    else:
-        new_status, new_retry = "pending", current.retry_count + 1
-
-    updated_subtasks = []
-    for t in subtasks:
-        if t.id == current.id:
-            updated_subtasks.append(t.model_copy(update={
-                "status": new_status,
-                "retry_count": new_retry,
-            }))
-        else:
-            updated_subtasks.append(t)
-
-    # PASS / 达到重试上限 → executing（让 router 继续调度剩余任务）
-    # 仍需重试 → reflecting（让 router 路由到 reflector 修正，避免 reviewing 死循环）
-    next_phase = "reflecting" if new_status == "pending" else "executing"
+    # Reviewer is advisory-only in reliability mode:
+    # never changes subtask status/retry lifecycle, only records review signals.
+    updated_subtasks = list(subtasks)
+    next_phase = "executing"
 
     return {
         "subtasks": updated_subtasks,
@@ -122,6 +103,9 @@ async def reviewer_node(state: GraphState) -> dict:
             "verdict": review["verdict"],
             "score": review.get("score", 0),
             "issues": review.get("issues", []),
+            "suggestions": review.get("suggestions", []),
+            "advisory_only": True,
+            "terminal": False,
             "subagent_called": "reviewer",
             "timestamp": datetime.now().isoformat(),
         }],
