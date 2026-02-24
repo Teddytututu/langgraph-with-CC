@@ -55,6 +55,8 @@ class ExecutionPolicyPayload(BaseModel):
                 raise ValueError("strict_enforcement=true requires force_complex_graph=true")
             if self.min_agents_per_node < 3:
                 raise ValueError("strict_enforcement=true requires min_agents_per_node>=3")
+            if self.min_discussion_rounds < 10:
+                raise ValueError("strict_enforcement=true requires min_discussion_rounds>=10")
         return self
 
 
@@ -927,8 +929,15 @@ def register_routes(app: FastAPI):
     async def clear_all_tasks(force: bool = False):
         """清空所有任务及子任务，重置系统状态。force=true 时强制清空（用于服务器重启后清除僵尸任务）"""
         async with app_state.state_lock:
-            running = [t for t in app_state.tasks.values() if t.get("status") == "running"]
-            if running and not force:
+            active_running = []
+            for tid, t in app_state.tasks.items():
+                if t.get("status") != "running":
+                    continue
+                handle = app_state.running_task_handles.get(tid)
+                if handle and not handle.done():
+                    active_running.append(t)
+
+            if active_running and not force:
                 raise HTTPException(status_code=409, detail="任务正在运行，无法清空")
             app_state.tasks.clear()
             app_state.current_task_id = None
@@ -936,6 +945,7 @@ def register_routes(app: FastAPI):
             app_state.system_status = "idle"
             app_state.terminal_log.clear()
             app_state.intervention_queues.clear()
+            app_state.running_task_handles.clear()
             app_state._bump_state_rev_unlocked()
             app_state.mark_dirty()
             snapshot = app_state._snapshot_state_unlocked()
@@ -1497,7 +1507,7 @@ def register_routes(app: FastAPI):
 
             initial_state: GraphState = {
                 "user_task": task["task"],
-                "time_budget": TimeBudget(total_minutes=task["time_minutes"], started_at=datetime.now()) if task["time_minutes"] else None,
+                "time_budget": TimeBudget(total_minutes=task.get("time_minutes"), started_at=datetime.now()) if task.get("time_minutes") else None,
                 "execution_policy": execution_policy,
                 "subtasks": [],
                 "discussions": {},
@@ -1896,15 +1906,23 @@ def register_routes(app: FastAPI):
                 "ts": now_iso,
             })
         finally:
-            app_state.running_task_handles.pop(task_id, None)
-
             now_iso = datetime.now().isoformat()
             async with app_state.state_lock:
+                running_handle = app_state.running_task_handles.pop(task_id, None)
                 current = app_state.tasks.get(task_id)
                 if current:
                     current["updated_at"] = now_iso
                     status = current.get("status")
-                    if status in TERMINAL_STATUSES and current.get("current_node"):
+                    if status == "running":
+                        app_state._set_task_and_system_state_unlocked(
+                            task_id,
+                            task_status="failed",
+                            error="任务执行结束但未写入终态，已自动收敛为失败",
+                            finished_at=now_iso,
+                            current_node="",
+                        )
+                        status = "failed"
+                    elif status in TERMINAL_STATUSES and current.get("current_node"):
                         current["current_node"] = ""
                 final_snapshot = _recompute_system_state_unlocked()
 
