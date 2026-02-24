@@ -421,10 +421,13 @@ def register_routes(app: FastAPI):
         async with app_state.state_lock:
             active_task_id = app_state.current_task_id
             active_task = app_state.tasks.get(active_task_id) if active_task_id else None
+            active_handle = app_state.running_task_handles.get(active_task_id) if active_task_id else None
+            active_handle_alive = bool(active_handle and not active_handle.done())
             if (
                 app_state.system_status == "running"
                 and active_task
                 and active_task.get("status") == "running"
+                and active_handle_alive
             ):
                 return {"status": "busy"}
 
@@ -604,7 +607,7 @@ def register_routes(app: FastAPI):
                     tools=[],
                     max_turns=4,
                 ),
-                timeout=25,
+                timeout=8,
             )
 
             if not result.success:
@@ -995,6 +998,17 @@ def register_routes(app: FastAPI):
                 raise HTTPException(status_code=404, detail="Task not found")
 
             old_status = task.get("status")
+            if old_status == "queued":
+                app_state.tasks.pop(task_id, None)
+                app_state.intervention_queues.pop(task_id, None)
+                snapshot = _recompute_system_state_unlocked()
+                app_state.mark_dirty()
+                return {
+                    "status": "deleted",
+                    "task_id": task_id,
+                    "previous_status": "queued",
+                    "state_rev": snapshot.get("state_rev"),
+                }
             if old_status != "running":
                 return {"status": task.get("status", "cancelled"), "task_id": task_id}
 
@@ -1138,6 +1152,7 @@ def register_routes(app: FastAPI):
 
     TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
     ACTIVE_STATUSES = {"running", "created", "queued"}
+    FINAL_OUTPUT_TERMINAL_PHASES = {"complete", "timeout"}
 
     def _event_meta(
         *,
@@ -1198,6 +1213,14 @@ def register_routes(app: FastAPI):
             "subtask_id": resolved_subtask_id,
             "message": msg_dict,
         })
+        logger.info(
+            "[discussion_emit] task=%s node=%s subtask=%s msg_id=%s from=%s",
+            task_id,
+            resolved_node_id,
+            resolved_subtask_id,
+            str(msg_dict.get("id") or ""),
+            speaker,
+        )
 
         if not emit_terminal:
             return
@@ -1517,6 +1540,9 @@ def register_routes(app: FastAPI):
                 "phase": "init",
                 "iteration": 0,
                 "max_iterations": 3,
+                "overtime_hits": 0,
+                "timeout_hard_stop": False,
+                "stalled_event": None,
                 "error": None,
                 "final_output": None,
             }
@@ -1607,6 +1633,20 @@ def register_routes(app: FastAPI):
                                 "warn"
                             )
 
+                    stalled_event = state_update.get("stalled_event")
+                    if isinstance(stalled_event, dict) and stalled_event.get("event") == "stalled":
+                        await emit(
+                            (
+                                "⚠ stalled: "
+                                f"reason={stalled_event.get('reason','unknown')} "
+                                f"overtime_hits={stalled_event.get('overtime_hits','-')}/"
+                                f"{stalled_event.get('hard_stop_threshold','-')}"
+                            ),
+                            "warn",
+                            node_id=final_node,
+                            phase=state_update.get("phase", ""),
+                        )
+
                     existing_subtasks = {
                         str(s.get("id")): s
                         for s in (task.get("subtasks") or [])
@@ -1679,52 +1719,94 @@ def register_routes(app: FastAPI):
                     # 将 GraphState.discussions 同步到 discussion_manager
                     # GraphState key: node_id; manager key: {task_id}_{node_id}
                     if "discussions" in state_update:
-                        for node_id, node_disc in (state_update["discussions"] or {}).items():
+                        state_discussions = state_update.get("discussions") or {}
+                        logger.info(
+                            "[discussion_sync] task=%s node=%s phase=%s discussion_nodes=%s",
+                            task_id,
+                            final_node,
+                            state_update.get("phase", ""),
+                            list(state_discussions.keys()),
+                        )
+                        for node_id, node_disc in state_discussions.items():
                             resolved_node_id, mapped_subtask_id = _resolve_discussion_node_id(task, str(node_id))
                             manager_key = _discussion_manager_key(task_id, resolved_node_id)
                             existing = app_state.discussion_manager.get_discussion(manager_key)
                             if existing is None:
                                 existing = app_state.discussion_manager.create_discussion(manager_key)
+
+                            def _disc_get(obj: Any, key: str, default: Any = None) -> Any:
+                                if isinstance(obj, dict):
+                                    return obj.get(key, default)
+                                return getattr(obj, key, default)
+
+                            raw_messages = _disc_get(node_disc, "messages", []) or []
+
                             # 合并新消息（避免重复追加）
-                            existing_ids = {m.id for m in existing.messages}
+                            existing_ids = {str(m.id) for m in existing.messages}
                             new_messages = []
-                            for msg in (node_disc.messages if hasattr(node_disc, "messages") else []):
-                                if msg.id not in existing_ids:
-                                    # 复制消息并修正 node_id 为 manager key
-                                    from src.discussion.types import DiscussionMessage as _DM
+                            for msg in raw_messages:
+                                raw_msg_id = ""
+                                raw_from_agent = None
+                                raw_agent = None
+                                raw_content = ""
+                                raw_timestamp = None
+                                raw_message_type = "info"
+                                raw_to_agents = []
+                                raw_metadata = {}
+
+                                if isinstance(msg, dict):
+                                    raw_msg_id = str(msg.get("id") or "")
+                                    raw_from_agent = msg.get("from_agent")
+                                    raw_agent = msg.get("agent")
+                                    raw_content = msg.get("content", "")
+                                    raw_timestamp = msg.get("timestamp")
+                                    raw_message_type = msg.get("message_type", "info")
+                                    raw_to_agents = msg.get("to_agents") or []
+                                    raw_metadata = msg.get("metadata") or {}
+                                else:
+                                    raw_msg_id = str(getattr(msg, "id", "") or "")
                                     raw_from_agent = getattr(msg, "from_agent", None)
                                     raw_agent = getattr(msg, "agent", None)
-                                    normalized_from_agent = str(raw_from_agent or raw_agent or "system").strip() or "system"
-
                                     raw_content = getattr(msg, "content", "")
-                                    normalized_content = str(raw_content if raw_content is not None else "")
-
+                                    raw_timestamp = getattr(msg, "timestamp", None)
                                     raw_message_type = getattr(msg, "message_type", "info")
-                                    normalized_message_type = str(raw_message_type or "info")
-                                    allowed_message_types = {
-                                        "query", "response", "consensus", "conflict", "info",
-                                        "proposal", "reflection", "agreement", "error", "review_opinion",
-                                        "analysis", "synthesis",
-                                    }
-                                    if normalized_message_type not in allowed_message_types:
-                                        normalized_message_type = "info"
+                                    raw_to_agents = getattr(msg, "to_agents", None) or []
+                                    raw_metadata = getattr(msg, "metadata", None) or {}
 
-                                    synced = _DM(
-                                        id=msg.id,
-                                        node_id=resolved_node_id,
-                                        from_agent=normalized_from_agent,
-                                        to_agents=getattr(msg, "to_agents", None) or [],
-                                        content=normalized_content,
-                                        timestamp=msg.timestamp,
-                                        message_type=normalized_message_type,
-                                        metadata=getattr(msg, "metadata", None) or {},
-                                    )
-                                    existing.add_message(synced)
-                                    existing_ids.add(msg.id)
-                                    new_messages.append(synced)
-                            existing.status = getattr(node_disc, "status", "resolved")
-                            existing.consensus_reached = getattr(node_disc, "consensus_reached", False)
-                            existing.consensus_topic = getattr(node_disc, "consensus_topic", None)
+                                if not raw_msg_id or raw_msg_id in existing_ids:
+                                    continue
+
+                                # 复制消息并修正 node_id 为 manager key
+                                from src.discussion.types import DiscussionMessage as _DM
+                                normalized_from_agent = str(raw_from_agent or raw_agent or "system").strip() or "system"
+                                normalized_content = str(raw_content if raw_content is not None else "")
+
+                                normalized_message_type = str(raw_message_type or "info")
+                                allowed_message_types = {
+                                    "query", "response", "consensus", "conflict", "info",
+                                    "proposal", "reflection", "agreement", "error", "review_opinion",
+                                    "analysis", "synthesis",
+                                }
+                                if normalized_message_type not in allowed_message_types:
+                                    normalized_message_type = "info"
+
+                                synced = _DM(
+                                    id=raw_msg_id,
+                                    node_id=resolved_node_id,
+                                    from_agent=normalized_from_agent,
+                                    to_agents=raw_to_agents,
+                                    content=normalized_content,
+                                    timestamp=raw_timestamp,
+                                    message_type=normalized_message_type,
+                                    metadata=raw_metadata,
+                                )
+                                existing.add_message(synced)
+                                existing_ids.add(raw_msg_id)
+                                new_messages.append(synced)
+
+                            existing.status = _disc_get(node_disc, "status", "resolved")
+                            existing.consensus_reached = bool(_disc_get(node_disc, "consensus_reached", False))
+                            existing.consensus_topic = _disc_get(node_disc, "consensus_topic", None)
 
                             for synced in new_messages:
                                 await _emit_discussion_message(
@@ -1735,10 +1817,53 @@ def register_routes(app: FastAPI):
                                 )
 
                     if state_update.get("final_output"):
+                        phase = str(state_update.get("phase") or "").strip()
+                        event_subtasks: list[dict[str, Any]] | None = None
+                        if "subtasks" in state_update:
+                            event_subtasks = _normalize_subtasks_for_api([
+                                {
+                                    "id": t.id,
+                                    "title": t.title,
+                                    "description": t.description,
+                                    "agent_type": t.agent_type,
+                                    "assigned_agents": getattr(t, "assigned_agents", None),
+                                    "status": t.status,
+                                    "result": t.result,
+                                    "dependencies": (
+                                        getattr(t, "dependencies", None)
+                                        or getattr(t, "depends_on", None)
+                                        or (existing_subtasks.get(str(t.id), {}).get("dependencies") or [])
+                                    ),
+                                }
+                                for t in state_update.get("subtasks", [])
+                            ])
+
+                        has_active_subtasks = False
+                        if event_subtasks is not None:
+                            has_active_subtasks = any(
+                                str(st.get("status") or "").strip() in ACTIVE_STATUSES
+                                or str(st.get("status") or "").strip() == "pending"
+                                for st in event_subtasks
+                            )
+
+                        guard_met = phase in FINAL_OUTPUT_TERMINAL_PHASES and not has_active_subtasks
+                        if not guard_met:
+                            await emit(
+                                (
+                                    "⚠ final_output observed but terminal guard not met "
+                                    f"(phase={phase or '-'}, has_active_subtasks={has_active_subtasks})"
+                                ),
+                                "warn",
+                                node_id=final_node,
+                                phase=phase,
+                            )
+                            continue
+
+                        subtasks_for_quality = event_subtasks if event_subtasks is not None else task.get("subtasks", [])
                         raw_final_output = str(state_update.get("final_output") or "")
                         quality_eval = await _check_final_output_quality_via_sdk(
                             raw_final_output,
-                            task.get("subtasks", []),
+                            subtasks_for_quality,
                         )
 
                         final_output_for_publish = raw_final_output
@@ -1759,11 +1884,12 @@ def register_routes(app: FastAPI):
                             verification_status = "quality_fallback"
 
                         now_iso = datetime.now().isoformat()
+                        subtasks_for_publish = event_subtasks if event_subtasks is not None else task.get("subtasks", [])
                         async with app_state.state_lock:
                             current = app_state.tasks.get(task_id)
                             if not current:
                                 break
-                            current["subtasks"] = task.get("subtasks", [])
+                            current["subtasks"] = subtasks_for_publish
                             current["quality_meta"] = quality_eval
                             current["updated_at"] = now_iso
                             snapshot = app_state._set_task_and_system_state_unlocked(
@@ -1787,7 +1913,7 @@ def register_routes(app: FastAPI):
                         await app_state.broadcast("task_completed", {
                             "id": task_id,
                             "result": final_output_for_publish,
-                            "subtasks": task.get("subtasks", []),
+                            "subtasks": subtasks_for_publish,
                             "quality_check": quality_eval,
                             "state_rev": snapshot["state_rev"],
                             "finished_at": now_iso,
@@ -1795,7 +1921,7 @@ def register_routes(app: FastAPI):
                             **_event_meta(
                                 task_id=task_id,
                                 node_id=final_node,
-                                phase=state_update.get("phase", ""),
+                                phase=phase,
                                 summary=(final_output_for_publish or "")[:240],
                                 verification=verification_status,
                                 report_path="reports/",

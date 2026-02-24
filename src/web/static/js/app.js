@@ -64,6 +64,7 @@ createApp({
             latestSpeaker: '',
             interventionsQueued: 0,
             interventionsApplied: 0,
+            unmatchedBuffered: 0,
         });
         const statusTimeline = ref([]);
         const timelineScope = ref('selected');
@@ -321,11 +322,30 @@ createApp({
                 messagesCount: discussionMessages.value.length,
                 participantCount: discussionParticipants.value.length,
                 latestSpeaker: latestMessage?.from_agent || '',
+                unmatchedBuffered: discussionStatus.value.unmatchedBuffered || 0,
             };
         };
 
         const discussionCacheKey = (taskId, nodeId) => `${taskId || ''}::${nodeId || ''}`;
 
+        const countUnmatchedBufferedForTask = (taskId, selectedSubtaskId = '') => {
+            if (!taskId) return 0;
+            const sid = String(selectedSubtaskId || '').trim();
+            let total = 0;
+            Object.entries(discussionCacheByNode.value || {}).forEach(([key, cache]) => {
+                const [cacheTaskId, cacheNodeId] = String(key || '').split('::');
+                if (cacheTaskId !== taskId) return;
+                const cacheMessages = Array.isArray(cache?.messages) ? cache.messages : [];
+                if (!sid) {
+                    total += cacheMessages.length;
+                    return;
+                }
+                if (cacheNodeId !== sid) {
+                    total += cacheMessages.length;
+                }
+            });
+            return total;
+        };
         const mergeDiscussionMessages = (baseMessages = [], extraMessages = []) => {
             const merged = [];
             const seen = new Set();
@@ -608,25 +628,56 @@ createApp({
                     );
 
                     const selectedId = selectedSubtask.value?.id;
+                    const selectedCanonicalId = selectedId
+                        ? (discussionNodeIdBySubtask.value[selectedId] || '')
+                        : '';
+                    const taskMatched = selectedTask.value?.id === payload.task_id;
+
+                    if (taskMatched && !selectedSubtask.value && contextSubtask?.id) {
+                        selectedSubtask.value = contextSubtask;
+                        discussionNodeIdBySubtask.value[contextSubtask.id] = eventNodeId || eventSubtaskId || contextSubtask.id;
+                    }
+
+                    const activeSelectedId = selectedSubtask.value?.id;
+                    const activeSelectedCanonicalId = activeSelectedId
+                        ? (discussionNodeIdBySubtask.value[activeSelectedId] || '')
+                        : '';
                     const matchesSelected = (
-                        !!selectedId && (
-                            (eventSubtaskId && selectedId === eventSubtaskId)
-                            || selectedId === eventNodeId
+                        !!activeSelectedId && (
+                            (eventSubtaskId && activeSelectedId === eventSubtaskId)
+                            || activeSelectedId === eventNodeId
+                            || (activeSelectedCanonicalId && activeSelectedCanonicalId === eventNodeId)
+                            || (activeSelectedCanonicalId && eventSubtaskId && activeSelectedCanonicalId === eventSubtaskId)
+                            || (contextSubtask?.id && contextSubtask.id === activeSelectedId)
                         )
                     );
 
-                    if (
-                        selectedTask.value?.id === payload.task_id &&
-                        matchesSelected
-                    ) {
+                    if (taskMatched && !selectedSubtask.value) {
+                        const normalizedIncoming = normalizeDiscussionMessage(payload.message, null);
+                        const exists = discussionMessages.value.find(m => m.id === normalizedIncoming?.id);
+                        if (!exists && normalizedIncoming) discussionMessages.value.push(normalizedIncoming);
+                        discussionParticipants.value = cache.participants.slice();
+                        refreshDiscussionStatusFromSelection();
+                    }
+
+                    if (taskMatched && matchesSelected) {
                         const normalizedIncoming = normalizeDiscussionMessage(payload.message, selectedSubtask.value);
                         const exists = discussionMessages.value.find(m => m.id === normalizedIncoming?.id);
                         if (!exists && normalizedIncoming) discussionMessages.value.push(normalizedIncoming);
                         discussionParticipants.value = cache.participants.slice();
-                        if (eventNodeId && selectedId) {
-                            discussionNodeIdBySubtask.value[selectedId] = eventNodeId;
+                        if (eventNodeId && activeSelectedId) {
+                            discussionNodeIdBySubtask.value[activeSelectedId] = eventNodeId;
                         }
                         refreshDiscussionStatusFromSelection();
+                        discussionStatus.value = {
+                            ...discussionStatus.value,
+                            unmatchedBuffered: countUnmatchedBufferedForTask(payload.task_id, activeSelectedId),
+                        };
+                    } else if (taskMatched) {
+                        discussionStatus.value = {
+                            ...discussionStatus.value,
+                            unmatchedBuffered: countUnmatchedBufferedForTask(payload.task_id, activeSelectedId || ''),
+                        };
                     }
                     addTimelineItem({
                         id: `discussion_message|${payload.task_id || ''}|${eventSubtaskId || eventNodeId || ''}|${payload.message?.id || ''}`,
@@ -671,6 +722,7 @@ createApp({
                         messagesCount: 0,
                         participantCount: 0,
                         latestSpeaker: '',
+                        unmatchedBuffered: 0,
                         interventionsQueued: 0,
                         interventionsApplied: 0,
                     };
@@ -815,6 +867,7 @@ createApp({
                     messagesCount: 0,
                     participantCount: 0,
                     latestSpeaker: '',
+                    unmatchedBuffered: countUnmatchedBufferedForTask(task.id, ''),
                 };
             }
         };
@@ -1275,6 +1328,43 @@ createApp({
             }
         };
 
+        const loadLatestDiscussionForTask = async (task) => {
+            if (!task?.id) return false;
+            const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+            for (const st of subtasks) {
+                const sid = st?.id;
+                if (!sid) continue;
+                try {
+                    const res = await fetch(`/api/tasks/${task.id}/nodes/${sid}/discussion`);
+                    if (!res.ok) continue;
+                    const data = await res.json();
+                    const resolvedNodeId = data.resolved_node_id || sid;
+                    const key = discussionCacheKey(task.id, sid);
+                    const canonicalKey = discussionCacheKey(task.id, resolvedNodeId);
+                    const messages = normalizeDiscussionMessages(data.messages || [], st);
+                    const participants = Array.from(new Set(data.participants || []));
+                    const mergedCache = { messages, participants };
+                    discussionCacheByNode.value[key] = mergedCache;
+                    discussionCacheByNode.value[canonicalKey] = mergedCache;
+                    discussionNodeIdBySubtask.value[sid] = resolvedNodeId;
+                    if (messages.length > 0) {
+                        selectedSubtask.value = st;
+                        discussionMessages.value = messages;
+                        discussionParticipants.value = participants;
+                        refreshDiscussionStatusFromSelection();
+                        discussionStatus.value = {
+                            ...discussionStatus.value,
+                            unmatchedBuffered: countUnmatchedBufferedForTask(task.id, sid),
+                        };
+                        return true;
+                    }
+                } catch (e) {
+                    console.warn('loadLatestDiscussionForTask failed for subtask', sid, e);
+                }
+            }
+            return false;
+        };
+
         const selectTask = async (task) => {
             selectedTask.value = task;
             selectedSubtask.value = null;
@@ -1294,6 +1384,7 @@ createApp({
                 messagesCount: 0,
                 participantCount: 0,
                 latestSpeaker: '',
+                unmatchedBuffered: 0,
                 interventionsQueued: 0,
                 interventionsApplied: 0,
             };
@@ -1309,6 +1400,7 @@ createApp({
                 console.error('selectTask: failed to refresh task', task.id, e);
             }
             refreshDiscussionStatusFromSelection();
+            await loadLatestDiscussionForTask(task);
             // 加载报告
             await fetchReports();
         };
@@ -1360,6 +1452,10 @@ createApp({
                     };
                     discussionCacheByNode.value[key] = mergedCache;
                     discussionCacheByNode.value[canonicalKey] = mergedCache;
+                    discussionStatus.value = {
+                        ...discussionStatus.value,
+                        unmatchedBuffered: countUnmatchedBufferedForTask(selectedTask.value.id, subtask.id),
+                    };
                     const assignedAgents = getDiscussionAssignedAgentList(subtask);
                     if (assignedAgents.length === 0) {
                         discussionTarget.value = '';
@@ -1384,9 +1480,17 @@ createApp({
                         ...(cached.participants || []),
                         ...(canonicalCached.participants || []),
                     ]));
+                    discussionStatus.value = {
+                        ...discussionStatus.value,
+                        unmatchedBuffered: countUnmatchedBufferedForTask(selectedTask.value.id, subtask.id),
+                    };
                 }
             }
             refreshDiscussionStatusFromSelection();
+            discussionStatus.value = {
+                ...discussionStatus.value,
+                unmatchedBuffered: countUnmatchedBufferedForTask(selectedTask.value?.id || '', subtask?.id || ''),
+            };
         };
 
         const sendMessage = async () => {

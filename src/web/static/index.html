@@ -8,9 +8,9 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script defer src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
     <div id="app">
@@ -561,11 +561,15 @@
                             <span class="status-chip">{{ discussionStatus.nodeId ? discussionStatus.nodeId.slice(0, 8) : 'no-node' }}</span>
                             <span class="status-chip" :class="discussionStatus.nodeStatus">{{ discussionStatus.nodeStatus || 'idle' }}</span>
                             <span class="status-chip">p: {{ discussionStatus.participantCount || 0 }}</span>
+                            <span class="status-chip warn" v-if="discussionStatus.unmatchedBuffered > 0">buffered: {{ discussionStatus.unmatchedBuffered }}</span>
                         </div>
                     </div>
 
                     <template v-if="selectedSubtask">
                         <div class="discussion-list">
+                            <div v-if="discussionStatus.unmatchedBuffered > 0" class="term-line warn" style="margin: 8px 10px 0; border-radius: 8px;">
+                                <span class="term-text">存在 {{ discussionStatus.unmatchedBuffered }} 条已缓存讨论消息；切换到对应子任务可查看。</span>
+                            </div>
                             <div v-for="msg in discussionMessages" :key="msg.id" class="message" :class="[msg.message_type, msg.side]">
                                 <div class="message-avatar">{{ msg.from_agent?.charAt(0)?.toUpperCase() }}</div>
                                 <div class="message-body">
@@ -785,6 +789,6 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <script defer src="/static/js/app.js"></script>
 </body>
 </html>
