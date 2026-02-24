@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -46,8 +47,8 @@ DEFAULT_TASK  = (
     "发现失败后必须进入 fix_request 修复路径，修复后重新验证再继续下一轮。"
 )
 
-DEFAULT_MINUTES_PER_ROUND = 60   # 每轮时间预算
-DEFAULT_COOLDOWN = 30            # 每轮冷却秒数
+IDLE_TIMEOUT_FACTOR = 1.2   # 提交前等待系统空闲窗口（相对每轮预算）
+POLL_DEADLINE_FACTOR = 1.5  # 提交后轮询等待窗口（相对每轮预算）
 DEFAULT_EXECUTION_POLICY = {
     "force_complex_graph": True,
     "min_agents_per_node": 3,
@@ -64,11 +65,24 @@ def _log(msg: str) -> None:
     print(f"[marathon {_ts()}] {msg}", flush=True)
 
 
+def _extract_policy_shortfall(detail: str) -> str:
+    text = detail or ""
+    pairs = []
+    for key in ("actual_rounds", "required_rounds", "actual_agents", "required_agents"):
+        m = re.search(rf"{key}=([0-9]+)", text, re.IGNORECASE)
+        if m:
+            pairs.append(f"{key}={m.group(1)}")
+    return " ".join(pairs)
+
+
 def _infer_failure_category(detail: str) -> str:
     text = (detail or "").lower()
     if "planner_call_failed" in text:
         return "planner_call_failed"
     if "policy_violation" in text or "planner_final_validation_failed" in text:
+        shortfall = _extract_policy_shortfall(detail)
+        if "actual_rounds=" in shortfall and "required_rounds=" in shortfall:
+            return "discussion_policy_rounds_insufficient"
         return "planner_validation_failed"
     if "timeout" in text:
         return "timeout"
@@ -82,10 +96,12 @@ def _stderr_failure_summary(round_num: int, task_id: str | None, detail: str) ->
     summary = (detail or "").replace("\n", " ").strip()
     if len(summary) > 280:
         summary = summary[:280] + "..."
+    shortfall = _extract_policy_shortfall(detail)
+    shortfall_suffix = f" shortfall={shortfall}" if shortfall else ""
     print(
         (
             f"[marathon {_ts()}] round={round_num} task_id={task_id or '-'} "
-            f"category={category} summary={summary or 'no_error_detail'} "
+            f"category={category}{shortfall_suffix} summary={summary or 'no_error_detail'} "
             "(see marathon.log for full context)"
         ),
         file=sys.stderr,
@@ -253,7 +269,7 @@ def _submit_task(
     - post_error:...
     """
     # 确保系统空闲再提交，避免多任务并发
-    wait_timeout = idle_timeout if idle_timeout is not None else max(600, int(time_minutes * 60 * 1.2))
+    wait_timeout = idle_timeout if idle_timeout is not None else max(600, int(time_minutes * 60 * IDLE_TIMEOUT_FACTOR))
     if not _wait_for_idle(timeout=wait_timeout):
         _log(f"等待系统空闲超时（{wait_timeout}s），暂不提交新任务")
         return None, "wait_idle_timeout"
@@ -402,7 +418,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
                 task_text,
                 minutes_per_round,
                 execution_policy,
-                idle_timeout=max(600, int(minutes_per_round * 60 * 1.2)),
+                idle_timeout=max(600, int(minutes_per_round * 60 * IDLE_TIMEOUT_FACTOR)),
             )
             if task_id is None:
                 # 系统仍在运行旧任务时，不应误判为 POST 失败
@@ -437,8 +453,8 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         _log(f"任务已提交: {task_id}，时间预算 {minutes_per_round} 分钟")
 
         # ── 轮询等待完成 ──
-        # 最多等待 round 时间 × 1.5 的宽余
-        poll_deadline = time.monotonic() + minutes_per_round * 60 * 1.5
+        # 最多等待 round 时间 × POLL_DEADLINE_FACTOR 的宽余（与提交前空闲等待窗口分离）
+        poll_deadline = time.monotonic() + minutes_per_round * 60 * POLL_DEADLINE_FACTOR
         status, detail = _poll_task(task_id, poll_deadline)
         elapsed_min = (time.monotonic() - round_start) / 60
 
@@ -508,17 +524,25 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
                     "verification": round_verification,
                 })
             else:
-                round_verification = "recheck unresolved"
-                _log("  复核结论: 仍为瞬态/未知，跳过修复进入下一轮")
+                round_failure_reason = recheck_detail[:500] if recheck_detail else round_failure_reason
+                round_fix_triggers += 1
+                round_verification = "recheck unresolved -> fix_request"
+                _log(f"  复核结论: unresolved，触发修复闭环 -> {recheck_detail[:200]}")
+                _stderr_failure_summary(round_num, task_id, recheck_detail or detail)
                 results.append({
                     "round": round_num,
                     "task_id": task_id,
-                    "status": status,
+                    "status": "failed",
                     "minutes": f"{elapsed_min:.1f}",
                     "fix_triggers": round_fix_triggers,
                     "failure_reason": round_failure_reason,
                     "verification": round_verification,
                 })
+                _wait_for_fix(
+                    f"轮次 {round_num} 任务状态复核仍未收敛",
+                    round_num,
+                    recheck_detail or detail or "transient status unresolved after recheck",
+                )
 
         round_result = results[-1]
         _log(
