@@ -808,18 +808,8 @@ def register_routes(app: FastAPI):
 
         await app_state.broadcast("task_created", created_payload)
 
-        # 自动启动：创建后立即触发执行
-        async def _auto_start():
-            async with app_state.state_lock:
-                task = app_state.tasks.get(task_id)
-                if not task:
-                    return
-                if task.get("status") != "created":
-                    return
-
-            await _start_task_internal(task_id, source="auto")
-
-        _fire(_auto_start())
+        # 自动启动：创建后立即触发执行（同步触发，避免依赖前端点击/刷新才看到启动）
+        await _start_task_internal(task_id, source="auto")
 
         return {
             "id": task_id,
