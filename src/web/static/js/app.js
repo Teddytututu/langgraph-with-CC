@@ -182,6 +182,8 @@ createApp({
 
         const newTask = ref({ task: '', time_minutes: null });
         const newMessage = ref({ from_agent: 'user', content: '' });
+        const discussionTarget = ref('__all_assigned__');
+        const lastDiscussionTargetLabel = ref('');
         const interveneText = ref('');
 
         // Subtask edit state
@@ -260,6 +262,28 @@ createApp({
         const getDiscussionAssignedAgents = (subtask = selectedSubtask.value) => {
             if (!subtask || !Array.isArray(subtask.assigned_agents)) return new Set();
             return new Set(subtask.assigned_agents.filter(Boolean));
+        };
+
+        const getDiscussionAssignedAgentList = (subtask = selectedSubtask.value) => {
+            if (!subtask || !Array.isArray(subtask.assigned_agents)) return [];
+            return subtask.assigned_agents.filter(Boolean);
+        };
+
+        const discussionTargetOptions = computed(() => {
+            const assigned = getDiscussionAssignedAgentList();
+            if (assigned.length === 0) return [];
+            return [
+                { value: '__all_assigned__', label: `All assigned agents (${assigned.join(', ')})` },
+                ...assigned.map(agent => ({ value: agent, label: agent })),
+            ];
+        });
+
+        const resolveDiscussionToAgents = () => {
+            const assigned = getDiscussionAssignedAgentList();
+            if (assigned.length === 0) return [];
+            if (discussionTarget.value === '__all_assigned__') return assigned;
+            if (assigned.includes(discussionTarget.value)) return [discussionTarget.value];
+            return [];
         };
 
         const resolveSubtaskByDiscussionContext = ({ taskId = '', subtaskId = '', nodeId = '' } = {}) => {
@@ -406,6 +430,16 @@ createApp({
                 case 'node_changed': {
                     if (!shouldApplyStatePayload(payload)) break;
                     currentNode.value = payload.node;
+                    if (payload.task_id) {
+                        const changedTask = tasks.value.find(t => t.id === payload.task_id);
+                        if (changedTask) {
+                            changedTask.current_node = payload.node || '';
+                            changedTask.updated_at = payload.ts || changedTask.updated_at;
+                            if (selectedTask.value?.id === changedTask.id) {
+                                selectedTask.value = changedTask;
+                            }
+                        }
+                    }
                     scheduleGraphRefresh();
                     break;
                 }
@@ -439,7 +473,12 @@ createApp({
                     break;
                 case 'task_started':
                     if (!shouldApplyStatePayload(payload)) break;
-                    mergeTasks([{ id: payload.id, status: 'running' }]);
+                    mergeTasks([{
+                        id: payload.id,
+                        status: 'running',
+                        current_node: payload.node || '',
+                        updated_at: payload.ts || new Date().toISOString(),
+                    }]);
                     addTimelineItem({
                         id: `task_started|${payload.id}|${payload.ts || ''}`,
                         ts: payload.ts,
@@ -460,6 +499,11 @@ createApp({
                 case 'task_completed':
                     if (!shouldApplyStatePayload(payload)) break;
                     handleTaskCompleted(payload);
+                    mergeTasks([{
+                        id: payload.id,
+                        current_node: '',
+                        updated_at: payload.finished_at || payload.ts || new Date().toISOString(),
+                    }]);
                     addTimelineItem({
                         id: `task_completed|${payload.id}|${payload.finished_at || payload.ts || ''}`,
                         ts: payload.finished_at || payload.ts,
@@ -475,7 +519,13 @@ createApp({
                     break;
                 case 'task_failed':
                     if (!shouldApplyStatePayload(payload)) break;
-                    mergeTasks([{ id: payload.id, status: 'failed', error: payload.error }]);
+                    mergeTasks([{
+                        id: payload.id,
+                        status: 'failed',
+                        error: payload.error,
+                        current_node: '',
+                        updated_at: payload.ts || new Date().toISOString(),
+                    }]);
                     addTimelineItem({
                         id: `task_failed|${payload.id}|${payload.ts || ''}|${payload.error || ''}`,
                         ts: payload.ts,
@@ -663,33 +713,28 @@ createApp({
             let completedSubtasks = task.subtasks?.filter(s => s.status === 'done' || s.status === 'completed').length || 0;
 
             if (payload.subtasks) {
-                // 合并子任务数据而不是直接覆盖，保留 description/result 等完整字段
-                const incomingMap = new Map(payload.subtasks.map(s => [s.id, s]));
-                if (!task.subtasks) task.subtasks = [];
+                // 以服务端快照为准重建子任务列表：保留已有详情字段，但移除本轮不存在的旧节点
+                const existingMap = new Map((task.subtasks || []).map(s => [s.id, s]));
+                const mergedSubtasks = payload.subtasks.map(incoming => {
+                    const existing = existingMap.get(incoming.id);
+                    return existing ? { ...existing, ...incoming } : incoming;
+                });
 
-                // 检测是否有实质性变化（新增子任务或状态变化）
-                let hasRealChange = false;
-                const existingIds = new Set(task.subtasks.map(s => s.id));
-
-                task.subtasks = task.subtasks.map(existing => {
-                    const update = incomingMap.get(existing.id);
-                    if (update) {
-                        // 只检测 status 变化（这是用户可见的关键变化）
-                        if (update.status && update.status !== existing.status) {
+                // 检测是否有实质性变化（新增/移除子任务或状态变化）
+                const prevSubtasks = task.subtasks || [];
+                let hasRealChange = prevSubtasks.length !== mergedSubtasks.length;
+                if (!hasRealChange) {
+                    const prevStatusMap = new Map(prevSubtasks.map(s => [s.id, s.status]));
+                    const nextStatusMap = new Map(mergedSubtasks.map(s => [s.id, s.status]));
+                    for (const [id, prevStatus] of prevStatusMap.entries()) {
+                        if (!nextStatusMap.has(id) || nextStatusMap.get(id) !== prevStatus) {
                             hasRealChange = true;
+                            break;
                         }
-                        return { ...existing, ...update };
                     }
-                    return existing;
-                });
+                }
 
-                // 检测新增子任务
-                incomingMap.forEach((incoming, id) => {
-                    if (!existingIds.has(id)) {
-                        hasRealChange = true;
-                        task.subtasks.push(incoming);
-                    }
-                });
+                task.subtasks = mergedSubtasks;
 
                 totalSubtasks = task.subtasks.length;
                 completedSubtasks = task.subtasks.filter(s => s.status === 'done' || s.status === 'completed').length;
@@ -754,6 +799,23 @@ createApp({
                 };
 
                 refreshDiscussionStatusFromSelection();
+            } else if (selectedSubtask.value && payload.subtasks) {
+                // 当前选中节点已不在本轮快照中，清空面板避免展示失效节点信息
+                selectedSubtask.value = null;
+                discussionMessages.value = [];
+                discussionParticipants.value = [];
+                discussionStatus.value = {
+                    ...discussionStatus.value,
+                    taskId: task.id,
+                    nodeId: '',
+                    nodeTitle: '',
+                    nodeStatus: 'idle',
+                    phase: phase || discussionStatus.value.phase,
+                    lastUpdated: payload.updated_at || payload.ts || new Date().toISOString(),
+                    messagesCount: 0,
+                    participantCount: 0,
+                    latestSpeaker: '',
+                };
             }
         };
 
@@ -1216,6 +1278,8 @@ createApp({
         const selectTask = async (task) => {
             selectedTask.value = task;
             selectedSubtask.value = null;
+            discussionTarget.value = '__all_assigned__';
+            lastDiscussionTargetLabel.value = '';
             discussionMessages.value = [];
             discussionParticipants.value = [];
             discussionCacheByNode.value = {};
@@ -1251,15 +1315,10 @@ createApp({
 
         const selectSubtask = async (subtask) => {
             selectedSubtask.value = subtask;
-            // 默认发言者：优先保留当前已选且仍可用；否则 assigned_agents 首项；再兜底 agent_type/user
-            const currentFromAgent = newMessage.value.from_agent;
-            const discussionAgentValues = discussionAgents.value.map(a => a.value);
-            if (discussionAgentValues.includes(currentFromAgent)) {
-                newMessage.value.from_agent = currentFromAgent;
-            } else {
-                newMessage.value.from_agent =
-                    subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
-            }
+            newMessage.value.from_agent = 'user';
+            const assignedAgents = getDiscussionAssignedAgentList(subtask);
+            discussionTarget.value = assignedAgents.length ? '__all_assigned__' : '';
+            lastDiscussionTargetLabel.value = '';
             discussionParticipants.value = [];
             discussionStatus.value = {
                 ...discussionStatus.value,
@@ -1301,11 +1360,14 @@ createApp({
                     };
                     discussionCacheByNode.value[key] = mergedCache;
                     discussionCacheByNode.value[canonicalKey] = mergedCache;
-                    // 讨论参与者加载后再校验一次默认发言者，避免切换节点时出现无效默认值
-                    const updatedAgentValues = discussionAgents.value.map(a => a.value);
-                    if (!updatedAgentValues.includes(newMessage.value.from_agent)) {
-                        newMessage.value.from_agent =
-                            subtask.assigned_agents?.[0] || subtask.agent_type || 'user';
+                    const assignedAgents = getDiscussionAssignedAgentList(subtask);
+                    if (assignedAgents.length === 0) {
+                        discussionTarget.value = '';
+                    } else if (
+                        discussionTarget.value !== '__all_assigned__'
+                        && !assignedAgents.includes(discussionTarget.value)
+                    ) {
+                        discussionTarget.value = '__all_assigned__';
                     }
                 } catch (e) {
                     console.error('selectSubtask: failed to load discussion', subtask.id, e);
@@ -1330,11 +1392,22 @@ createApp({
         const sendMessage = async () => {
             if (!newMessage.value.content.trim() || !selectedSubtask.value) return;
             try {
-                const toAgents = Array.isArray(selectedSubtask.value.assigned_agents)
-                    ? selectedSubtask.value.assigned_agents.filter(Boolean)
-                    : [];
+                const toAgents = resolveDiscussionToAgents();
+                if (toAgents.length === 0) {
+                    const msg = '当前子任务没有可用 assigned_agents，请先分配 subagent 后再发送讨论消息。';
+                    termLog(`✗ ${msg}`, 'error');
+                    alert(msg);
+                    return;
+                }
+
+                const targetLabel = discussionTarget.value === '__all_assigned__'
+                    ? `all assigned_agents (${toAgents.join(', ')})`
+                    : toAgents[0];
+                lastDiscussionTargetLabel.value = targetLabel;
+
                 const payload = {
                     ...newMessage.value,
+                    from_agent: 'user',
                     to_agents: toAgents,
                 };
                 const resolvedNodeId = discussionNodeIdBySubtask.value[selectedSubtask.value?.id] || selectedSubtask.value?.id;
@@ -1479,30 +1552,52 @@ createApp({
                 const safeMarkdown = escapeHtml(normalized);
                 const tokens = marked.lexer(safeMarkdown, { gfm: true });
                 const lines = [];
+                const maxLines = 4;
+                const maxChars = 220;
 
-                const pushLine = (line) => {
+                const pushLine = (line, prefix = '') => {
                     const clean = String(line || '').replace(/\s+/g, ' ').trim();
-                    if (clean) lines.push(clean);
+                    if (!clean) return;
+                    lines.push(`${prefix}${clean}`.trim());
                 };
 
                 for (const token of tokens) {
                     if (!token) continue;
                     if (token.type === 'heading') {
-                        pushLine(`# ${token.text || ''}`);
+                        pushLine(token.text || '', '# ');
                     } else if (token.type === 'list' && Array.isArray(token.items)) {
                         for (const item of token.items) {
-                            pushLine(`- ${item?.text || ''}`);
+                            pushLine(item?.text || '', '- ');
+                            if (lines.length >= maxLines) break;
                         }
                     } else if (token.type === 'paragraph') {
                         pushLine(token.text || '');
+                    } else if (token.type === 'code') {
+                        pushLine(token.text || '', '`');
                     }
-                    if (lines.length >= 6) break;
+                    if (lines.length >= maxLines) break;
                 }
 
-                const preview = lines.length ? lines.join('\n') : normalized;
+                let preview = lines.length ? lines.join('\n') : normalized;
+                preview = preview.replace(/\s+/g, ' ').trim();
+
+                let truncated = false;
+                if (preview.length > maxChars) {
+                    preview = preview.slice(0, maxChars).trimEnd();
+                    truncated = true;
+                }
+                if (lines.length >= maxLines) {
+                    truncated = true;
+                }
+                if (truncated && !preview.endsWith('…')) {
+                    preview += '…';
+                }
+
                 return escapeHtml(preview).replace(/\n+/g, '<br>');
             } catch (e) {
-                return escapeHtml(text);
+                const fallback = normalizeTaskText(text).replace(/\s+/g, ' ').trim();
+                const short = fallback.length > 220 ? `${fallback.slice(0, 220).trimEnd()}…` : fallback;
+                return escapeHtml(short);
             }
         };
 
@@ -1547,6 +1642,7 @@ createApp({
         return {
             wsConnected, systemStatus, currentNode, tasks, selectedTask, selectedSubtask,
             discussionMessages, discussionParticipants, discussionStatus, statusTimeline, filteredTimeline, timelineScope, mermaidSvg, isDynamicGraph, showNewTask, newTask, newMessage,
+            discussionTarget, discussionTargetOptions, lastDiscussionTargetLabel,
             terminalLines, terminalInput, editingSubtask, editForm, interveneText,
             chatMessages, chatInput, chatThinking,
             graphZoom,
