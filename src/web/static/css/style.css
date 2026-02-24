@@ -512,20 +512,20 @@ body {
     flex: 1;
 }
 
-.task-actions {
-    display: flex;
-    gap: 6px;
-    align-items: center;
+.past-output-card {
+    min-height: auto !important;
+    flex: 0 0 auto !important;
 }
 
-.task-jump-btn {
-    padding: 6px 10px;
-    font-size: 0.72rem;
-    white-space: nowrap;
+.past-output-list {
+    min-height: auto;
+    max-height: 280px;
+    overflow-y: auto;
 }
 
-.task-jump-btn:hover {
-    border-color: var(--border-2);
+.past-output-empty {
+    min-height: 120px;
+    padding: 20px 14px;
 }
 
 .task-list {
@@ -535,6 +535,7 @@ body {
     flex-direction: column;
     gap: 8px;
     padding: 12px;
+    overflow-y: auto;
 }
 
 .task-list::-webkit-scrollbar { width: 5px; }
@@ -2019,7 +2020,10 @@ body {
 /* ========== 响应式 ========== */
 @media (max-width: 1200px) {
     .layout { grid-template-columns: 260px 1fr; }
-    .sidebar-right { display: none; }
+    .sidebar-right {
+        display: flex;
+        grid-column: 1 / -1;
+    }
     .stats-grid { grid-template-columns: repeat(2, 1fr); }
     .deco-dots, .deco-dots-2, .deco-cross-1, .deco-cross-2 { display: none; }
 }
