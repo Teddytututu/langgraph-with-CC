@@ -21,16 +21,18 @@ from pathlib import Path
 from datetime import datetime
 
 # ── 配置 ──────────────────────────────────────────────────────────────
+REPO_ROOT = Path(__file__).resolve().parent.parent
 SIGNAL_FILES = {
-    "crash":       Path("reports/crash_report.json"),
-    "decision":    Path("decision_request.json"),
-    "stuck":       Path("stuck_report.json"),
-    "fix_request": Path("fix_request.json"),
+    "crash":       REPO_ROOT / "reports" / "crash_report.json",
+    "decision":    REPO_ROOT / "decision_request.json",
+    "stuck":       REPO_ROOT / "stuck_report.json",
+    "fix_request": REPO_ROOT / "fix_request.json",
 }
 
 DEFAULT_PORT       = 8001
 POLL_INTERVAL      = 3.0   # 秒：检查信号文件频率
 HEARTBEAT_INTERVAL = 30.0  # 秒：打印心跳频率
+STALL_THRESHOLD_SEC = 900.0  # 秒：长时间无 server_up 时报告 stalled
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
@@ -65,6 +67,8 @@ def main(port: int = DEFAULT_PORT) -> None:
     server_was_up: bool | None = None
     last_heartbeat: float = 0.0
     fix_cycle_active = False
+    down_since_monotonic: float | None = None
+    stalled_emitted = False
 
     while True:
         now = time.monotonic()
@@ -93,6 +97,22 @@ def main(port: int = DEFAULT_PORT) -> None:
 
         # ── 检查服务器健康 ────────────────────────────────────────────
         server_up = is_port_open(port=port)
+        if server_up:
+            down_since_monotonic = None
+            stalled_emitted = False
+        else:
+            if down_since_monotonic is None:
+                down_since_monotonic = now
+            elif (not stalled_emitted) and (now - down_since_monotonic >= STALL_THRESHOLD_SEC):
+                emit({
+                    "event": "stalled",
+                    "server": "down",
+                    "port": port,
+                    "down_seconds": int(now - down_since_monotonic),
+                    "threshold_seconds": int(STALL_THRESHOLD_SEC),
+                })
+                stalled_emitted = True
+
         if server_up != server_was_up:
             event = "server_up" if server_up else "server_down"
             if not (fix_cycle_active and event == "server_down"):

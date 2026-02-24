@@ -39,7 +39,7 @@ from threading import Thread
 # ── 常量 ──────────────────────────────────────────────────────────────
 FIX_REQUEST  = Path("fix_request.json")   # 写给 Claude Code 的修复请求
 WAIT_POLL    = 3.0    # 秒：等待修复时的轮询间隔
-WAIT_TIMEOUT = 600.0  # 秒：等 Claude Code 修复的最长时间（10 分钟）
+WAIT_TIMEOUT = 3600.0  # 秒：等 Claude Code 修复的最长时间（默认 60 分钟）
 ROOT         = Path(__file__).parent.parent  # 项目根目录
 
 
@@ -56,7 +56,7 @@ def _read_wait_timeout(default_value: float = WAIT_TIMEOUT) -> float:
         return default_value
 
 
-def _read_verify_timeout(default_value: int = 60) -> int:
+def _read_verify_timeout(default_value: int = 180) -> int:
     raw = str(os.environ.get("AUTORUN_VERIFY_TIMEOUT_SEC", "")).strip()
     if not raw:
         return default_value
@@ -153,7 +153,7 @@ def _wait_for_fix(wait_timeout_sec: float) -> bool:
 def run_loop(goal: str, verify_cmd: str, run_cmd: str | None, max_attempts: int) -> None:
     attempt = 0
     proc: subprocess.Popen | None = None
-    verify_timeout_sec = _read_verify_timeout(60)
+    verify_timeout_sec = _read_verify_timeout(180)
     wait_timeout_sec = _read_wait_timeout(WAIT_TIMEOUT)
 
     FIX_REQUEST.unlink(missing_ok=True)   # 清理上次遗留

@@ -30,15 +30,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # ── 常量 ──────────────────────────────────────────────────────────────
+REPO_ROOT     = Path(__file__).resolve().parent.parent
 BASE_URL      = "http://127.0.0.1:8001"
-FIX_REQUEST   = Path("fix_request.json")
-MARATHON_LOCK = Path("marathon.lock.json")
-POLL_INTERVAL = 15      # 秒：轮询任务状态间隔
-WAIT_POLL     = 5       # 秒：等待修复时轮询间隔
-WAIT_TIMEOUT  = 900     # 秒：等 Claude Code 修复的最长时间（15 分钟）
-IDLE_STABLE_SAMPLES = 3  # 连续稳定次数才认为 idle
-TRANSIENT_RECHECKS = 3   # 瞬态异常复核次数
+FIX_REQUEST   = REPO_ROOT / "fix_request.json"
+MARATHON_LOCK = REPO_ROOT / "marathon.lock.json"
+POLL_INTERVAL = int(float(os.getenv("MARATHON_POLL_INTERVAL_SEC", "15") or 15))      # 秒：轮询任务状态间隔
+WAIT_POLL     = int(float(os.getenv("MARATHON_WAIT_POLL_SEC", "5") or 5))            # 秒：等待修复时轮询间隔
+WAIT_TIMEOUT  = int(float(os.getenv("MARATHON_WAIT_TIMEOUT_SEC", "3600") or 3600))   # 秒：等 Claude Code 修复最长时间
+IDLE_STABLE_SAMPLES = int(float(os.getenv("MARATHON_IDLE_STABLE_SAMPLES", "3") or 3))
+TRANSIENT_RECHECKS = int(float(os.getenv("MARATHON_TRANSIENT_RECHECKS", "6") or 6))   # 瞬态异常复核次数
 DEFAULT_HOURS = 10
+DEFAULT_MINUTES_PER_ROUND = float(os.getenv("MARATHON_MINUTES_PER_ROUND", "30") or 30)
+DEFAULT_COOLDOWN = int(float(os.getenv("MARATHON_COOLDOWN_SEC", "30") or 30))
 DEFAULT_TASK  = (
     "执行 10h 自我修复闭环：仅允许自检系统、定位缺陷、修复 bug、验证修复，不得新增任何功能或做需求外扩展。"
     "每轮必须将任务分解为不少于 12 个子任务节点，且依赖图必须包含并行分支与汇合节点，禁止线性清单式拆分。"
@@ -184,7 +187,32 @@ def _release_singleton_lock() -> None:
         pass
 
 
-def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
+def _is_hard_failure(detail: str) -> bool:
+    """可靠性模式：策略/质量短板不触发硬失败，只有运行时/传输层故障才触发。"""
+    text = (detail or "").lower()
+    runtime_markers = [
+        "traceback",
+        "crash",
+        "runtimeerror",
+        "exception",
+        "connection refused",
+        "connectionreseterror",
+        "connection reset",
+        "http error",
+        "httperror",
+        "500 internal server error",
+    ]
+    return any(marker in text for marker in runtime_markers)
+
+
+def _wait_for_fix(
+    reason: str,
+    attempt: int,
+    detail: str,
+    *,
+    wait_timeout: int = WAIT_TIMEOUT,
+    wait_poll: int = WAIT_POLL,
+) -> None:
     """写 fix_request.json，阻塞等待 Claude Code 修复后删除它。"""
     req = {
         "type":        "fix_request",
@@ -202,18 +230,18 @@ def _wait_for_fix(reason: str, attempt: int, detail: str) -> None:
     _log(f"已写 fix_request.json，等待 Claude Code 修复...")
     _log(f"原因: {reason}")
 
-    deadline = time.monotonic() + WAIT_TIMEOUT
+    deadline = time.monotonic() + wait_timeout
     ticks = 0
     while FIX_REQUEST.exists():
         if time.monotonic() > deadline:
-            _log(f"等待修复超时 {WAIT_TIMEOUT}s，强制进入下一轮")
+            _log(f"等待修复超时 {wait_timeout}s，强制进入下一轮")
             FIX_REQUEST.unlink(missing_ok=True)
             return
         if ticks % 12 == 0:
-            elapsed = int(time.monotonic() - (deadline - WAIT_TIMEOUT))
+            elapsed = int(time.monotonic() - (deadline - wait_timeout))
             print(f"  ... 等待修复 ({elapsed}s)", flush=True)
         ticks += 1
-        time.sleep(WAIT_POLL)
+        time.sleep(wait_poll)
 
     _log("修复完成（fix_request.json 已删除）")
 
@@ -257,9 +285,8 @@ def _wait_for_idle(timeout: int = 600, stable_samples: int = IDLE_STABLE_SAMPLES
 
 def _submit_task(
     task_text: str,
-    time_minutes: float,
     execution_policy: dict | None,
-    idle_timeout: int | None = None,
+    idle_timeout: int = 600,
 ) -> tuple[str | None, str]:
     """提交任务，返回 (task_id, reason)。
 
@@ -269,12 +296,11 @@ def _submit_task(
     - post_error:...
     """
     # 确保系统空闲再提交，避免多任务并发
-    wait_timeout = idle_timeout if idle_timeout is not None else max(600, int(time_minutes * 60 * IDLE_TIMEOUT_FACTOR))
-    if not _wait_for_idle(timeout=wait_timeout):
-        _log(f"等待系统空闲超时（{wait_timeout}s），暂不提交新任务")
+    if not _wait_for_idle(timeout=idle_timeout):
+        _log(f"等待系统空闲超时（{idle_timeout}s），暂不提交新任务")
         return None, "wait_idle_timeout"
     try:
-        payload = {"task": task_text, "time_minutes": time_minutes}
+        payload = {"task": task_text}
         if execution_policy is not None:
             payload["execution_policy"] = execution_policy
         resp = _api("POST", "/api/tasks", payload)
@@ -284,7 +310,12 @@ def _submit_task(
         return None, f"post_error:{e}"
 
 
-def _check_transient_task_status(task_id: str, retries: int = TRANSIENT_RECHECKS) -> tuple[str, str]:
+def _check_transient_task_status(
+    task_id: str,
+    retries: int = TRANSIENT_RECHECKS,
+    *,
+    poll_interval: int = POLL_INTERVAL,
+) -> tuple[str, str]:
     """复核 timeout/unknown 场景，避免把瞬态误判为失败。"""
     last_detail = ""
     for i in range(retries):
@@ -312,12 +343,17 @@ def _check_transient_task_status(task_id: str, retries: int = TRANSIENT_RECHECKS
                 last_detail = f"recheck#{i + 1}: HTTPError {e.code}"
         except Exception as e:
             last_detail = f"recheck#{i + 1}: {e}"
-        time.sleep(min(POLL_INTERVAL, 5))
+        time.sleep(min(poll_interval, 5))
 
     return "transient", last_detail or "transient status unresolved"
 
 
-def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
+def _poll_task(
+    task_id: str,
+    deadline: float,
+    *,
+    poll_interval: int = POLL_INTERVAL,
+) -> tuple[str, str]:
     """
     轮询任务状态直到终态或超时。
     返回 (status, error_detail)，status ∈ {completed, failed, timeout, transient}
@@ -355,7 +391,7 @@ def _poll_task(task_id: str, deadline: float) -> tuple[str, str]:
             _log(f"  轮询 HTTP 异常: {e}")
         except Exception as e:
             _log(f"  轮询异常: {e}")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(poll_interval)
     return "timeout", f"任务 {task_id} 超时未完成"
 
 
@@ -374,27 +410,47 @@ def _clear_old_tasks() -> None:
         _log(f"  清空旧任务失败: {e}")
 
 
-def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, execution_policy: dict | None) -> None:
+def run(
+    task_text: str,
+    hours: float,
+    minutes_per_round: float,
+    cooldown: int,
+    execution_policy: dict | None,
+    *,
+    poll_interval: int = POLL_INTERVAL,
+    wait_poll: int = WAIT_POLL,
+    wait_timeout: int = WAIT_TIMEOUT,
+    transient_rechecks: int = TRANSIENT_RECHECKS,
+    forever: bool = False,
+    fail_open: bool = False,
+) -> None:
     total_seconds = hours * 3600
     end_time = datetime.now() + timedelta(seconds=total_seconds)
     round_num = 0
     results: list[dict] = []
 
-    _log(f"马拉松启动：计划运行 {hours}h，约 {int(hours * 60 / minutes_per_round)} 轮")
+    if forever:
+        _log("马拉松启动：forever 模式（无结束时间）")
+    else:
+        _log(f"马拉松启动：计划运行 {hours}h，约 {int(hours * 60 / minutes_per_round)} 轮")
+        _log(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     _log(f"任务: {task_text[:80]}...")
-    _log(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log(f"失败策略: {'fail-open(继续运行)' if fail_open else 'normal(硬失败触发修复)'}")
     _log("─" * 60)
 
     FIX_REQUEST.unlink(missing_ok=True)
 
-    while datetime.now() < end_time:
+    while forever or datetime.now() < end_time:
         round_num += 1
-        remaining_h = (end_time - datetime.now()).total_seconds() / 3600
+        if forever:
+            remaining_h_text = "∞"
+        else:
+            remaining_h_text = f"{(end_time - datetime.now()).total_seconds() / 3600:.1f}"
         round_fix_triggers = 0
         round_failure_reason = ""
         round_verification = ""
         _log(f"")
-        _log(f"═══ 第 {round_num} 轮 | 剩余 {remaining_h:.1f}h ═══")
+        _log(f"═══ 第 {round_num} 轮 | 剩余 {remaining_h_text}h ═══")
         if execution_policy:
             _log(f"执行策略: {json.dumps(execution_policy, ensure_ascii=False)}")
 
@@ -406,7 +462,13 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
             _log(detail)
             round_failure_reason = detail
             round_fix_triggers += 1
-            _wait_for_fix("服务器无响应", round_num, detail)
+            _wait_for_fix(
+                "服务器无响应",
+                round_num,
+                detail,
+                wait_timeout=wait_timeout,
+                wait_poll=wait_poll,
+            )
 
         # ── 清理旧任务 ──
         _clear_old_tasks()
@@ -416,7 +478,6 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         while task_id is None:
             task_id, submit_reason = _submit_task(
                 task_text,
-                minutes_per_round,
                 execution_policy,
                 idle_timeout=max(600, int(minutes_per_round * 60 * IDLE_TIMEOUT_FACTOR)),
             )
@@ -442,12 +503,18 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
                     )
                     round_failure_reason = detail
                     _log(f"提交延后: {detail}")
-                    time.sleep(min(POLL_INTERVAL, 10))
+                    time.sleep(min(poll_interval, 10))
                     continue
 
                 round_failure_reason = "POST /api/tasks 返回错误"
                 round_fix_triggers += 1
-                _wait_for_fix("任务提交失败", round_num, f"POST /api/tasks 返回错误: {submit_reason}")
+                _wait_for_fix(
+                    "任务提交失败",
+                    round_num,
+                    f"POST /api/tasks 返回错误: {submit_reason}",
+                    wait_timeout=wait_timeout,
+                    wait_poll=wait_poll,
+                )
 
         round_start = time.monotonic()
         _log(f"任务已提交: {task_id}，时间预算 {minutes_per_round} 分钟")
@@ -455,7 +522,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         # ── 轮询等待完成 ──
         # 最多等待 round 时间 × POLL_DEADLINE_FACTOR 的宽余（与提交前空闲等待窗口分离）
         poll_deadline = time.monotonic() + minutes_per_round * 60 * POLL_DEADLINE_FACTOR
-        status, detail = _poll_task(task_id, poll_deadline)
+        status, detail = _poll_task(task_id, poll_deadline, poll_interval=poll_interval)
         elapsed_min = (time.monotonic() - round_start) / 60
 
         if status == "completed":
@@ -473,44 +540,72 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
 
         elif status == "failed":
             round_failure_reason = detail[:500]
-            round_fix_triggers += 1
             round_verification = "task failed"
+            hard_failed = _is_hard_failure(detail)
             _log(f"✗ 第 {round_num} 轮 FAILED（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  错误: {detail[:200]}")
             _stderr_failure_summary(round_num, task_id, detail)
             results.append({
                 "round": round_num,
                 "task_id": task_id,
-                "status": "failed",
+                "status": "failed" if hard_failed else "ok",
                 "minutes": f"{elapsed_min:.1f}",
-                "fix_triggers": round_fix_triggers,
+                "fix_triggers": round_fix_triggers + (1 if hard_failed else 0),
                 "failure_reason": round_failure_reason,
-                "verification": round_verification,
+                "verification": "hard_failed" if hard_failed else "deferred_failed_continue",
             })
-            _wait_for_fix(f"轮次 {round_num} 任务执行失败", round_num, detail)
+            if hard_failed:
+                round_fix_triggers += 1
+                if fail_open:
+                    _log("  hard failed, fail-open 模式：记录后继续下一轮")
+                else:
+                    _wait_for_fix(
+                        f"轮次 {round_num} 任务执行失败",
+                        round_num,
+                        detail,
+                        wait_timeout=wait_timeout,
+                        wait_poll=wait_poll,
+                    )
+            else:
+                _log("  失败被判定为可恢复（deferred），继续下一轮")
 
         elif status in ("timeout", "transient"):
             # timeout/transient 先复核，不直接触发 fix_request
             round_failure_reason = detail[:500]
             _log(f"⚠ 第 {round_num} 轮 {status}（耗时 {elapsed_min:.1f} 分钟）")
             _log(f"  初始详情: {detail[:200]}")
-            recheck_status, recheck_detail = _check_transient_task_status(task_id)
+            recheck_status, recheck_detail = _check_transient_task_status(
+                task_id,
+                retries=transient_rechecks,
+                poll_interval=poll_interval,
+            )
             if recheck_status == "failed":
                 round_failure_reason = recheck_detail[:500]
-                round_fix_triggers += 1
+                hard_failed = _is_hard_failure(recheck_detail)
                 round_verification = "recheck failed"
-                _log(f"  复核结论: hard failed -> {recheck_detail[:200]}")
+                _log(f"  复核结论: {'hard failed' if hard_failed else 'deferred failed'} -> {recheck_detail[:200]}")
                 _stderr_failure_summary(round_num, task_id, recheck_detail)
                 results.append({
                     "round": round_num,
                     "task_id": task_id,
-                    "status": "failed",
+                    "status": "failed" if hard_failed else "ok",
                     "minutes": f"{elapsed_min:.1f}",
-                    "fix_triggers": round_fix_triggers,
+                    "fix_triggers": round_fix_triggers + (1 if hard_failed else 0),
                     "failure_reason": round_failure_reason,
-                    "verification": round_verification,
+                    "verification": "recheck_hard_failed" if hard_failed else "recheck_deferred_continue",
                 })
-                _wait_for_fix(f"轮次 {round_num} 任务执行失败(复核)", round_num, recheck_detail)
+                if hard_failed:
+                    round_fix_triggers += 1
+                    if fail_open:
+                        _log("  recheck hard failed, fail-open 模式：记录后继续下一轮")
+                    else:
+                        _wait_for_fix(
+                            f"轮次 {round_num} 任务执行失败(复核)",
+                            round_num,
+                            recheck_detail,
+                            wait_timeout=wait_timeout,
+                            wait_poll=wait_poll,
+                        )
             elif recheck_status == "completed":
                 round_verification = "recheck completed"
                 _log("  复核结论: 已完成（瞬态切换窗口）")
@@ -532,17 +627,22 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
                 results.append({
                     "round": round_num,
                     "task_id": task_id,
-                    "status": "failed",
+                    "status": "failed" if not fail_open else "ok",
                     "minutes": f"{elapsed_min:.1f}",
                     "fix_triggers": round_fix_triggers,
                     "failure_reason": round_failure_reason,
-                    "verification": round_verification,
+                    "verification": "recheck_unresolved_continue" if fail_open else round_verification,
                 })
-                _wait_for_fix(
-                    f"轮次 {round_num} 任务状态复核仍未收敛",
-                    round_num,
-                    recheck_detail or detail or "transient status unresolved after recheck",
-                )
+                if fail_open:
+                    _log("  unresolved, fail-open 模式：记录后继续下一轮")
+                else:
+                    _wait_for_fix(
+                        f"轮次 {round_num} 任务状态复核仍未收敛",
+                        round_num,
+                        recheck_detail or detail or "transient status unresolved after recheck",
+                        wait_timeout=wait_timeout,
+                        wait_poll=wait_poll,
+                    )
 
         round_result = results[-1]
         _log(
@@ -556,7 +656,7 @@ def run(task_text: str, hours: float, minutes_per_round: float, cooldown: int, e
         )
 
         # ── 冷却 ──
-        if datetime.now() < end_time and cooldown > 0:
+        if (forever or datetime.now() < end_time) and cooldown > 0:
             _log(f"冷却 {cooldown}s 后开始下一轮...")
             time.sleep(cooldown)
 
@@ -648,6 +748,18 @@ if __name__ == "__main__":
                         help="每个节点最少讨论轮次（默认 10）")
     parser.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN,
                         help=f"每轮结束后冷却秒数（默认 {DEFAULT_COOLDOWN}）")
+    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL,
+                        help=f"任务轮询间隔秒（默认 {POLL_INTERVAL}）")
+    parser.add_argument("--wait-poll", type=int, default=WAIT_POLL,
+                        help=f"fix_request 等待轮询秒（默认 {WAIT_POLL}）")
+    parser.add_argument("--wait-timeout", type=int, default=WAIT_TIMEOUT,
+                        help=f"fix_request 等待超时秒（默认 {WAIT_TIMEOUT}）")
+    parser.add_argument("--transient-rechecks", type=int, default=TRANSIENT_RECHECKS,
+                        help=f"瞬态复核次数（默认 {TRANSIENT_RECHECKS}）")
+    parser.add_argument("--forever", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否无限轮次运行（默认开启，可用 --no-forever 关闭）")
+    parser.add_argument("--fail-open", action=argparse.BooleanOptionalAction, default=True,
+                        help="硬失败是否继续下一轮（默认开启，可用 --no-fail-open 关闭）")
     args = parser.parse_args()
 
     if not _acquire_singleton_lock():
@@ -673,6 +785,12 @@ if __name__ == "__main__":
             minutes_per_round=args.minutes,
             cooldown=args.cooldown,
             execution_policy=execution_policy,
+            poll_interval=max(1, int(args.poll_interval)),
+            wait_poll=max(1, int(args.wait_poll)),
+            wait_timeout=max(30, int(args.wait_timeout)),
+            transient_rechecks=max(1, int(args.transient_rechecks)),
+            forever=bool(args.forever),
+            fail_open=bool(args.fail_open),
         )
     except KeyboardInterrupt:
         _log("用户中断")
